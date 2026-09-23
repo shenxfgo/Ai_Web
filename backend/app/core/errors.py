@@ -68,7 +68,9 @@ def register_exception_handlers(app: FastAPI) -> None:
         # 不把驱动原文回给前端，避免泄露连接串与库内对象名
         from app.core.logging import get_logger
 
-        get_logger(__name__).exception("db_error", path=request.url.path, exc_info=exc)
+        # stdlib logger 不认任意关键字参数：写成 path=... 会让这个处理器自己抛
+        # TypeError，用户拿到没有 envelope 的裸 500。
+        get_logger(__name__).exception("数据库访问失败 path=%s", request.url.path, exc_info=exc)
         return JSONResponse(
             error_body("database_error", "数据访问失败"),
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

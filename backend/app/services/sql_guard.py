@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, cast
 
 import sqlglot
 from sqlglot import exp
@@ -234,7 +234,13 @@ def parse(sql: str, *, dialect: Dialect) -> exp.Expression:
         raise SqlGuardError("unsupported_construct", f"无法解析：{exc}") from exc
     if len(stmts) != 1 or stmts[0] is None:
         raise SqlGuardError("multi_statement", "一次只允许一条语句")
-    return stmts[0]
+    stmt = stmts[0]
+    if not isinstance(stmt, exp.Expression):
+        # sqlglot 的类型签名是 Expr，比 Expression 更宽；后面的规则全部按 Expression 走
+        raise SqlGuardError(
+            "unsupported_construct", f"解析结果不是 AST 表达式：{type(stmt).__name__}"
+        )
+    return stmt
 
 
 def _check_top_level(stmt: exp.Expression) -> None:
@@ -384,13 +390,15 @@ def guard(
     if violations:
         return GuardResult(ok=False, sql_final=None, tables=refs, violations=tuple(violations))
 
+    final: exp.Expr = stmt
     if stmt.args.get("limit") is None:
-        # 不包一层子查询：MySQL 5.7 优化器会丢掉子查询里的 ORDER BY，直接加在最外层更稳
-        stmt = stmt.limit(max_rows + 1)
+        # 不包一层子查询：MySQL 5.7 优化器会丢掉子查询里的 ORDER BY，直接加在最外层更稳。
+        # limit() 只长在 exp.Query 上，而 _check_top_level 已经保证 stmt 是它的后代。
+        final = cast("exp.Query", stmt).limit(max_rows + 1)
 
     return GuardResult(
         ok=True,
-        sql_final=stmt.sql(dialect=dialect, comments=False),
+        sql_final=final.sql(dialect=dialect, comments=False),
         tables=refs,
         violations=(),
     )
