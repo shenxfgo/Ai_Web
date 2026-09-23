@@ -7,8 +7,13 @@ from pathlib import Path
 
 import pytest
 
+from app.core.logging import reconfigure_std_streams
+
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_ROOT))
+
+# 测试名是中文的，cp936 控制台下 pytest 的 ID 输出会成乱码
+reconfigure_std_streams()
 
 if sys.platform == "win32":  # asyncpg 与 Proactor 事件循环不兼容
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

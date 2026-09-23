@@ -230,6 +230,49 @@ def check_dirs(settings: Settings, checks: list[Check]) -> None:
             checks.append(Check(label, "fail", f"{resolved}: {exc}"[:120]))
 
 
+def check_sql_guard(checks: list[Check]) -> None:
+    """守卫自测（roadmap §5 项 13，定级 warn）：sqlglot 的解析行为是整条只读链的地基。"""
+    try:
+        import sqlglot
+
+        from app.services import sql_guard
+
+        passed = sql_guard.guard("SELECT 1", allowed=frozenset())
+        if not passed.ok or "LIMIT" not in (passed.sql_final or "").upper():
+            checks.append(
+                Check(
+                    "sql_guard.smoke",
+                    "warn",
+                    f"SELECT 1 未通过：{passed.violations}",
+                    "先跑 pytest tests/guard",
+                )
+            )
+            return
+        rejected = sql_guard.guard("SELECT /*!50100 1 */", allowed=frozenset())
+        code = rejected.violations[0].code if rejected.violations else None
+        if rejected.ok or code != "executable_comment":
+            checks.append(
+                Check(
+                    "sql_guard.smoke",
+                    "warn",
+                    f"可执行注释未被拒（ok={rejected.ok}，归因={code}）",
+                    "第一层防御已失效，别接执行链路",
+                )
+            )
+            return
+        checks.append(
+            Check(
+                "sql_guard.smoke",
+                "ok",
+                f"sqlglot {sqlglot.__version__}，强制 LIMIT 已注入（{passed.sql_final}）",
+            )
+        )
+    except Exception as exc:
+        # 体检要把任何异常降级成一行，不能炸栈
+        msg = f"{type(exc).__name__}: {exc}"[:120]
+        checks.append(Check("sql_guard.smoke", "warn", msg, "uv sync 是否完成"))
+
+
 def check_config_shape(settings: Settings, checks: list[Check]) -> None:
     env_file = BACKEND_ROOT / ".env"
     checks.append(
@@ -267,6 +310,7 @@ async def main() -> int:
     check_config_shape(settings, checks)
     check_secrets(settings, checks)
     check_dirs(settings, checks)
+    check_sql_guard(checks)
     await check_pg(settings, checks)
     check_llm(settings, checks)
     check_embedding(settings, checks)

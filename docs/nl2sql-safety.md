@@ -399,3 +399,30 @@ def test_allow(sql):
 | sqlglot 宽容 parser | 需要正则级兜底（`PROCEDURE ANALYSE` 等）；升级 sqlglot 必须先跑全语料 |
 | MySQL 5.7 `ONLY_FULL_GROUP_BY` 默认开启 | 进 prompt 约束，不在守卫里强行改写 SQL |
 | 中间件/代理重置会话变量 | 曾考虑用 hint 双保险，与 `comments=False` 冲突，改为拒绝 hint |
+
+### 9.1 语料与 sqlglot 30.19 实测的差异（实现时逐条核实过）
+
+拒绝结论一条没少，只有**归因**随实际解析行为调整；`tests/guard/corpus.py` 里同步注明。
+
+| §8.1 用例 | 实测 |
+|---|---|
+| #25 `HANDLER`、#26 `LOAD DATA` | 直接 ParseError → 归 `unsupported_construct`，不是 `top_level_not_select` |
+| #24 `PREPARE s FROM 'SELECT 1'; EXECUTE s` | 是两条语句，规则先后使它归 `multi_statement`；单条 `PREPARE` 才归 `prepared_statement` |
+| #22 `WHERE pg_catalog.pg_sleep(1)` | 与 #16 同一个函数，统一归 `pg_file_access` |
+| #33 的 PG `E'\x2d\x2d'` | 解析成普通字符串字面量、重生成后仍是字面量，不构成注入面 → 未收进语料 |
+| 行首注释（`-- 说明\nSELECT …`） | 放行。① 只剥围栏与尾随 `;`，"整条都是注释"才判 `empty_statement`——注释扫描在剥完之后 |
+| §8.1 之外的 4 条补充语料 | `orders`（短表名无权）、`other_db.x`（跨库）、`mysql.user.User`（三段式列）、`ai_web_demo.information_schema.tables` 来自 §1.2 ⑥ 的规则描述，corpus 里逐条标注了出处 |
+| 无表引用（#5 放行用例 `SELECT 1 UNION SELECT 2`） | 放行：没有可越权的对象；危险函数规则排在表白名单之前命中，不因此漏挡 |
+
+### 9.2 §1.1 接口与实现的差额（评审时逐条对过）
+
+实现比文档**更严**的地方一律不动接口，只在表里说明；需要放宽时必须先改本文。
+
+| §1.1/§1.2 要求 | 实现现状 |
+|---|---|
+| `allowed_schemas` 单独入参 | 折进 `allowed`（表白名单里已带 `db`，短表名由 `default_schema` 补全）→ 效果等价且更严 |
+| `forbid_files: bool = True` | 恒为真，不给关 |
+| ⑥ `CROSS_CATALOG` 独立规则 | 归 `table_not_allowed`（catalog 非空的白名单条目本来就不存在） |
+| ③ `Union/Except/Intersect` 递归校验臂 | 未写：sqlglot 对 `SELECT 1 UNION DROP TABLE x` 直接 ParseError，规则跑不到那一层 |
+| ⑤ `AIWEB_GUARD__DANGLING_EXTRA_RULES` 追加黑名单 | 未实现。"拒绝一切 Anonymous" 已经是超集，追加黑名单只在"想放开某个函数"时才有意义，而那不在 v1 计划里 |
+| ⑦ `HARD_LIMIT` 收敛模型自写的 `LIMIT 999999` | 未收敛，交给第三层的行数上限截断 + `truncated` 标记 |
