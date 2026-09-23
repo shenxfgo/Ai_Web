@@ -216,3 +216,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- Ai_Web 项目专属 ----
+# uv 在 Windows 上的临时目录（PE 资源写入失败时的本地 TMP）
+backend/.uvtmp/
+# 依赖与虚拟环境
+node_modules/
+# 前端构建产物
+frontend/dist/
+# 后端本地日志
+logs/
+# 结果集落盘目录：只保留目录说明，内容不进版本库
+data/*
+!data/README.md
+# knowledge/ 是人工维护的知识文件，属于版本库内容，不忽略
+# 本地环境变量（含口令），只提交 .env.example
+.env
+.env.local
+# ui-check.mjs 的截图产物（本地人工核对用，不版本化）
+frontend/ui-*.png

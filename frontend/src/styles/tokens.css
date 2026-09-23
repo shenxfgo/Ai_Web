@@ -1,0 +1,120 @@
+/**
+ * 设计令牌：全局只有一处颜色/尺寸真源。
+ * Element Plus 走 CSS 变量覆盖（--el-*），所以不引 sass，主题只在 --aw-* 上改。
+ */
+
+:root {
+  /* ---- 品牌与语义色 ---- */
+  --aw-color-primary: #2f6feb;
+  --aw-color-primary-hover: #5a8bf3;
+  --aw-color-primary-active: #2457c0;
+  --aw-color-primary-soft: #eaf1fe;
+  --aw-color-success: #17803d;
+  --aw-color-success-soft: #e8f5ec;
+  --aw-color-warning: #ab6200;
+  --aw-color-warning-soft: #fdf3e3;
+  --aw-color-danger: #c62828;
+  --aw-color-danger-soft: #fdeceb;
+  --aw-color-info: #5a6b7f;
+  --aw-color-info-soft: #eff2f6;
+
+  /* ---- 中性色 ---- */
+  --aw-text-1: #1f2733;
+  --aw-text-2: #3b4859;
+  /* 3 与 4 都保持对白底 ≥4.5:1，次要文字不能靠降饱和到看不清 */
+  --aw-text-3: #55657a;
+  --aw-text-4: #677689;
+  --aw-border-1: #d8dee6;
+  --aw-border-2: #e7ebf0;
+  /* 滚动条滑块：比边框更重一档，只在浅色底上用 */
+  --aw-scrollbar: #c6cedb;
+  --aw-scrollbar-hover: #a9b4c6;
+  --aw-bg-page: #f5f6f8;
+  --aw-bg-card: #ffffff;
+  --aw-bg-subtle: #f7f9fb;
+  --aw-bg-hover: #f0f3f7;
+
+  /* ---- 侧边栏（专业工具风：深色导航 + 浅色工作区） ---- */
+  --aw-nav-bg: #1e2836;
+  --aw-nav-bg-hover: #293647;
+  --aw-nav-bg-active: #2f6feb;
+  --aw-nav-text: #b6c2d1;
+  --aw-nav-text-active: #ffffff;
+  --aw-nav-section: #8698ae;
+  /* 半透明叠加色：侧栏分隔线压在深色底上，抽屉遮罩压在整页上 */
+  --aw-nav-divider: rgb(255 255 255 / 8%);
+  --aw-nav-scrim: rgb(16 24 40 / 45%);
+  /* 反色文字：深色底与主色底上都只用它，不各处写 #fff */
+  --aw-text-invert: #ffffff;
+  --aw-border-danger: #f0c2be;
+  --aw-nav-width: 208px;
+  --aw-nav-width-collapsed: 56px;
+  --aw-header-height: 52px;
+
+  /* ---- 圆角 / 间距 / 阴影 ---- */
+  --aw-radius-sm: 4px;
+  --aw-radius: 6px;
+  --aw-radius-lg: 10px;
+  --aw-space-1: 4px;
+  --aw-space-2: 8px;
+  --aw-space-3: 12px;
+  --aw-space-4: 16px;
+  --aw-space-5: 24px;
+  --aw-space-6: 32px;
+  --aw-shadow-card: 0 1px 2px rgb(16 24 40 / 6%), 0 1px 3px rgb(16 24 40 / 10%);
+  --aw-shadow-pop: 0 8px 24px -6px rgb(16 24 40 / 18%), 0 2px 6px rgb(16 24 40 / 8%);
+  --aw-focus-ring: 0 0 0 2px var(--aw-bg-card), 0 0 0 4px var(--aw-color-primary);
+
+  /* ---- 排版 ---- */
+  --aw-font:
+    "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", sans-serif;
+  --aw-font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+  --aw-fs-xs: 12px;
+  --aw-fs-sm: 13px;
+  --aw-fs-md: 14px;
+  --aw-fs-lg: 16px;
+  --aw-fs-xl: 18px;
+  --aw-fs-2xl: 22px;
+  --aw-lh: 1.55;
+
+  /* ---- 图表（ECharts 与状态色共用，保证同一指标同色） ---- */
+  --aw-chart-1: #2f6feb;
+  --aw-chart-2: #12a5a5;
+  --aw-chart-3: #e08e0b;
+  --aw-chart-4: #7c4dbd;
+  --aw-chart-5: #d9534f;
+  --aw-chart-6: #4b9e5f;
+  --aw-chart-7: #5a6b7f;
+  --aw-chart-8: #2a9d8f;
+
+  /* ---- 把令牌映射进 Element Plus ---- */
+  --el-color-primary: var(--aw-color-primary);
+  --el-color-primary-light-3: var(--aw-color-primary-hover);
+  --el-color-primary-light-5: #8fabe9;
+  --el-color-primary-light-7: var(--aw-color-primary-soft);
+  --el-color-primary-light-8: var(--aw-color-primary-soft);
+  --el-color-primary-light-9: var(--aw-color-primary-soft);
+  --el-color-primary-dark-2: var(--aw-color-primary-active);
+  --el-color-success: var(--aw-color-success);
+  --el-color-warning: var(--aw-color-warning);
+  --el-color-danger: var(--aw-color-danger);
+  --el-color-error: var(--aw-color-danger);
+  --el-color-info: var(--aw-color-info);
+  --el-text-color-primary: var(--aw-text-1);
+  --el-text-color-regular: var(--aw-text-2);
+  --el-text-color-secondary: var(--aw-text-3);
+  --el-text-color-placeholder: var(--aw-text-4);
+  --el-border-color: var(--aw-border-1);
+  --el-border-color-light: var(--aw-border-2);
+  --el-border-color-lighter: var(--aw-border-2);
+  --el-border-color-extra-light: var(--aw-border-2);
+  --el-fill-color-blank: var(--aw-bg-card);
+  --el-bg-color: var(--aw-bg-card);
+  --el-bg-color-page: var(--aw-bg-page);
+  --el-border-radius-base: var(--aw-radius);
+  --el-border-radius-small: var(--aw-radius-sm);
+  --el-font-size-base: var(--aw-fs-md);
+  --el-font-family: var(--aw-font);
+  --el-box-shadow-light: var(--aw-shadow-card);
+}

@@ -1,0 +1,93 @@
+/* 全局基线：只做各页面都需要的事，组件级外观留在各自 scoped 样式里。
+   加载顺序由 main.ts 保证：先 tokens.css 再本文件。 */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--aw-font);
+  font-size: var(--aw-fs-md);
+  line-height: var(--aw-lh);
+  color: var(--aw-text-1);
+  background: var(--aw-bg-page);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--aw-text-1);
+}
+
+a {
+  color: var(--aw-color-primary);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* 数字一律等宽，表格里的金额/计数才不会左右跳动 */
+.num,
+.el-table .cell,
+code,
+kbd,
+pre,
+samp {
+  font-variant-numeric: tabular-nums;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--aw-font-mono);
+  font-size: 0.92em;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--aw-focus-ring);
+  border-radius: var(--aw-radius-sm);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--aw-scrollbar);
+  border: 3px solid transparent;
+  border-radius: 8px;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--aw-scrollbar-hover);
+  background-clip: content-box;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

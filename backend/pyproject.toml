@@ -1,0 +1,57 @@
+[project]
+name = "aiweb-backend"
+version = "0.1.0"
+description = "AI 数据问答：元数据知识库 + NL2SQL"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.6",
+  "email-validator>=2.2",
+  "sqlalchemy[asyncio]>=2.0.30,<2.1",
+  "alembic>=1.14",
+  "asyncpg>=0.30",
+  "httpx>=0.27",
+  "cryptography>=43",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.7",
+  "mypy>=1.13",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["B008", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers"
+markers = [
+  "pg: 需要真实 PostgreSQL（未配 AIWEB_PG_TEST_DSN 时 skip）",
+  "live: 需要真实外部服务或源库",
+]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true

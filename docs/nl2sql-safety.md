@@ -1,0 +1,401 @@
+# NL2SQL 安全模型
+
+> 本文是评审对象。三层防御**彼此独立**：任何一层被绕过，另外两层仍必须挡住。
+> 这个前提来自一条已核实的事实——**sqlglot 是 transpiler，不是 validator**
+> （README 原文："The parser is intentionally lenient…"），所以 AST 白名单**不足以**当唯一防线。
+
+## 0. 三层防御总览
+
+| 层 | 位置 | 手段 | 失败表现 |
+|---|---|---|---|
+| **第一层** | `app/services/sql_guard.py` | sqlglot 正向 AST 白名单 + 危险子结构/函数扫描 + 表白名单 + 强制 LIMIT + **重生成** | 400 `sql_guard_rejected` + `rule_id` + violations |
+| **第二层** | `sql_guard` 末尾，引擎侧 | `EXPLAIN` dry-run（不执行，只验证与估行） | 拒 `TOO_COSTLY` / `CARTESIAN_PRODUCT` / 语法对象不存在 |
+| **第三层** | `app/services/nl2sql/executor.py` | 会话级只读 + 语句超时 + 行数上限 + 单元格/payload 截断 + 并发与限流 | 驱动报错（不是守卫报错），事务回滚 |
+
+外加两条贯穿性约束：**数据源口令 Fernet 加密且永不回传**（§6），
+**结果集落文件且下载防目录穿越**（§7）。
+
+---
+
+## 1. 第一层：sqlglot 正向 AST 白名单
+
+### 1.1 接口
+
+```python
+@dataclass(frozen=True)
+class Violation:  code: str; message: str; node: str | None = None
+
+@dataclass(frozen=True)
+class GuardResult:
+    ok: bool
+    sql_final: str | None          # 由 AST 重新生成的、强制带 LIMIT 的 SQL
+    tables: tuple[QualifiedTable, ...]
+    violations: tuple[Violation, ...]
+
+def guard(
+    sql: str, *,
+    dialect: Literal["mysql", "postgres"],
+    allowed_tables: set[QualifiedTable],   # 来自检索结果 ∩ 用户有权表（不是"全库"）
+    allowed_schemas: set[tuple[str, str]],
+    max_rows: int,
+    forbid_files: bool = True,
+) -> GuardResult: ...
+```
+
+按顺序执行，任一失败即 `ok=False`，但**收集全部 violations 再返回**，便于前端一次展示所有问题。
+每条拒绝都带枚举化的 `rule_id`（便于统计模型常犯哪一类）。
+
+### 1.2 规则清单
+
+**① 预处理**：剥 ``` fences、去尾随 `;`、拒绝非 ASCII 之外的控制字符、长度上限（8000 字符）。
+
+**② 解析必须成功且不宽容**
+
+```python
+stmts = sqlglot.parse(sql, dialect=dialect, error_level=ErrorLevel.RAISE)
+```
+
+不 try/except 降级，也不用默认的 `IGNORE`。
+`len(stmts) != 1 or stmts[0] is None` → `MULTI_STATEMENT`（挡住 `;DROP TABLE` 拼贴）。
+
+**③ 顶层类型白名单（正向枚举，不是黑名单）**
+
+```
+isinstance(ast, (exp.Select, exp.Union, exp.Except, exp.Intersect))   # 其余全拒
+```
+
+`Union/Intersect/Except` 需再校验 `ast.this` / `ast.expression` 也是上述类型。
+显式拒绝清单（记进 violations 以便测试断言）：
+`Command, Insert, Update, Delete, Drop, Create, Alter, Grant, Revoke, Merge, Copy, Set, Transaction,
+Use, Call, Explain, Analyze, Optimize, Vacuum, Truncate, Refresh, Show, Describe, Pragma, Attach, Kill`。
+
+> `SHOW` / `DESCRIBE` 在 sqlglot 里常落成 `exp.Command` → 靠"顶层白名单"自动挡住。
+> **这就是必须用白名单而非黑名单的原因。**
+
+**④ 危险子结构扫描（`ast.walk()`）**
+
+- `exp.Into` → `SELECT_INTO` / `INTO_OUTFILE` / `INTO_DUMPFILE`（覆盖 `SELECT ... INTO @var`、`OUTFILE`、`DUMPFILE`）。
+- `exp.Lock` / `Select.args.get("for_update")` / `lock` → `ROW_LOCKING`（`FOR UPDATE`、`LOCK IN SHARE MODE`）。
+- `exp.Placeholder, exp.Parameter, exp.SessionVar`（MySQL `@@x` / `@x`）、`exp.Op` 中的 `:=` → `VARIABLE_ACCESS`。
+- `exp.CTE` 允许（PG 需要），但 `INSERT/UPDATE/DELETE` 前缀的 CTE 在 ③ 已被拒。
+
+**⑤ 函数黑名单**（`exp.Func` 子类名 + `exp.Anonymous.this`，小写比对）
+
+```
+load_file, into outfile, into dumpfile, sleep, benchmark, randombytes,
+pg_read_file, pg_read_binary_file, pg_ls_dir, pg_stat_file, pg_ls_logdir,
+pg_terminate_backend, pg_cancel_backend, pg_advisory_lock, pg_ls_waldir,
+lo_import, lo_export, dblink, dblink_exec, query_to_xml, query_to_xmlschema,
+table_to_xml, xmlforest(可放), pg_sleep, pg_backend_pid, current_setting(非白名单值),
+system, exec, xp_cmdshell, sp_executesql, utl_inaddr,
+```
+
+另外：**拒绝一切 `Anonymous` 函数**（未知即危险，方言专有函数最容易藏副作用），
+violations 里提示"函数 X 未被允许，请换写法"。
+`AIWEB_GUARD__DANGLING_EXTRA_RULES` 可逗号分隔追加黑名单函数（与代码内置取并集）。
+
+**⑥ 表引用全部落入白名单**
+
+```python
+cte_names = {c.alias_or_name.lower() for c in ast.expressions of type exp.CTE}   # 排除 CTE 别名
+alias_map = {a.alias.lower() for a in ast.find_all(exp.TableAlias)}              # 排除别名
+for t in ast.find_all(exp.Table):
+    if t.name.lower() in cte_names: continue
+    parts = (t.catalog or '', t.db or '', t.name)   # sqlglot 已解引号/反引号
+    qt = QualifiedTable.from_parts(parts, dialect)
+    if qt not in allowed_tables → TABLE_NOT_ALLOWED
+```
+
+- **归一化**：MySQL 大小写敏感取决于 `lower_case_table_names` → 统一 lower 比较；
+  PG 未加引号的标识符折叠小写 → 加引号的表名要**保留原样**，用 `(is_quoted, name)` 双 key。
+- 跨库禁止：MySQL 的 `db.table` 中 `db` 必须 ∈ `allowed_schemas`；PG 的 schema ∈ `allowed_schemas`；
+  `catalog` 非空即 `CROSS_CATALOG`。
+- 系统对象禁止：`information_schema, mysql, performance_schema, sys, pg_catalog, pg_toast`
+  （**即便用户有权也拒**；元数据从我们自己库读）。
+- `exp.Column` 上带 `catalog/db` 前缀的（`SELECT x.y.z`）→ 拆出表部分同样校验，
+  防 `mysql.user` 三段式绕过。
+
+**⑦ 强制 LIMIT**
+
+无顶层 `exp.Limit` 时，注入 `max_rows + 1`（`+1` 用于探测截断）。
+包装写法 `exp.select('*').from_(ast.subquery('__aiweb_q')).limit(max_rows+1)` 在 MySQL 5.7 上
+会被优化器丢掉子查询里的 ORDER BY，**实测更稳的做法是直接 `ast.limit(max_rows+1)` 加在最外层**，
+不包一层（代码里保留这条取舍注释）。
+`AIWEB_GUARD__FORCE_LIMIT=true`、`AIWEB_QUERY__HARD_LIMIT` 决定注入值上限。
+
+**⑧ 重新生成（不是原样执行 LLM 文本）**
+
+```python
+sql_final = stmt.sql(dialect=dialect, comments=False, pretty=False)
+```
+
+见 §2。
+
+**⑨ 引擎 dry-run** 见 §3。
+
+### 1.3 守卫一致性不变式（防 rewrite 漂移）
+
+守卫**执行的是重生成的 SQL**，并断言：
+
+```python
+assert out.sql.endswith("LIMIT 1001") or "LIMIT" in out.sql.upper()
+assert ";" not in out.sql and "/*" not in out.sql          # 重生成后的硬不变式
+assert guard.parse(out.sql, error_level=RAISE)             # 幂等：可再解析
+```
+
+以及"重生成后再 parse 一次的 AST 与首次 parse 的 AST 归一化相同"——防 rewrite 漂移。
+重跑（`POST /chat/messages/{id}/rerun`）**绝不复用旧 `sql_final`**，同样走完整 guard。
+
+---
+
+## 2. `comments=False` 重生成不变式与 hint 拒绝
+
+`stmt.sql(comments=False)` 是挡住 **MySQL 可执行注释** 的关键安全参数：
+`/*!50100 UNION SELECT ... */` 这类注释在 sqlglot AST 里是 comment，重生成时被抹掉 →
+天然挡住这条经典绕过（对应语料 `executable_comment`）。顺带完成方言归一：
+AI 写了 `LIMIT 10` 给 PG 也能被重写成合法形态。重生成结果必须满足不变式：**不含 `;`、不含 `/*`**。
+
+**副作用与对策（这是设计里最微妙的一条）**：`comments=False` 同时会剥掉优化器 hint——
+MySQL 的 `/*+ MAX_EXECUTION_TIME(n) */` 也是注释。这会造成"**守卫看到的 SQL ≠ 实际执行的 SQL**"，
+属于最危险的一类不一致。因此定稿的规则是：
+
+1. **检测到任何 hint 节点即拒绝**（`rule_id = hint_not_allowed`）——模型本来就不该生成 hint。
+2. **超时必须走会话变量而不是 hint**：MySQL 用 `SET SESSION MAX_EXECUTION_TIME = <ms>`，
+   PG 用 `SET LOCAL statement_timeout`。会话变量作用于之后所有 SELECT，天然覆盖 `UNION` 场景，
+   也就不需要再判断"UNION 不加 hint"。
+   （`AIWEB_QUERY__USE_SESSION_MAX_EXEC_TIME=true` 即此语义。）
+
+> 早期草案曾打算在 SQL 前挂 `/*+ MAX_EXECUTION_TIME(n) */` 做双保险（因为 session 变量可能被中间件重置），
+> 该做法与 `comments=False` 冲突，已作废；现在只保留 `SET SESSION` 路径。
+
+---
+
+## 3. 第二层：引擎 EXPLAIN dry-run
+
+弥补 sqlglot "宽容非校验"的第二道独立闸门：
+
+- **MySQL**：`EXPLAIN <sql_final>`（5.7 对 SELECT 支持；`EXPLAIN` 不执行）。
+- **PG**：
+  ```sql
+  BEGIN READ ONLY; SET LOCAL statement_timeout='3000ms'; EXPLAIN <sql_final>; ROLLBACK;
+  ```
+- 估行超阈值：`rows_estimated > AIWEB_QUERY__MAX_EXPLAIN_ROWS`（默认 5e7）→ 拒 `TOO_COSTLY`。
+- 笛卡尔积：v1 **只对"无 join 条件的逗号连接"硬拒**，其余放行
+  （`materialize` / `Nested Loop all` + 无索引 Join 的检测误报率高，写进 known limitation）。
+- `AIWEB_QUERY__DRY_RUN=true`；关掉即失去第三道防御之外的第二层，**prod 启动自检禁止关闭**。
+- dry-run 失败信息可回喂模型自动重试一次（`retry_with_error`），**最多 1 次**。
+
+---
+
+## 4. 第三层：会话级只读、超时、行上限
+
+### 4.1 MySQL（session 建立后依次执行，全在同一连接上）
+
+```sql
+SET SESSION TRANSACTION READ ONLY;   -- 5.7 支持；挡住一切写
+SET SESSION MAX_EXECUTION_TIME = <timeout_ms>;  -- 5.7.4+，仅作用于只读 SELECT，最可靠的路径
+SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_ENGINE_SUBMIT');  -- 不改；仅读取并记入日志
+SET SESSION NETWORK_COMPRESSION = OFF;  -- 视驱动支持，失败忽略
+SET SESSION wait_timeout = <timeout_ms/1000 + 10>;
+SET SESSION autocommit = 1;
+```
+
+- `SET SESSION TRANSACTION READ ONLY` 前**不能在已有事务里**。
+- 账号侧要求：**只给 `GRANT SELECT ON <db>.* TO 'aiweb_ro'@'%'`**，数据源表单提示"请建只读账号"。
+  UI 检测 `SHOW GRANTS` 里出现 `ALL|INSERT|UPDATE|DROP|CREATE` → 黄色警告（不阻断，admin 可确认）；
+  连上的账号不具备只读能力时 `test_connection` 报 `readonly_capability_missing`（能力探测前置）。
+- 取数：无缓冲 cursor + 逐 1000 行 `fetchmany`，累计到 `max_rows+1` 立即 `cursor.close()`。
+  **不做 `KILL <connection_id>`**——`KILL` 是写操作，只读账号本来就无权限，依赖
+  `MAX_EXECUTION_TIME` 自杀 + 连接归还前 `ROLLBACK`。这是 MVP 的诚实取舍，写进 known limitation。
+- `asyncmy` 的 `read_timeout` 与 `MAX_EXECUTION_TIME` 谁先触发要实测：驱动先断会留下服务端仍在跑的查询。
+
+### 4.2 PostgreSQL
+
+```sql
+SET default_transaction_read_only = on;      -- 或连接参数 options='-c default_transaction_read_only=on'
+BEGIN; SET LOCAL transaction_read_only = on;
+SET LOCAL statement_timeout = '<n>ms';
+SET LOCAL idle_in_transaction_session_timeout = '30s';
+SET LOCAL lock_timeout = '3s';
+SET LOCAL application_name = 'aiweb-nl2sql';
+```
+
+连接串可选带 `target_session_attrs=prefer-standby`：有备库时走只读副本，这是 PG 侧最强的一道防线。
+
+### 4.3 行上限与截断
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `AIWEB_QUERY__ROW_LIMIT` | 1000 | 返回给前端 + 喂结论模型的行数上限 |
+| `AIWEB_QUERY__HARD_LIMIT` | 5000 | 注入 `LIMIT(+1)` 的值上限 |
+| `AIWEB_QUERY__TIMEOUT_MS` | 15000 | 默认语句超时；数据源级可覆盖 |
+| `AIWEB_QUERY__MAX_TIMEOUT_MS` | 30000 | 全局天花板，UI 不许超过 |
+| `AIWEB_QUERY__CELL_MAX_CHARS` / `AIWEB_RESULT__MAX_CELL_CHARS` | 1000 / 2000 | 超长文本单元格截断 |
+| `AIWEB_RESULT__MAX_PAYLOAD_MB` | 2 | 单页 JSON payload 上限 |
+| `AIWEB_QUERY__CONCURRENCY_PER_DS` | 2 | 按数据源限并发（`asyncio.Semaphore`），防连点把源库打满 |
+| `AIWEB_QUERY__RATE_LIMIT_PER_USER_PER_MIN` | 20 | 每用户每分钟问数次数（内存滑动窗口） |
+
+- 截断探测：注入 `max_rows + 1`，取到 `max_rows+1` 行即判定 `truncated=true` 并丢弃最后一行。
+- 单元格保护：`str` 截断；`bytes`/`Binary` → `"<binary 1.2KB>"`；
+  `Decimal` → **str**（避免前端精度丢失，不能让金额变成 `0.30000000000000004`）；日期 → ISO 字符串。
+  `executor` 统一 `default=str` + 按列 `type` 显式序列化，否则 naive `datetime` 进 `json.dumps` 会 500。
+- 抽取侧同样保护：全部 IS 查询前 `SET SESSION max_execution_time` / `SET LOCAL statement_timeout`，
+  批大小固定 200，批间 `await asyncio.sleep(EXTRACT__BATCH_INTERVAL_MS)`，单连接串行，不开并发打源库。
+
+---
+
+## 5. 权限与白名单的关系
+
+- `allowed_tables` 的来源是 **检索结果 ∩ 该用户有权的表**，不是"全库"。执行前二次校验
+  "SQL 引用的表 ⊆ 该用户可访问表"。
+- member 直接 `POST /chat/validate {"sql":"SELECT * FROM secret_table"}` → `403 table_not_granted`。
+- 跨用户会话不可见；`chat_message` 记录 `actor_id`。
+- "用户手改 SQL 后重跑"由 `AIWEB_QUERY__ALLOW_SQL_EDIT=admin|all|none` 控制。
+  **开启时输入来源从"模型输出"扩到"人输入"**，守卫的 hint/comment 拒绝与 `table_not_allowed`
+  必须在此模式下 100% 覆盖（语料里 §8.6 的 hint 用例与跨库用例就是为这条准备的）。
+
+---
+
+## 6. 数据源凭据处理
+
+- 口令字段 `aiweb.data_sources.secret_enc bytea NOT NULL`（Fernet 密文 → **二进制，不用 text**）。
+  写入即刻加密，`create`/`update` 后内存里不留明文。
+- **任何 API 响应都不回传口令**：`GET /datasources/{id}` 只回 `password_masked:'••••'` + `has_secret:true`；
+  PATCH 时密码字段缺省 = 不改。前端"表单里已填的口令不会回填到任何 GET 响应"是验收项（Network 面板核对）。
+- 轮换：`AIWEB_FERNET__KEYS` 当前 key + 保留的旧 key 列表（`MultiFernet`，新把在前，解密按多把尝试）。
+  启动自检做加解密哨兵（失败 fatal）+ 逐条试解密库内 credential（有失败者按 datasource id 列出，warn）；
+  `AIWEB_FERNET__REENCRYPT_ON_STARTUP=true` 是一次性把所有密文用当前 key 重写。
+- 日志脱敏：`RedactFilter` 同时按"键名正则（password/api_key/credential/Authorization）"
+  和"值形态正则（JWT、`gpt-`、`sk-`）"双保险；含密 model 覆写 `__repr__` 输出 `redacted`。
+  否则启动打印配置或异常 traceback 会把 DSN 打出来。
+- 密钥类字符串**一律禁止进 `app_settings`**（admin 端点对 value 做
+  `^(sk-|.*api_key.*|.*password.*)$` 拒绝写入并返回 422）。
+- DSN 拼接必须 `quote_plus` 用户名与口令：含 `@ # % /` 不转义会被解析成主机名，报"未知主机"且极难查
+  （`PgGroup.dsn()` 有专门单测覆盖）。
+- 演示/生产都用只读专用账号 `aiweb_ro`，只授 `SELECT ON <db>.*`，不给 `ON *.*`
+  （否则"跨库读 `mysql.user`"这类攻击用例在本地永远测不出真拦截）。
+
+---
+
+## 7. 结果文件下载与目录穿越防护
+
+结果集落 `AIWEB_RESULT__DIR`（默认 `data/results/`）后，前端按文件名请求下载。规则：
+
+- 文件名由**服务端生成**，客户端只能提交服务端此前返回过的标识；不接受任意相对/绝对路径。
+- 解析路径后必须校验其 realpath 仍落在结果目录内（拒绝 `..`、符号链接逃逸、绝对路径、空字节），
+  越界一律 403/404，不区分"不存在"与"无权限"的细节。
+- 同一套约束适用于 `knowledge/` 覆盖层的文件读写（目录根来自配置，不由用户拼接）。
+- 结果内容不进版本库（`.gitignore` 的 `data/*`），保留期由 `AIWEB_RESULT__RETENTION_DAYS` 控制；
+  体检项 `query.row_limit` > 5000 会 warn，理由就是"结果集落文件也吃磁盘"。
+
+---
+
+## 8. 攻击语料（测试 oracle）
+
+`backend/tests/guard/corpus.py` 里两个常量列表 + 两个 parametrize，一条用例一次跑完：
+
+```python
+# tests/guard/test_reject_corpus.py
+@pytest.mark.parametrize("sql,rule", REJECT_CASES, ids=[c[0][:38] for c in REJECT_CASES])
+def test_reject(sql, rule):
+    with pytest.raises(SqlGuardError) as ei: guard.check(sql, allowed=DEMO_TABLES, dialect="mysql")
+    assert ei.value.rule_id == rule, f"{sql!r} 被拒但规则不符预期"
+
+@pytest.mark.parametrize("sql", ALLOW_CASES, ids=[s[:38] for s in ALLOW_CASES])
+def test_allow(sql):
+    out = guard.check(sql, allowed=DEMO_TABLES, dialect="mysql")
+    assert out.sql.endswith("LIMIT 1001") or "LIMIT" in out.sql.upper()
+    assert ";" not in out.sql and "/*" not in out.sql          # 重生成后的硬不变式
+    assert guard.parse(out.sql, error_level=RAISE)             # 幂等：可再解析
+```
+
+### 8.1 必须被拒（≥15，标 `rule_id`）
+
+| # | SQL | 期望 rule_id |
+|---|---|---|
+| 1 | `SELECT 1; DROP TABLE kb_card` | `multi_statement` |
+| 2 | `DROP TABLE order_main` | `top_level_not_select` |
+| 3 | `UPDATE customer SET level='vip' WHERE 1=1` | `top_level_not_select` |
+| 4 | `DELETE FROM order_item WHERE 1=1` | `top_level_not_select` |
+| 5 | `INSERT INTO category VALUES (99,'x','y')` | `top_level_not_select` |
+| 6 | `CREATE TABLE tmp_x AS SELECT * FROM customer` | `top_level_not_select` |
+| 7 | `TRUNCATE TABLE payment_record` | `top_level_not_select` |
+| 8 | `SELECT id, name FROM customer INTO OUTFILE '/tmp/c.csv'` | `into_outfile` |
+| 9 | `SELECT id FROM customer INTO DUMPFILE '/tmp/x'` | `into_outfile` |
+| 10 | `SELECT LOAD_FILE('/etc/passwd')` | `danger_function` |
+| 11 | `SELECT /*!50100 DROP TABLE user */ FROM dual` | `executable_comment` |
+| 12 | `SELECT /*!32302 1/0, */ 1 AS x` | `executable_comment` |
+| 13 | `SELECT SLEEP(30)` | `sleep_function` |
+| 14 | `SELECT BENCHMARK(50000000, MD5('a'))` | `danger_function` |
+| 15 | `SELECT pg_read_file('/etc/passwd')` | `pg_file_access` |
+| 16 | `SELECT * FROM pg_ls_dir('/')` / `SELECT pg_sleep(10)` | `pg_file_access` |
+| 17 | `SELECT * FROM mysql.user` | `table_not_allowed`（跨库） |
+| 18 | `SELECT name FROM information_schema.columns WHERE table_name='user'` | `table_not_allowed` |
+| 19 | `SELECT * FROM order_main FOR UPDATE` | `locking_clause` |
+| 20 | `SELECT * FROM order_main LOCK IN SHARE MODE` | `locking_clause` |
+| 21 | `WITH x AS (UPDATE customer SET level='vip' RETURNING id) SELECT * FROM x` | `dml_in_cte` |
+| 22 | `SELECT 1 WHERE pg_catalog.pg_sleep(1) IS NULL` | `danger_function`（子句内函数扫描） |
+| 23 | `CALL sp_purge()` | `top_level_not_select` |
+| 24 | `PREPARE s FROM 'SELECT 1'; EXECUTE s` | `prepared_statement` |
+| 25 | `HANDLER customer OPEN; READ customer FIRST` | `top_level_not_select` |
+| 26 | `LOAD DATA INFILE '/etc/passwd' INTO TABLE customer` | `top_level_not_select` |
+| 27 | `SELECT * FROM order_main GROUP BY id PROCEDURE ANALYSE()` | `procedure_analyse` |
+| 28 | `SELECT * FROM (SELECT 1) t WHERE (SELECT COUNT(*) FROM customer) > 0 UNION SELECT user,password FROM mysql.user` | `table_not_allowed` |
+| 29 | `SET GLOBAL general_log = 'ON'` | `top_level_not_select` |
+| 30 | `SELECT id FROM customer WHERE name = '' OR 1=1; -- ` + 换行 `DROP TABLE customer` | `multi_statement` |
+| 31 | `SELECT * FROM customer LIMIT 1 INTO @v` | `into_outfile` |
+| 32 | `SELECT 1 /*+ MAX_EXECUTION_TIME(1) */` | `hint_not_allowed`（§8.6） |
+| 33 | `SELECT $$\n DROP TABLE x\n $$` / `SELECT E'\\x2d\\x2d'`（非常规 quoting / dollar-quoted） | `unsupported_construct` |
+| 34 | `SELECT * FROM customer c JOIN order_main o ON c.id=o.cid FOR SHARE o.id` | `locking_clause` |
+
+再加两个非 SQL 文本用例：空串、纯注释 `-- hi` → `empty_statement`；超长（>20k 字符）→ `too_large`。
+
+> 第 27 条要留意：5.7 的 `PROCEDURE ANALYSE()`、`INTO @var`、`FOR UPDATE` 都需要单独规则，
+> sqlglot 的宽容 parser 可能不把 `PROCEDURE ANALYSE` 识别为子结构 → **必须有正则级兜底**。
+
+### 8.2 必须被放行（≥6）
+
+1. `SELECT o.id, SUM(o.amount) AS total FROM order_main o JOIN customer c ON c.id=o.customer_id WHERE o.created_at >= '2024-01-01' GROUP BY o.id ORDER BY total DESC LIMIT 10`
+2. `WITH monthly AS (SELECT DATE_FORMAT(created_at,'%Y-%m') m, SUM(amount) s FROM order_main GROUP BY 1) SELECT * FROM monthly ORDER BY s DESC LIMIT 20`
+3. `SELECT status, COUNT(*) c FROM payment_record GROUP BY status HAVING COUNT(*) > 5 ORDER BY c DESC`（无 LIMIT → 断言注入 `LIMIT 1001`）
+4. `SELECT c.id, c.name FROM customer c LEFT JOIN order_main o ON o.customer_id=c.id WHERE o.id IS NULL LIMIT 50`
+5. `SELECT 1 AS a UNION SELECT 2`（顶层 Union 在已定稿白名单内）
+6. `SELECT id, ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY created_at) rn FROM order_item LIMIT 100`
+7. `SELECT DATE(created_at) d, COUNT(*) FROM order_main GROUP BY 1 ORDER BY 1 LIMIT 400`
+8. `SELECT json_extract(extra_col,'$.city') FROM customer LIMIT 10`
+9. `SELECT o.id FROM order_main o WHERE o.id IN (SELECT om.order_id FROM order_item om WHERE om.qty>3) EXCEPT SELECT r.order_id FROM refund_record r`
+10. `SELECT p.name, s.* FROM product_stats_wide s JOIN product p ON p.id=s.product_id ORDER BY s.gmv DESC LIMIT 1`（宽表自连接冒烟）
+
+放行用例还要断言：`LIMIT 5 OFFSET 10` 不被改坏（幂等，不出现双 LIMIT）、
+注入的 LIMIT 值是 `HARD_LIMIT + 1`、`table_refs` 集合恰好等于 SQL 里的表（含别名解析后）。
+
+### 8.3 变异测试（一条 parametrize 自动扩到全语料）
+
+`test_corpus_mutation.py`：对每条 ALLOW 用例施加 5 种变异并断言必须被拒 ——
+追加 `; DROP TABLE x`、把某表名换成 `mysql.user`、在末尾加 `FOR UPDATE`、
+把 `SELECT` 换成 `SELECT ... INTO OUTFILE '/tmp/a'`、在注释里塞 `/*!50100 ...*/`。
+这是防"规则只挡顶层"的探针，价值高于再加 10 条手写用例。
+
+### 8.4 三层独立性的验证方式
+
+- 手工提交一条不带 `LIMIT` 的 `SELECT * FROM order_item` → 实际执行 SQL 日志里看到 `LIMIT 1001`
+  且返回 1000 行 + `truncated:true`（第一层的强制 LIMIT 生效）。
+- 在 MySQL 5.7 上提交 `SELECT SLEEP(20)` → 被黑名单拒；**把黑名单临时清空** →
+  被 `SET SESSION MAX_EXECUTION_TIME=1000` 截断（错误来自驱动 timeout 而非守卫），
+  证明第二/第三层独立有效。
+- `POST /api/chat/validate {"sql":"SELECT 1; DROP TABLE users"}` →
+  400 `{code:"sql_guard_rejected", rule_id:"multi_statement"}`。
+- 即使模型产出了 `DROP`，`/api/chat/ask` 的 dry-run 分支也要返回 400 `sql_guard_rejected`，
+  绝不落到执行层。
+
+---
+
+## 9. Known limitations（诚实清单）
+
+| 项 | 现状 |
+|---|---|
+| 服务端查询无法主动 `KILL` | 只读账号没有 `KILL` 权限；依赖 `MAX_EXECUTION_TIME` 自杀 + 归还前 `ROLLBACK` |
+| 笛卡尔积检测 | v1 只对"无 join 条件的逗号连接"硬拒，其余放行（误报率高） |
+| sqlglot 宽容 parser | 需要正则级兜底（`PROCEDURE ANALYSE` 等）；升级 sqlglot 必须先跑全语料 |
+| MySQL 5.7 `ONLY_FULL_GROUP_BY` 默认开启 | 进 prompt 约束，不在守卫里强行改写 SQL |
+| 中间件/代理重置会话变量 | 曾考虑用 hint 双保险，与 `comments=False` 冲突，改为拒绝 hint |
