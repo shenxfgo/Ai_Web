@@ -24,11 +24,10 @@
 守卫语料里的表名（`order_main`/`order_item`/`customer`/`payment_record`/`refund_record`/
 `product_stats_wide`/`category`/`product`）与这张演示库一一对应 —— 语料的 `DEMO_TABLES` 白名单就是它。
 
-> **口径不一致要在实现时对齐**：方案里 §10.4 的标题写"8 张"、手测第 5 步和同步验收写
-> "8 表 1 视图 / `total=8`"，但同一张表实际列出了 9 张业务表 + 1 视图。
-> 以**枚举出来的对象清单为准**（9 表 + 1 视图），同步验收里的 `total` 应随之为 10
-> （或按 `TABLE_TYPE` 只计 `BASE TABLE` 得 9）。实现 `init_demo_mysql.sql` 时把这条改掉，
-> 否则第 6 步"进度 total 与 `SHOW TABLES` 计数一致"永远测不过。
+> **口径已定（2026-09-23）**：以**枚举出来的对象清单为准 = 9 张业务表 + 1 视图**。
+> 同步验收里的 `total` 随之为 10（`SHOW FULL TABLES` 全计）或 9（只计 `BASE TABLE`），
+> 二者只能选一种并让断言与它同源，否则"进度 total 与 `SHOW TABLES` 计数一致"这一步永远测不过。
+> 原方案 §10.4 标题的"8 张"是笔误，roadmap 的 P2/P3 验收已按 9 表改齐。
 
 ### 1.1 数据生成要点
 
@@ -168,7 +167,7 @@
 | 2 | `uv run alembic upgrade head` | `aiweb` schema 下表齐全 + `alembic_version` 在 aiweb 内（不在 public） |
 | 3 | `uv run python scripts/seed_admin.py` | 建 admin；**第二次运行幂等且不重置口令**；库里存的是 argon2 hash |
 | 4 | 前端登录 → 首登强制改密 | 旧 token 立即失效（token 带 `pwd_ver` 或 `users.token_version`） |
-| 5 | 新建数据源 `demo-mysql` → 测试连接 | 返回"连接成功 / 8 表 1 视图 / 只读能力=OK / MySQL 5.7.x / max_execution_time 支持=yes" |
+| 5 | 新建数据源 `demo-mysql` → 测试连接 | 返回"连接成功 / 9 表 1 视图 / 只读能力=OK / MySQL 5.7.x / max_execution_time 支持=yes" |
 | 6 | 立即同步 | SSE 进度到 100%；`sync_jobs.status=success`；phase 序列完整 |
 | 7 | 元数据浏览 → 打开 `order_main` | 字段列表含中文注释；索引含复合索引两列顺序正确；关系显示指向 `customer`/`order_item`；卡片文本可复制 |
 | 8 | 知识库检索预览（调参页）输入"各区域每月回款金额" | 返回 `payment_record`/`order_main`/`customer` 三表且带 `vector_rank`/`keyword_rank`/`rrf_score` 三列排名；把 `final_tables` 改成 2 后第三表消失 |

@@ -9,9 +9,11 @@
 ## 目录
 
 ```
+CONTEXT.md  术语表（唯一词汇权威，纯术语、无实现）
 backend/    FastAPI + SQLAlchemy(async) + Alembic，Python 3.12，包管理用 uv
 frontend/   Vue 3 + TS + Vite + Element Plus + ECharts
-docs/       架构 / 安全守卫 / 元数据模型 / 知识文件工作流 / 阶段计划 / 验收步骤
+docs/       架构 / 安全守卫 / 元数据模型 / 知识文件工作流 / 阶段计划 / 验收步骤 / UI 契约
+docs/adr/   不可逆决策（为什么这么设计，改主意前先读）
 scripts/    bootstrap.py（装依赖 + 生成 .env）、dev.ps1（Windows 下的 make）
 data/       查询结果集落盘目录（不进版本库）
 knowledge/  人工维护的表知识 Markdown（进版本库，是知识的一部分）

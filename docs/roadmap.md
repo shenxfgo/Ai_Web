@@ -78,7 +78,7 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
   `pipeline.ask(question)` → 打印 `retrieved_tables / sql / guard_verdict / rows`。
 
 验收：
-1. `init_demo_mysql.sql` 建成 `ai_web_demo`（8 表 + 1 视图），`SHOW TABLES` 可见；
+1. `init_demo_mysql.sql` 建成 `ai_web_demo`（9 表 + 1 视图，见 verification.md §1 的枚举清单），`SHOW TABLES` 可见；
 2. `seed_admin.py` 建 admin，登录返回 `access_token`；
 3. 建数据源成功，且 `SELECT left(secret_enc,12)` 看到的是 `gAAAAAB` 开头（Fernet 指纹）而不是明文；
    `GET /api/datasources` 响应体不含口令；
@@ -104,10 +104,11 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 验收：
 1. `POST /api/sync/jobs` → 返回 job id；
 2. `GET /api/sync/jobs/1/events`（SSE）输出 `event: progress` 序列（含 `phase=extract/embed/upsert`、
-   `done=..., total=8`）并以 `event: done` 结束，`total` 与 `SHOW TABLES` 计数一致；
+   `done=..., total=10`）并以 `event: done` 结束，`total` 与 `SHOW FULL TABLES` 计数一致
+   （9 张 `BASE TABLE` + 1 张 `VIEW` 全计；若实现只计 `BASE TABLE` 则为 9，两处口径必须同源）；
 3. 同时再发一次 POST → 409 `sync_already_running`（证明部分唯一索引生效，不是代码 race）；
 4. 同步中途 `kill` 进程再重启：日志出现"回收 N 个僵尸 job"，重启后重新同步得到 `status=success`；
-5. 故意让 3 张表 embed 抛错 → `status=partial`、`errors` 含表名、其余 5 张表元数据已落库；
+5. 故意让 3 张表 embed 抛错 → `status=partial`、`errors` 含表名、其余 6 张表元数据已落库；
 6. PG 数据源跑通，`test_pg_type_normalize.py` 覆盖 `_text/_int4/_numeric/_timestamptz/_varchar/[]/_jsonb`；
 7. `meta_index` 里 `CARDINALITY`/`SUB_PART` 非空（证明没退回 `SHOW CREATE TABLE` 方案）。
 
