@@ -12,6 +12,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_JWT_SECRET = "dev-insecure-jwt-secret"
 
+# asyncpg 的 ssl 参数认这套（与 libpq 同名），别的名会在 connect 时才炸
+_PG_SSL_MODES = frozenset({"", "disable", "allow", "prefer", "require", "verify-ca", "verify-full"})
+
 
 class AppGroup(BaseModel):
     name: str = "AI 问数"
@@ -32,11 +35,23 @@ class PgGroup(BaseModel):
     password: str = ""
     database: str = ""
     schema_name: str = "aiweb"
+    # 键名沿用 libpq 的 SSLMODE（运维熟），取值是 asyncpg 认的那一套；空 = 不传该参数
     sslmode: str = "prefer"
     connect_timeout_s: int = 10
     pool_size: int = 5
     max_overflow: int = 10
     echo: bool = False
+
+    @field_validator("sslmode")
+    @classmethod
+    def _sslmode_known(cls, v: str) -> str:
+        if v not in _PG_SSL_MODES:
+            raise ValueError(
+                "AIWEB_PG__SSLMODE 取值只能是 "
+                + " | ".join(sorted(_PG_SSL_MODES - {""}))
+                + "（留空表示不启用 SSL）"
+            )
+        return v
 
     @property
     def configured(self) -> bool:
@@ -45,7 +60,14 @@ class PgGroup(BaseModel):
     def dsn(self, driver: str = "postgresql+asyncpg") -> str:
         # 口令里的 @ # % / 不转义会被解析成主机名，报错还很难查
         auth = f"{quote_plus(self.user)}:{quote_plus(self.password)}"
-        return f"{driver}://{auth}@{self.host}:{self.port}/{self.database}?sslmode={self.sslmode}"
+        query = f"?ssl={self.sslmode}" if self.sslmode else ""
+        # 这里是 app 与 alembic 唯一的连接参数出口：参数名必须是 asyncpg 的 ssl，
+        # 写成 libpq 的 sslmode 会让驱动在 connect() 当场 TypeError。
+        return f"{driver}://{auth}@{self.host}:{self.port}/{self.database}{query}"
+
+    def connect_args(self) -> dict[str, object]:
+        # asyncpg 的超时键叫 timeout；DSN 里没有对应写法，只能由调用方带进 connect_args
+        return {"timeout": self.connect_timeout_s}
 
     def masked_dsn(self) -> str:
         if not self.configured:

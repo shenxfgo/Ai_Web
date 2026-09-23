@@ -27,6 +27,32 @@ from app.settings import Settings, get_settings  # noqa: E402
 Status = Literal["ok", "warn", "fail"]
 _MARK = {"ok": "[ ok ]", "warn": "[warn]", "fail": "[FAIL]"}
 
+# 体检报告是给人照着修的，驱动原文（英文 + 内部异常名）帮不上忙。
+# 键取异常类名片段而不是类型本身：脚本不该为了报错文案去 import 驱动。
+_PG_ERROR_HINTS: tuple[tuple[str, str, str], ...] = (
+    (
+        "InvalidPassword",
+        "口令不对",
+        "核对 AIWEB_PG__PASSWORD；应用账号口令由开通脚本生成，改过就要同步 .env",
+    ),
+    ("InvalidCatalogName", "库不存在", "AIWEB_PG__DATABASE 写错，或开通脚本没跑"),
+    ("InvalidAuthorizationSpec", "角色不存在", "AIWEB_PG__USER 不是该实例上的角色"),
+    ("InsufficientPrivilege", "账号权限不够", "元数据库要由该账号 own（要能 CREATE SCHEMA）"),
+    ("Timeout", "连接超时", "核对 AIWEB_PG__HOST/PORT，或调大 AIWEB_PG__CONNECT_TIMEOUT_S"),
+    ("refused", "端口没人监听", "PG 服务未启动，或 host/port 写错"),
+    ("getaddrinfo", "主机名解析不了", "核对 AIWEB_PG__HOST"),
+)
+
+
+def _pg_failure(exc: Exception) -> Check:
+    """把驱动异常翻成中文，并保留原文——只给结论不给线索，人就没办法自查。"""
+    raw = f"{type(exc).__name__}: {exc}"
+    text_blob = raw.lower()
+    for needle, message, hint in _PG_ERROR_HINTS:
+        if needle.lower() in text_blob:
+            return Check("pg.connect", "fail", f"{message}（原文：{raw[:90]}）", hint)
+    return Check("pg.connect", "fail", raw[:120], "看原文里的 SQLSTATE/异常名定位")
+
 
 @dataclass(slots=True)
 class Check:
@@ -117,7 +143,7 @@ async def check_pg(settings: Settings, checks: list[Check]) -> None:
                 )
             )
     except Exception as exc:
-        checks.append(Check("pg.connect", "fail", f"{type(exc).__name__}: {exc}"[:120]))
+        checks.append(_pg_failure(exc))
     finally:
         await engine.dispose()
 

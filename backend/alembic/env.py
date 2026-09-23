@@ -69,9 +69,17 @@ async def run_async_migrations() -> None:
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
+        # DSN 已经带了 ssl，唯独超时只能走 connect_args：不传的话 asyncpg 用默认 60s，
+        # host 写错时看着像卡死而不是报错。
+        connect_args=settings.pg.connect_args(),
     )
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
+        # 实测：不显式 commit 时 aiweb schema 与 alembic_version 都会随连接关闭一起回滚，
+        # alembic 退出码却还是 0——看起来迁移成功了，库里什么都没有。SQLAlchemy 2.0 的
+        # 异步连接是"commit as you go"，官方模板那段只在 alembic 自己开事务时才成立，
+        # 而我们在它之前就先 _ensure_schema() 起了外层隐式事务。
+        await connection.commit()
     await connectable.dispose()
 
 

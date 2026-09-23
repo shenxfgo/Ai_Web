@@ -42,6 +42,7 @@ def create_engine(**overrides: Any) -> AsyncEngine:
         "pool_size": pg.pool_size,
         "max_overflow": pg.max_overflow,
         "echo": pg.echo,
+        "connect_args": pg.connect_args(),
     }
     kwargs.update(overrides)
     return create_async_engine(pg.dsn(), **kwargs)
