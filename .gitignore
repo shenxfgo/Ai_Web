@@ -218,6 +218,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 # ---- Ai_Web 项目专属 ----
+# 一次性开通脚本里带着应用账号口令，跑完就该删，绝不进版本库
+backend/.setup/
 # uv 在 Windows 上的临时目录（PE 资源写入失败时的本地 TMP）
 backend/.uvtmp/
 # 依赖与虚拟环境

@@ -24,6 +24,7 @@ dev = [
   "ruff>=0.7",
   "mypy>=1.13",
   "respx>=0.21",
+  "python-dotenv>=1.0",
 ]
 
 [tool.uv]

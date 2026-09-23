@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from dotenv import dotenv_values
 
 from app.core.logging import reconfigure_std_streams
 
@@ -17,6 +18,13 @@ reconfigure_std_streams()
 
 if sys.platform == "win32":  # asyncpg 与 Proactor 事件循环不兼容
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# AIWEB_PG_TEST_DSN 不是 Settings 字段（Settings 是 extra="ignore"），只有下面的 skip 判定读它。
+# 从 .env 兜一份进 os.environ，免得跑 pg 用例要每次手工 export；真实环境变量始终优先。
+_TEST_ONLY = ("AIWEB_PG_TEST_DSN", "AIWEB_REQUIRE_PG_TESTS")
+for _key, _value in dotenv_values(BACKEND_ROOT / ".env").items():
+    if _key in _TEST_ONLY and _value:
+        os.environ.setdefault(_key, _value)
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
