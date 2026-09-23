@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
+from app import deps
 from app.api.router import api_router
 from app.core import db
 from app.core.errors import register_exception_handlers
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.warning("元数据库未配置：填 backend/.env 的 AIWEB_PG__* 后再跑迁移")
     yield
+    await deps.dispose_llm_http()
     await db.dispose_engine()
 
 
@@ -51,7 +53,7 @@ def create_app() -> FastAPI:
     )
 
     @app.middleware("http")
-    async def _request_id(request: Request, call_next):  # type: ignore[no-untyped-def]
+    async def _request_id(request: Request, call_next):
         token = new_request_id()
         try:
             request_id = current_request_id()

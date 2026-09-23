@@ -60,6 +60,8 @@ class LlmGroup(BaseModel):
     temperature: float = 0.0
     max_tokens: int = 2000
     timeout_s: int = 60
+    # 只对 429/5xx/超时重试：生成 SQL 与分类都是纯函数调用，重试幂等
+    max_retries: int = 2
 
     @property
     def configured(self) -> bool:
