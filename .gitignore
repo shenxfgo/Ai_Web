@@ -235,3 +235,5 @@ data/*
 .env.local
 # ui-check.mjs 的截图产物（本地人工核对用，不版本化）
 frontend/ui-*.png
+# 拆出来的工单是过程稿，落地即消化；要长期留存就搬进 docs/
+.scratch/
