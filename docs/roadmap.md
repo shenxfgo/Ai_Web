@@ -338,15 +338,16 @@ AIWEB_EMBEDDING__CONCURRENCY=4
 
 ########## 分组 5：JWT ##########
 AIWEB_JWT__SECRET=                     # 【必须 env】≥32 字节随机；openssl rand -hex 32
-AIWEB_JWT__ALGORITHM=HS256             # 白名单只允许 HS256/HS384/HS512，禁 none/HS256+空串
-AIWEB_JWT__ACCESS_TTL_MIN=120
-AIWEB_JWT__REFRESH_TTL_DAYS=7
-AIWEB_JWT__ISSUER=aiweb
-AIWEB_JWT__AUDIENCE=aiweb-web
-AIWEB_JWT__CLOCK_SKEW_S=5
-AIWEB_JWT__ROTATION_GRACE_S=30         # 用刷新 token 时旧 access 的宽限期
+# 算法不是配置项：实现里钉死 HS256（app/core/security.py:_ALGORITHM）。
+# 把它做成可配，等于把 "none" 也请进攻击面——所以本表删掉了 draft 里的 AIWEB_JWT__ALGORITHM。
+AIWEB_JWT__ACCESS_TTL_S=900            # draft 里写的是 ACCESS_TTL_MIN=120：键名以 Settings 为准
+AIWEB_JWT__REFRESH_TTL_S=86400         # 同上（draft 写的 REFRESH_TTL_DAYS）
+# 下面四个 draft 键尚未实现，随"刷新令牌 / 登出 / 轮转宽限"一起做（当前无工单认领）：
+#   AIWEB_JWT__ISSUER、AIWEB_JWT__AUDIENCE、AIWEB_JWT__CLOCK_SKEW_S、AIWEB_JWT__ROTATION_GRACE_S
+# 没有刷新令牌时 access 只有 900 秒会很难受；那条工单落地时要么调大这里，要么上静默刷新。
 AIWEB_BOOTSTRAP_ADMIN_USERNAME=admin   # seed_admin 使用（非密钥，可留默认）
-AIWEB_BOOTSTRAP_ADMIN_PASSWORD=        # 【必须 env 或交互输入】空则 seed_admin 走 getpass
+AIWEB_BOOTSTRAP_ADMIN_PASSWORD=        # 【必须显式给】空则 seed_admin 拒绝执行，不建号
+                                       # 值不能同行写注释：dotenv 会把 "# ..." 读成口令
 
 ########## 分组 6：Fernet（数据源口令加密） ##########
 AIWEB_FERNET__KEYS=                    # 【必须 env】当前 key，MultiFernet 第一项

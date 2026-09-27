@@ -3,7 +3,7 @@ SHELL := bash
 BACKEND := backend
 FRONTEND := frontend
 
-.PHONY: help bootstrap check-env migrate demo-db dev dev-backend dev-frontend lint fmt typecheck test check clean
+.PHONY: help bootstrap check-env migrate seed-admin demo-db dev dev-backend dev-frontend lint fmt typecheck test check clean
 
 help:
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/^\([a-z-]*\):.*## /\1\t/'
@@ -16,6 +16,9 @@ check-env: ## 环境体检（配置/目录/元数据库/LLM 探活），有 fail
 
 migrate: ## 元数据库升级到最新 schema
 	cd $(BACKEND) && uv run alembic upgrade head
+
+seed-admin: ## 建初始 admin（口令走 AIWEB_BOOTSTRAP_ADMIN_PASSWORD，为空则拒绝执行）
+	cd $(BACKEND) && uv run python scripts/seed_admin.py
 
 demo-db: ## 建本机演示库 ai_web_demo（只探测、只建不删；建库账号走 backend/.setup/my_login.cnf）
 	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo_db.ps1

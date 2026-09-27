@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# 不 import 包，Base.metadata 里就是空的：autogenerate 会把所有已有表看成"待删除"
+import app.models  # noqa: F401
 from app.core.db import Base
 from app.core.logging import reconfigure_std_streams
 from app.settings import get_settings

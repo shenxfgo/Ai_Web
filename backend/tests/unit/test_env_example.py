@@ -51,3 +51,20 @@ def test_settings_have_documented_fields() -> None:
     documented = {key.removeprefix("AIWEB_").replace("__", ".").lower() for key in _env_keys()}
     missing = sorted(_field_paths() - documented)
     assert not missing, f"Settings 有字段但 .env.example 未列出：{missing}"
+
+
+def test_empty_values_have_no_inline_comment() -> None:
+    """`KEY=    # 说明` 里那段说明会被当成值读进来。
+
+    python-dotenv 不剥行内注释（它只认整行注释），pydantic-settings 也跟着错。
+    真炸过的三处：`AIWEB_JWT__SECRET` 变成模板里的生成命令（于是 check_env 报
+    "已自定义"，而实际是所有仓库克隆者都知道的公开串）、`AIWEB_FERNET__KEYS` 变成
+    一串非空垃圾（于是"未配置"判定失效）、`AIWEB_BOOTSTRAP_ADMIN_PASSWORD` 变成
+    "seed_admin 用；留空则该脚本拒绝执行"（于是 seed_admin 拿这句垃圾建出 admin）。
+    """
+    offenders = [
+        line.split("=", 1)[0]
+        for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines()
+        if re.match(r"^AIWEB_[A-Z0-9_]+= *#", line)
+    ]
+    assert not offenders, f"这些键值为空却带了行内注释，注释会被读成值：{offenders}"
