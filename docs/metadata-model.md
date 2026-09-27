@@ -435,6 +435,28 @@ DELETE FROM aiweb.meta_relation
 2. 批内一事务，但**源库读和元数据库写不要混在一个 session**（跨两个 engine）。
 3. `manifest_digest` 命中上次成功指纹时短路，避免无变化的重复重建。
 
+> **as-built(0007)**：P2 真跑之后，上表有三处需要按实现口径收紧，其中第一条是缺陷修复而非偏差。
+>
+> 1. **终局状态写在 `finally` 里，不是 try 的末尾**。上表只安排了"进程崩溃留下僵尸 running"的
+>    启动回收，前提是不重启就永远撞不到——但元数据库还没开通时进程确实不重启，而 `run_sync`
+>    一旦让**没分类过的异常**（pymysql 的驱动异常、`StatementError`…）裸冒到端点，那行 job 就
+>    永远停在 `'running'`；`ux_sync_running` 是**部分唯一索引**，于是这条源此后每次同步都 409，
+>    用户侧表现为"这个源再也点不动了"，只能手工进库删行才能救。因此终局收尾必须在 `finally`，
+>    并且除了 `AppError`/`SQLAlchemyError` 两支之外还要有一支"没分类过的异常"：落 `failed` +
+>    `errors[{code:'sync_failed'}]` 后再抛。**任何 raise 路径都不例外。**
+> 2. **`partial` 的粒度是 catalog（一个 schema 一次 `collect` + 一个事务），不是"某张表"**。
+>    上表那行"中途某张表 IS 查询失败 → 继续下一批"讲的是 P3 的分批（`BATCH_SIZE=200`）语义；
+>    P2 没有分批，所以失败的原子单位就是整个 schema。
+> 3. **`counters` 只累计确实提交完了的那个 catalog**。边写边涨的总账会在"中途 rollback、
+>    一行都没落"时谎报"10 张表同步好了"——分账 (`_Tally`) 写完由调用方在提交成功后并进总账。
+>    `ds.last_sync_at` 同一条规矩：只有走完全程才推它，失败的同步不该把"最近一次同步"往前挪。
+> 4. `ExtractScopeTooLarge` 是**拒绝开工**，不是"某一批失败"：它必须穿过 per-catalog 的兜底
+>    `except` 让整个请求以 400 结束，且 `detail` 里那三条出路要原样到达响应体（前端按结构化
+>    出路渲染，只剩一个 `code` 就没有可操作性了）。
+> 5. `?force=true`（第 4 行表格里 admin 覆盖上限那条）：`run_sync(force=)` 参数在，
+>    **端点没有开关**，工单 007 的验收里没有它 → P3 接背景执行时一并补。
+>    同理 `AIWEB_EXTRACT__MIN_MYSQL_VERSION`（第 1 行）也还没有读取点。
+
 ## 7. `SourceDialect` 抽象与中间结构
 
 ```python
