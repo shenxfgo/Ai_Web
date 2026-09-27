@@ -375,6 +375,7 @@ DELETE FROM aiweb.meta_index WHERE table_id = ANY(%ids);  INSERT ...
 -- 3) 关系：只删 extracted，manual/inferred 各自走自己的重建逻辑
 DELETE FROM aiweb.meta_relation
  WHERE datasource_id=%d AND source_kind='extracted'
+   AND from_table_id IN (本轮写完的那些库的表)   -- as-built(0007)：差分范围是库，不是数据源（见 §4）
    AND id NOT IN (刚 upsert 的 id 集合);   -- 用 CTE: with keep as (insert ... returning id) delete where id not in (select id from keep)
 ```
 
@@ -405,6 +406,15 @@ DELETE FROM aiweb.meta_relation
   UI 可一键 accept → 转成 `manual`（`GET /metadata/relations/inferred` + `POST /metadata/relations`）。
 - `extracted` 不可在 UI 删除（`DELETE /metadata/relations/{id}` 只允许 manual/inferred）。
 - `is_authors_enforced` 记录"外键存在但库没启用 FK 约束"这类现实情况。
+- **as-built(0007)：delete-diff 的范围是"本轮写完的那些库"**（`from_table_id IN (这些库的表)`），
+  不是整个数据源。范围放到数据源级时，同一个同步里**后写的库会把先写的库刚落的 extracted 边
+  整批收走**——演示库只有一个 schema，这条缺陷在里面永远看不见，多 schema 的库里边只剩
+  最后一个库的。两个方向都要钉（`test_sync_pg.py::test_多库同步时后写的库不能删光先写的库的边`）：
+  还在的外键不许被收走，源库删掉的必须被收走。
+- **as-built(0007)：外键为 0 也要走差分的另一半**（纯 DELETE 清扫，`meta_relation_prune()`）。
+  §3 第 3 段那句 CTE 是"upsert + 顺手删差集"，零行时 upsert 什么都不做、DELETE 也跟着不跑
+  （executemany 空列表不执行任何语句）——源库删光外键后上一轮的 extracted 边就永远残留。
+  所以 `_write_catalog` 对关系没有"跳过"这条路：有行走 replace，无行走 prune。
 
 ## 5. 陈旧标记与硬删
 
@@ -418,7 +428,7 @@ DELETE FROM aiweb.meta_relation
 | 连接失败 / 认证失败 / 网络 | `probe()` 阶段直接 `failed`，`error_code` 分类（`AUTH_FAILED`/`HOST_UNREACHABLE`/`TIMEOUT`/`UNSUPPORTED_VERSION`）。**MySQL < 5.7、PG < 12 视为不支持并明确报错**（5.6 无 IS 统计、PG<12 部分函数缺） |
 | 中途某张表 IS 查询失败 | 记 `errors[]` + `counters.tables_failed++`，**继续下一批**，最终 `status='partial'` |
 | 权限不全（MySQL 只能看到被 grant 的对象） | `discover()` 里比对 `SHOW DATABASES` 结果 vs `SCHEMATA` 可见集合；差异写 `warnings[{code:'SCHEMA_PARTIALLY_VISIBLE'}]`；UI 黄条提示"该账号看不到 N 个库/表，请补 GRANT SELECT"。**绝不允许**因为"看不到"就删掉上次同步到的元数据 → 只有 `catalog` 层确认成功枚举到的 schema 才参与 stale 判定（`known_complete=True` 时才做 delete-diff） |
-| 超大库（>2000 表） | `probe()` 先 `SELECT COUNT(*)` 预估 → 超过 `AIWEB_EXTRACT__MAX_TABLES`（默认 2000）**拒绝**并返回结构化提示 + 三个出路：①配 `include_tables` 白名单 ②只同步部分 schema ③admin 用 `?force=true` 覆盖上限 |
+| 超大库（>2000 表） | `probe()` 先 `SELECT COUNT(*)` 预估 → 超过 `AIWEB_EXTRACT__MAX_TABLES`（默认 2000）**拒绝**并返回结构化提示 + 三个出路：①配 `include_tables` 白名单 ②只同步部分 schema ③调高 `AIWEB_EXTRACT__MAX_TABLES` 上限（admin 改配置） |
 | 宽表（>200 列） | 抽取照常，卡片构建走列切片，并给 warning"字段过多建议拆视图" |
 | 同步中重复点"同步" | 部分唯一索引：`CREATE UNIQUE INDEX ux_sync_running ON aiweb.sync_jobs(datasource_id) WHERE status IN ('pending','running');` → 天然互斥，冲突返回 409 `sync_already_running`（是数据库保证，不是代码 race） |
 | 进程崩溃留下僵尸 running | 启动 `lifespan` 里 `UPDATE sync_jobs SET status='failed', error='reclaimed on startup' WHERE status IN ('pending','running') AND heartbeat_at < now()-interval '3 minutes'`；之后 admin 可"重跑" |
@@ -453,8 +463,12 @@ DELETE FROM aiweb.meta_relation
 > 4. `ExtractScopeTooLarge` 是**拒绝开工**，不是"某一批失败"：它必须穿过 per-catalog 的兜底
 >    `except` 让整个请求以 400 结束，且 `detail` 里那三条出路要原样到达响应体（前端按结构化
 >    出路渲染，只剩一个 `code` 就没有可操作性了）。
-> 5. `?force=true`（第 4 行表格里 admin 覆盖上限那条）：`run_sync(force=)` 参数在，
->    **端点没有开关**，工单 007 的验收里没有它 → P3 接背景执行时一并补。
+> 5. `?force=true`（旧表格里 admin 覆盖上限那条）：`run_sync(force=)` 参数在，
+>    **端点没有开关**，工单 007 的验收里没有它 → P3 接背景执行时一并补。开关落地前，
+>    第三条出路的文案是"调高 `AIWEB_EXTRACT__MAX_TABLES` 上限（admin 改配置）"——出路必须
+>    **当下可操作**，指向一个不存在的开关等于让人猜（三条出路的原文由 `SCOPE_REMEDIES`
+>    常量统一，`test_extract_mysql_client.py` 按本表钉字面量）。P3 落地时把这条文案换回
+>    "admin 用 `?force=true` 覆盖上限"并同步改常量与用例。
 >    同理 `AIWEB_EXTRACT__MIN_MYSQL_VERSION`（第 1 行）也还没有读取点。
 
 ## 7. `SourceDialect` 抽象与中间结构
@@ -473,6 +487,7 @@ class RawCatalog:
     collation: str | None
     approx_size_bytes: int | None
     visible_table_count: int | None
+    approx_rows: int | None = None          # §8.1 A 的 SUM(TABLE_ROWS) → meta_database.approx_rows（§2.4）
     grant_limited: bool = False           # 该 schema 疑似因权限被 IS 隐藏
 
 @dataclass(slots=True, frozen=True)
@@ -636,6 +651,13 @@ WHERE k.TABLE_SCHEMA=%s AND k.REFERENCED_TABLE_NAME IS NOT NULL AND k.TABLE_NAME
 > 是 006 的 `test_connection` 与 007 的抽取**共用**的同一个函数——两边各写一套的话，
 > 探测报 9 表 1 视图、同步抽出 11 张，同一颗按钮给出两个数（见 verification.md §1.2）。
 > 占位符在落地版里是 SQLAlchemy 命名参数（`:schema` / `:tbl_0`），因为抽取和探测要共用同一段渲染。
+>
+> ③ A 条多了 `COUNT(t.TABLE_NAME) AS visible_table_count`：§2.4 的 `meta_database.table_count`
+> 要这一列，原文 A 只 SELECT 了尺寸/行数，是原文漏列不是实现多加。
+> ④ C 条多了 `ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION`：只为快照/人读的输出确定性，
+> 语义上不依赖（`meta_column.ordinal_position` 自己带着序）。
+> ⑤ 测试口径是**子串钉**不是整段原文钉（`test_extract_mysql_snapshot.py` 对 A–E 各钉若干
+> 关键子串）——所以 ①–④ 这类偏差不会让用例变红，由本条 as-built 充当记录。
 
 > D 条那个 `LEFT JOIN STATISTICS it ... AND it.SEQ_IN_INDEX=1` 的自连接不是冗余：`COMMENT` 是
 > **索引级**属性，IS 给每一行都带一份，不钉住第 1 行就会让复合索引的注释随列数翻倍。
@@ -740,6 +762,12 @@ PG `format_type` → 内部 `data_type`：`character varying(64)→varchar(64)`�
 - PG：`_text[]` / `numeric(10,2)` / `varchar(64)` / `timestamptz` / `jsonb` / `serial` / `generated always`
 - MySQL：`decimal unsigned zerofill` / `enum('a','b')` / `set` / `tinyint(1)`（→bool 与否）/ `datetime(3)` /
   生成列 / `utf8mb4_0900_ai_ci`（8.0 的排序规则出现在输入时的容错）
+
+> **as-built(0007)：§9 的归一化整体还没实现**，007 只保证两列都留着：
+> `data_type` = IS 的 `DATA_TYPE` 原文、`raw_data_type` = `COLUMN_TYPE` 原文（含 unsigned/zerofill/长度）。
+> `postgres_types.py::normalize()` 尚未有落点（PG 抽取整条没做）；MySQL 侧的
+> `tinyint(1)→bool`、`decimal unsigned zerofill` 修饰也没人归一——上表那些映射现在只有
+> "raw 还在、将来归一有原料"这层保证。归一放抽取层还是卡片层没定，动工前先补决策。
 
 ## 10. MySQL 5.7 特有的两个坑（写进代码注释）
 
