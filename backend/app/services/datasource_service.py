@@ -254,11 +254,14 @@ def describe_source_error(exc: BaseException) -> str:
     return _ERROR_HINTS.get(errno, f"源库返回错误（错误号 {errno}）")
 
 
-def table_scope_filter(row: DataSource) -> tuple[str, dict[str, str]]:
+def table_scope_filter(
+    row: DataSource, *, column: str = "table_name"
+) -> tuple[str, dict[str, str]]:
     r"""include_tables / exclude_tables → (SQL 片段, 绑定参数)。
 
-    片段里的 `table_name` 是裸列名，只在外层那条 `from information_schema.tables` 的查询
-    里没有别名时才成立；007 同步侧复用它之前，先确认外层形状一致。
+    `column` 让调用方给出自己那条查询里的列写法：006 的探测查询没别名，007 的抽取查询
+    带 `t.` 前缀。同一个函数渲染两边，正是"两处口径必须一致"（verification.md §1.2
+    as-built 注）的落地方式——各写一套的话，探测报 9 表 1 视图而同步抽出 11 张。
 
     口径是**源原生 LIKE**，不是正则：metadata-model §2.2 那两列写的是"正则/通配"，而两边
     都不支持正则（MySQL 5.7 的 information_schema 查询里没有 regexp 算子，PG 得换 ~ 运算符），
@@ -285,7 +288,7 @@ def table_scope_filter(row: DataSource) -> tuple[str, dict[str, str]]:
         for i, pattern in enumerate(names):
             key = f"{field}_{i}"
             params[key] = pattern
-            conds.append(f"table_name {op} :{key}")
+            conds.append(f"{column} {op} :{key}")
         parts.append("(" + joiner.join(conds) + ")")
     return " AND ".join(parts), params
 

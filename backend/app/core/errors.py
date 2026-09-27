@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -61,6 +61,39 @@ class NotImplementedSource(AppError):
 
     code = "not_implemented"
     status_code = status.HTTP_501_NOT_IMPLEMENTED
+
+
+class SyncAlreadyRunning(Conflict):
+    """同一个数据源已有一个未结束的 `sync_jobs`（metadata-model §6 的互斥）。
+
+    互斥由 `ux_sync_running` 这个部分唯一索引在库里保证，不是代码里查一次再插入——
+    两个请求同时进来时"先查后插"两个都查不到。单列一档而不是裸 `Conflict`：
+    前端要能只对"再点一次就好"这一种情况显示"同步进行中"而不是"保存失败"。
+    """
+
+    code = "sync_already_running"
+
+
+class ExtractScopeTooLarge(AppError):
+    """抽取范围内的表数超过 `AIWEB_EXTRACT__MAX_TABLES`（metadata-model §6）。
+
+    和 source_unreachable 同一个理由用 400：请求本身合法，是目标太大，用户改一格配置就能自救。
+    detail 里带三个出路，是 §6 点名要求结构化返回的东西，不是我们多加的礼貌。
+    """
+
+    code = "extract_scope_too_large"
+    status_code = status.HTTP_400_BAD_REQUEST
+
+
+# §6 的三条出路。放在错误类旁边而不是抛出点：编排层（sync_service）与测试桩都要引用同一份，
+# 于是"编排层把 detail 换成别的词"会当场红，而不是前端拿到任意三句话照样绿。
+# 第三条 §6 原文是"admin 用 ?force=true 覆盖上限"——那个开关 P3 才有，现在写上去就是撒谎，
+# 所以改成今天真能走的路（改配置）。P3 接上 ?force 时再把文案换回原文。
+SCOPE_REMEDIES: Final = (
+    "配 include_tables 白名单",
+    "只同步部分 schema（include_schemas）",
+    "调高 AIWEB_EXTRACT__MAX_TABLES 上限（admin 改配置）",
+)
 
 
 def error_body(code: str, message: str, detail: Any = None) -> dict[str, Any]:

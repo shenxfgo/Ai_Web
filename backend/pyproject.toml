@@ -18,6 +18,7 @@ dependencies = [
   "pwdlib[argon2]>=0.3.1",
   "pyjwt>=2.15.0",
   "asyncmy>=0.2.9,<0.3",
+  "pymysql>=1.2.3",
 ]
 
 [dependency-groups]
