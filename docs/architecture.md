@@ -358,7 +358,7 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | POST | `/datasources/{id}/test` | owner/admin | `{}` 或 `{"connect_password":"临时未保存口令"}` | `{ok, server_version, visible_schemas, est_table_count, table_count, view_count, grants:{read_only:bool, code:'readonly_capability_missing'\|null, warnings[]}, supports_max_execution_time:bool, latency_ms}` **← 建库前先探规模**；`table_count/view_count` 按 `include_schemas + include/exclude_tables`（源原生 LIKE）口径统计，并把探到的 `server_version` 写回 §2.2 那一列；`supports_max_execution_time` 决定 011 的超时能否由源库兜底；`grants.code` 只作机读警告，不阻断（§4.1），阻断留给 011 |
 | GET | `/datasources/{id}/grants` | admin | — | `[{principal_type,principal_id,principal_name,permission}]` |
 | PUT | `/datasources/{id}/grants` | admin | `{items:[{type:'user'\|'role',id?,role?,permission}]}` | 200（整体替换） |
-| POST | `/datasources/{id}/sync` | sync 权 | `{"force":false}` | 202 `{job_id}`；并发冲突 409 |
+| POST | `/datasources/{id}/sync` | sync 权 | `{"force":false}` | 202 `{job_id}`；并发冲突 409。**as-built(007)**：P2 落的是 `POST /api/sync/jobs`（`{datasource_id}` → **200 + counters**，同步执行完再回）。这一行的 202+背景执行与 `force` 覆盖是 P3 的事，届时**只换返回码不动路径**——工单 007 的拍板表里记着这条决定 |
 | GET | `/sync/jobs` | user | `?datasource_id&status&cursor` | 列表 |
 | GET | `/sync/jobs/{id}` | 同 ds 权 | — | `{status,phase,progress,counters,warnings,errors,started_at,finished_at}` |
 | POST | `/sync/jobs/{id}/cancel` | 同 ds 权 | — | 置 `cancel_requested`，worker 批间检查 |
@@ -455,7 +455,7 @@ Chat 单条 assistant 消息的分区（都是可折叠 panel，默认按阶段�
 | **pgvector 的 `vector` 扩展不是 trusted**（pg_trgm 是） | pgvector 0.8.6 的 `vector.control` 无 `trusted = true` | `CREATE EXTENSION vector` **必须超级用户/DBA 预建**；启动自检必须区分"缺扩展"与"无权限建扩展"两种报错文案。`pg_trgm` 可由应用自己 `CREATE EXTENSION IF NOT EXISTS` |
 | **HNSW/IVFFlat 索引上限：vector 2000 维、halfvec 4000 维**（`vector` 类型本身可存 16000 维） | pgvector README | embedding 维度硬约束 ≤2000，`settings` 里 `dimension > 2000` 直接校验失败；`text-embedding-3-large`(3072) 出局，3072 维必须用 `halfvec` |
 | **sqlglot 是 transpiler，不是 validator** | README："The parser is intentionally lenient…" | AST 白名单**不足以**当唯一防线，必须叠加引擎侧 EXPLAIN dry-run + 会话只读，三层独立 |
-| **MySQL 5.7 的 `information_schema` 中文注释可能返回 `???`** | 5.7 IS 列走 `character_set_system_variables`（部分构建默认 utf8mb3） | 抽完首批统计 comment 中 `?` 占比 > 0.3 → warning `CHARSET_SUSPECT`，并回退 `SHOW CREATE TABLE` / `SHOW FULL COLUMNS` 逐表取注释（走表真实字符集）；连接必须 `charset='utf8mb4'` |
+| **MySQL 5.7 的 `information_schema` 中文注释可能返回 `???`** | 5.7 IS 列走 `character_set_system_variables`（部分构建默认 utf8mb3） | 抽完首批统计 comment 中 `?` 占比 > 0.3 → warning `CHARSET_SUSPECT`，并回退 `SHOW CREATE TABLE` / `SHOW FULL COLUMNS` 逐表取注释（走表真实字符集）；连接必须 `charset='utf8mb4'`。**as-built(007)**：本机 5.7.17 实测**没有** `character_set_system_variables` 这个变量（`select @@...` 报 1193），存在的是 `character_set_system=utf8`；代表"注释到达客户端的编码"的是会话级 `character_set_results`，`ServerInfo.charset` 取它。中文注释实测正常到达，乱码回退路径因此 P2 未实现（见 metadata-model.md §10.1） |
 | **Windows 上 asyncpg 与 Proactor 事件循环不兼容** | asyncpg/uvicorn 行为 | 必须用 `WindowsSelectorEventLoopPolicy`。uvicorn `--loop asyncio` 会自动设，但**自写脚本与 pytest-asyncio 不会** → `conftest.py` 与 `scripts/*.py` 顶部统一：`if sys.platform == "win32": asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())` |
 | `asyncmy` 0.2.15 提供 cp312 win_amd64 wheel；SQLAlchemy 2.0 有 `mysql+asyncmy` 方言 | PyPI 文件清单 + 方言源码 | 本机 Windows + Python 3.12 可走异步 MySQL，不必退回 pymysql |
 | MySQL 5.7：`max_execution_time` 系统变量 5.7.4+、`MAX_EXECUTION_TIME()` hint 5.7.8+、仅对只读 SELECT 生效；`ONLY_FULL_GROUP_BY` 默认开启 | 官方文档口径（未直连实例验证） | 进 prompt 约束与 executor 会话初始化 |

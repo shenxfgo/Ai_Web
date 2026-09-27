@@ -1,7 +1,11 @@
 # `table_uid` 是四元组的 md5 指纹，拼接用单元分隔符
 
-表的对外标识 `table_uid = md5(concat_ws(分隔符, datasource_id, catalog_name, schema_name, table_name))`，
+表的对外标识 `table_uid = md5(datasource_id::text || 分隔符 || catalog_name || 分隔符 || schema_name || 分隔符 || table_name)`，
 `char(32) GENERATED ALWAYS ... STORED` + `UNIQUE`。
+
+> as-built(0004)：决定不变，**拼法从 `concat_ws` 改成 `||` 链**——`concat_ws` 在 PG 是 STABLE 函数，
+> 生成列要求 IMMUTABLE 表达式，真库建表直接拒绝（`metadata-model.md` §1 的 as-built 注有实测口径）。
+> 四列都 `NOT NULL`，所以 `||` 与 `concat_ws` 的结果逐字节相同，uid 值不受这次改写影响。
 
 **为什么用 md5 而不是 uuid**：uuid 需要外部输入或映射表，而我们要的是"同一张源表在任何环境算出同一个串"，
 hash 天然满足，且能跨同步比对、当 embedding 的 doc id。**为什么用 `\x1f`（单元分隔符）**：

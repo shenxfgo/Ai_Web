@@ -33,9 +33,15 @@ UNIQUE (datasource_id, catalog_name, schema_name, table_name)
 
 ```sql
 table_uid char(32) GENERATED ALWAYS AS
-  (md5(concat_ws(<分隔符>, datasource_id, catalog_name, schema_name, table_name))) STORED,
+  (md5(datasource_id::text || <分隔符> || catalog_name || <分隔符> || schema_name || <分隔符> || table_name)) STORED,
 UNIQUE (table_uid)
 ```
+
+> as-built(0004)：**不能写 `concat_ws(<分隔符>, ...)`**。`concat_ws` 在 PG 里是 **STABLE**
+> 而不是 IMMUTABLE（`select provolatile from pg_proc where proname='concat_ws'` 实测为 `s`；
+> 同批实测 `md5`/`encode`/`chr` 都是 `i`），生成列要求表达式 IMMUTABLE，建表直接报
+> `generation expression is not immutable`。四列都是 `NOT NULL text`，`||` 链与 `concat_ws` 等价。
+> 另注意 `datasource_id` 是 `bigint`，`||` 不隐式转换，必须 `::text`。
 
 - 分隔符用 `\x1f`（单元分隔符）这类**不可能出现在标识符里的字符**，
   否则 `a_b`+`c` 与 `a`+`b_c` 会撞出同一个 md5。
@@ -166,6 +172,14 @@ is_stale bool                      -- 本次同步未出现的表打陈旧标记
 synced_at / created_at
 UNIQUE (datasource_id, catalog_name, schema_name, table_name)
 ```
+
+> as-built(0004)：两处踩过坑，留在这里省别人一次调试。
+> ① `collation` 是 **PG 的保留字**（`pg_get_keywords` 里有它），但 SQLAlchemy 的保留字表按
+> SQL:2008 收，**不含 `collation`**——直接写 `Column("collation", Text)` 会生成不带引号的
+> `collation`，建表报 `syntax error at or near "collation"`。ORM 与迁移两侧都要
+> `quoted_name("collation", True)`（见 `app/models/meta.py` 的 `COLLATION_COL`）。
+> ② §2.4 标题写"6 张"是对的，但按前缀数容易漏掉子表 **`meta_index_column`**——0004 落地的就是
+> 六张 + `sync_jobs`（§2.5）。
 
 **`aiweb.meta_column`**
 
@@ -494,6 +508,25 @@ class SourceDialect(Protocol):
 一批一个 schema（MySQL 一个 db、PG 一个 schema），每批 ≤ `batch_size` 张表
 → **service 每批一个事务提交**，这就是 `partial` 状态和进度百分比的来源。
 
+> as-built(007)：这段协议在落地时有三处必须先说清楚，否则读代码的人会以为少实现了东西。
+>
+> 1. **`ConnectionSpec` 原文被引用但从未定义**。现在它定义在 `app/extractor/base.py`：
+>    `host/port/user/password/database/charset='utf8mb4'/connect_timeout_s`。
+>    刻意不认识 `DataSource`——ORM 行、Fernet 密文、Settings 都留在 `sync_service` 那一侧，
+>    方言层拿到的是已解密的明文参数，这样加第三种源库不用改 service。
+> 2. **P2 只实现 `probe/discover/collect/close` 四个方法**。`stream_manifest`（分批 yield +
+>    cancel 回调）、`render_create_sql`、`sample_distinct` 属 P3，没有实现也没有桩——
+>    与其留一个永不通过的假实现，不如让 Protocol 显式小一点（`app/extractor/base.py` 的
+>    `Extractor` 就是这个子集，注释里写着少掉的三个）。
+> 3. **`collect` 的抽取范围是调用方渲染好的 SQL 片段 + 绑定参数**（`table_sql`/`table_params`），
+>    而不是原文的 `include_tables/exclude_tables` 两个序列。原因是这两列的口径必须由 006 的
+>    `test_connection` 与 007 的抽取共用同一个渲染函数（§8.1 B 的 as-built 注），
+>    方言层因此不认识"正则还是通配"这个问题。`table_limit` 同理变成 `max_tables` 参数（§6）。
+>
+> `Raw*` 的取值形状补一条实测：结果集键名 = SQL 里写的那个大小写（5.7.17 + pymysql 实测
+> `SELECT c.TABLE_NAME` 回 `TABLE_NAME`，`AS enum_def` 回 `enum_def`），所以映射层按 §8.1 原文
+> 的大小写取键，不需要做大小写归一。
+
 ## 8. 抽取 SQL 原文
 
 ### 8.1 MySQL 5.7（4 条批量 SQL 拿全一切，与表数量无关）
@@ -511,13 +544,13 @@ GROUP BY s.SCHEMA_NAME, s.DEFAULT_CHARACTER_SET_NAME, s.DEFAULT_COLLATION_NAME;
 -- B. tables + comments + engine（一次拿完）
 SELECT t.TABLE_SCHEMA, t.TABLE_NAME,
        CASE t.TABLE_TYPE WHEN 'BASE TABLE' THEN 'BASE TABLE' WHEN 'VIEW' THEN 'VIEW' ELSE t.TABLE_TYPE END AS table_type,
-       t.TABLE_COMMENT, t.ENGINE, t.TABLE_COLLATION, t.TABLE_ROWS,
+       t.TABLE_COMMENT, t.ENGINE, t.ROW_FORMAT, t.TABLE_COLLATION, t.TABLE_ROWS,
        t.DATA_LENGTH, t.INDEX_LENGTH, t.CREATE_TIME, t.UPDATE_TIME
 FROM information_schema.TABLES t
 WHERE t.TABLE_SCHEMA = %s
   AND (t.TABLE_TYPE IN ('BASE TABLE','VIEW'))
-  AND (t.TABLE_NAME REGEXP %s OR %s IS NULL)        -- include 正则
-  AND (t.TABLE_NAME NOT REGEXP %s OR %s IS NULL);   -- exclude 正则
+  AND (t.TABLE_NAME LIKE %s OR %s IS NULL)        -- include 通配
+  AND (t.TABLE_NAME NOT LIKE %s OR %s IS NULL);   -- exclude 通配
 
 -- C. columns（含 COLUMN_COMMENT / 枚举 / 生成列）
 SELECT c.TABLE_NAME, c.COLUMN_NAME, c.ORDINAL_POSITION, c.DATA_TYPE, c.COLUMN_TYPE,
@@ -549,8 +582,23 @@ JOIN information_schema.REFERENTIAL_CONSTRAINTS r
 WHERE k.TABLE_SCHEMA=%s AND k.REFERENCED_TABLE_NAME IS NOT NULL AND k.TABLE_NAME IN (%s);
 ```
 
+> as-built(007)：B 条有两处与原文不同，都是被真库逼出来的。
+> ① 多了 `t.ROW_FORMAT`——`RawTable.row_format` 与 `meta_table.row_format` 都有这一列，原文漏 SELECT。
+> ② 范围过滤是**源原生 LIKE**，不是 `REGEXP`：`data_sources.include_tables/exclude_tables`
+> 里存的本就不是正则（006 实测），而且渲染这段的 `datasource_service.table_scope_filter`
+> 是 006 的 `test_connection` 与 007 的抽取**共用**的同一个函数——两边各写一套的话，
+> 探测报 9 表 1 视图、同步抽出 11 张，同一颗按钮给出两个数（见 verification.md §1.2）。
+> 占位符在落地版里是 SQLAlchemy 命名参数（`:schema` / `:tbl_0`），因为抽取和探测要共用同一段渲染。
+
+> D 条那个 `LEFT JOIN STATISTICS it ... AND it.SEQ_IN_INDEX=1` 的自连接不是冗余：`COMMENT` 是
+> **索引级**属性，IS 给每一行都带一份，不钉住第 1 行就会让复合索引的注释随列数翻倍。
+> 本机 5.7.17 实测 `STATISTICS` 同时存在 `COMMENT` 与 `INDEX_COMMENT` 两列，所以不需要退回
+> `SHOW CREATE TABLE` 去捞索引注释。
+
 > 视图的 `TABLE_COMMENT` 在 5.7 拿不到（IS 里视图注释存 `information_schema.VIEWS` 但常为空）
 > → 用 `SHOW CREATE TABLE` / `SHOW FULL COLUMNS` 作**注释兜底**，仅对 B/C 返回空的表触发，且限流 ≤N 张。
+> as-built(007)：这条兜底路径**P2 未实现**（演示库的视图注释实测能拿到），实现落在抽取层之外的
+> 补救环节；`RawTable.create_sql` 字段已预留，`render_create_sql()` 尚未有人认领。
 
 ### 8.2 PostgreSQL（同样 4–5 条）
 
@@ -653,6 +701,13 @@ PG `format_type` → 内部 `data_type`：`character varying(64)→varchar(64)`�
    检测：抽完第一批后统计 comment 里 `?` 占比 > 0.3 → 打 warning `CHARSET_SUSPECT`，
    并自动回退用 `SHOW CREATE TABLE` / `SHOW FULL COLUMNS` 逐表取注释（这两条走表的真实字符集）。
    连接必须 `charset='utf8mb4'`。
+   as-built(007)：判定函数是 `extractor.mysql.comment_charset_suspect`，口径按原文
+   （**全部**注释拼起来后 `?` 的字符占比 > 0.3，一条注释都没有时不算乱码）。
+   **乱码回退路径 P2 未实现**——本机 5.7.17 + `aiweb_ro` 实测中文注释正常到达，`?` 占比 0，
+   没有可复现的乱码源库可对着做，硬写就成了没有验收对象的代码。
+   另外原文的变量名在本机不存在：`select @@character_set_system_variables` 报 1193，
+   实际存在的是 `character_set_system=utf8`（服务器级）；能代表"注释到达客户端时是什么编码"的
+   是会话级的 `character_set_results`，所以 `ServerInfo.charset` 取的是后者。
 2. **`utf8mb4` 索引前缀 / 排序规则**：5.7 默认 `utf8mb4_general_ci`；不要用 `utf8mb4_0900_ai_ci`（那是 8.0），
    也别在 IS 查询里手写 `COLLATE`，否则 `%s` 字面量与 IS 列比较会撞 "Illegal mix of collations"。
    正则过滤用 `REGEXP` 而不是 `LIKE ... COLLATE`。
