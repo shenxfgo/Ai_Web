@@ -181,3 +181,24 @@ def jwt_secret(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     finally:
         # 缓存不清回去，后面的用例会拿着这个已撤销的环境变量继续用
         get_settings.cache_clear()
+
+
+@pytest.fixture
+def fernet_key(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """现生成一把 Fernet 密钥并走真实配置通道注入。
+
+    必须盖住开发机上的 `backend/.env`：`.setup` 里那把是要能解开真库口令的，
+    测试拿它加密就等于把密文写进（虽然是随机 schema 的）真连接串旁边。
+    和 jwt_secret 同一个理由——桩只能盖住读配置的调用点，盖不住读了几次。
+    """
+    from cryptography.fernet import Fernet
+
+    from app.settings import get_settings
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("AIWEB_FERNET__KEYS", key)
+    get_settings.cache_clear()
+    try:
+        yield key
+    finally:
+        get_settings.cache_clear()

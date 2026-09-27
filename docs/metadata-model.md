@@ -102,7 +102,10 @@ server_version    text NULL                       -- test_connection 时探测�
 params            jsonb NOT NULL DEFAULT '{}'::jsonb  -- {charset:utf8mb4, ssl_mode, tenant...}
 include_schemas   text[] NULL                     -- 白名单；NULL=自动发现
 include_tables    text[] NULL / exclude_tables text[] NULL   -- 正则/通配
-readonly_enforced bool NOT NULL DEFAULT true
+readonly_enforced bool NOT NULL DEFAULT true   -- as-built(006)：表单不收这一列（POST 请求体里没它），
+                                               -- 所以它恒为默认 true，没有任何证据支持。源库真相看
+                                               -- test_connection 的 grants.{read_only,code,warnings}；
+                                               -- 拿只读结论去挡执行在 011（executor）那一片
 row_limit         int NOT NULL DEFAULT 1000
 timeout_ms        int NOT NULL DEFAULT 15000
 allow_global_access bool NOT NULL DEFAULT false   -- 授权给全体

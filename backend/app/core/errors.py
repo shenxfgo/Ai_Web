@@ -45,6 +45,24 @@ class InvalidRequest(AppError):
     status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
+class SourceUnreachable(AppError):
+    """连不上源库、或者连上了但源库说"你不该连"。
+
+    单列一档而不是塞进 500：这是用户填错一格就能自救的情况，前端要把它显示成表单错误
+    而不是"服务异常"。400 而不是 422——422 归请求体格式，这里是请求合法、目标不对。
+    """
+
+    code = "source_unreachable"
+    status_code = status.HTTP_400_BAD_REQUEST
+
+
+class NotImplementedSource(AppError):
+    """功能对某种 kind 还没做（区别于"这是 bug"）。"""
+
+    code = "not_implemented"
+    status_code = status.HTTP_501_NOT_IMPLEMENTED
+
+
 def error_body(code: str, message: str, detail: Any = None) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, "detail": detail}}
 
@@ -58,8 +76,15 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # 只回定位用的三件套，不回 exc.errors() 的整条：pydantic 的 `input` 装的是**整个**
+        # 请求体，哪怕错的是 port 那一格，同一份 body 里的 connect_password 也会跟着回显出去。
+        # 输出模型白名单只挡成功路径，挡不住这里。
+        detail = [
+            {"loc": list(err.get("loc", ())), "type": err.get("type"), "msg": err.get("msg")}
+            for err in exc.errors()
+        ]
         return JSONResponse(
-            error_body("invalid_request", "请求参数不合法", exc.errors()),
+            error_body("invalid_request", "请求参数不合法", detail),
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 

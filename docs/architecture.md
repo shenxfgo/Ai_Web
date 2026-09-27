@@ -350,12 +350,12 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | GET | `/users` | admin | `?q&cursor&limit&role&is_active` | `{items[],next_cursor}` |
 | POST | `/users` | admin | `{username,password,role,display_name}` | 201 |
 | PATCH | `/users/{id}` | admin | `{role?,is_active?,password_reset?}` | 200（禁止把自己降级/停用：service 校验） |
-| GET | `/datasources` | user | `?kind&q` | **只返回有权的**：`[{id,name,kind,host,port,status,last_sync_at,access:'owner'\|'granted'\|'global',table_count}]` |
+| GET | `/datasources` | user | `?kind&q` | **只返回有权的**：`[{id,name,kind,host,port,status,last_sync_at,access:'owner'\|'granted'\|'global',table_count}]`（as-built 006：`?kind&q` 与 `table_count` 未做——表数来自 `meta_table`，那是 007 的表；列表当前就是 `DataSourceOut` 的字段集） |
 | POST | `/datasources` | user(可建) | `{name,kind,host,port,catalog_name,connect_user,connect_password,params,include_schemas,include_tables,exclude_tables,row_limit,timeout_ms}` | 201（密码即刻 Fernet 加密） |
 | GET | `/datasources/{id}` | read 权 | — | 详情，`connect_password` **永不回传**（回 `password_masked:'••••'` + `has_secret:true`） |
 | PATCH | `/datasources/{id}` | owner/admin | 同上 + `status` | 200（密码字段缺省=不改） |
 | DELETE | `/datasources/{id}` | owner/admin | — | 软删 `deleted_at` |
-| POST | `/datasources/{id}/test` | owner/admin | `{}` 或 `{"connect_password":"临时未保存口令"}` | `{ok, server_version, visible_schemas, est_table_count, grants:{read_only:bool,warnings[]}, latency_ms}` **← 建库前先探规模** |
+| POST | `/datasources/{id}/test` | owner/admin | `{}` 或 `{"connect_password":"临时未保存口令"}` | `{ok, server_version, visible_schemas, est_table_count, table_count, view_count, grants:{read_only:bool, code:'readonly_capability_missing'\|null, warnings[]}, supports_max_execution_time:bool, latency_ms}` **← 建库前先探规模**；`table_count/view_count` 按 `include_schemas + include/exclude_tables`（源原生 LIKE）口径统计，并把探到的 `server_version` 写回 §2.2 那一列；`supports_max_execution_time` 决定 011 的超时能否由源库兜底；`grants.code` 只作机读警告，不阻断（§4.1），阻断留给 011 |
 | GET | `/datasources/{id}/grants` | admin | — | `[{principal_type,principal_id,principal_name,permission}]` |
 | PUT | `/datasources/{id}/grants` | admin | `{items:[{type:'user'\|'role',id?,role?,permission}]}` | 200（整体替换） |
 | POST | `/datasources/{id}/sync` | sync 权 | `{"force":false}` | 202 `{job_id}`；并发冲突 409 |

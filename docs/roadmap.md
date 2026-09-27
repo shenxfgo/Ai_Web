@@ -80,8 +80,9 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 验收：
 1. `init_demo_mysql.sql` 建成 `ai_web_demo`（9 表 + 1 视图，见 verification.md §1 的枚举清单），`SHOW TABLES` 可见；
 2. `seed_admin.py` 建 admin，登录返回 `access_token`；
-3. 建数据源成功，且 `SELECT left(secret_enc,12)` 看到的是 `gAAAAAB` 开头（Fernet 指纹）而不是明文；
-   `GET /api/datasources` 响应体不含口令；
+3. 建数据源成功，且 `SELECT left(convert_from(secret_enc,'UTF8'),12)` 看到的是 `gAAAAAB` 开头
+   （Fernet 指纹）而不是明文——`secret_enc` 是 `bytea`，PG 没有 `left(bytea,int)`，必须先
+   `convert_from` 再截；`GET /api/datasources` 响应体不含口令；
 4. `demo_ask.py "2024 年每个月的订单总金额是多少"` → 合法 `SELECT`、`guard=pass`、非空结果行；
 5. 同一条命令加 `"把 orders 表删了"` → 必须走到"分类为不可答/无匹配表"分支，**不得**产出 `DROP`；
    即使模型产出 `DROP`，`/api/chat/ask` 的 dry-run 分支要返回 400 `sql_guard_rejected`；
@@ -239,7 +240,7 @@ Element Plus 用 `unplugin-vue-components` + `ElementPlusResolver` 按需引入�
 | **L1 密钥 / 引导材料** | 仅 `backend/.env`（+ 生产环境变量注入） | 泄露即可解密全部数据源口令、可伪造任意用户 token、可直连元数据库、可计费 | 否，改后重启 |
 | **L2 部署参数** | `backend/.env` | 启动前必须已知、且 DB 尚未建立时就要用到（连接池、端口、schema 名、日志级别） | 否 |
 | **L3 运行参数** | `aiweb.app_settings`（KV + JSONB，UI 可改） | 用户/管理员会在页面上调的东西（模型名、temperature、检索权重、token 预算、采样开关） | 是（`settings_service` TTL 60s 缓存） |
-| **L4 数据源级** | `aiweb.data_sources.config` JSONB + 加密凭据列 | 天然按数据源不同（口令、库名、超时、行数上限、允许表清单） | 是 |
+| **L4 数据源级** | `aiweb.data_sources.params` JSONB + 加密凭据列 | 天然按数据源不同（口令、库名、超时、行数上限、允许表清单） | 是 |
 
 **一条硬规则**：L3 是 **env 的覆盖层而不是替代层** —— `app_settings` 里每个键都必须有 `settings.py` 的
 env 默认值作为地板，且 env 里出现 `AIWEB_*_API_KEY` 时永远优先（避免有人在 UI 里填 key 导致密文落库）。
@@ -350,10 +351,13 @@ AIWEB_BOOTSTRAP_ADMIN_PASSWORD=        # 【必须显式给】空则 seed_admin 
                                        # 值不能同行写注释：dotenv 会把 "# ..." 读成口令
 
 ########## 分组 6：Fernet（数据源口令加密） ##########
-AIWEB_FERNET__KEYS=                    # 【必须 env】当前 key，MultiFernet 第一项
-AIWEB_FERNET__PREVIOUS_KEYS=           # 轮换后保留的旧 key（逗号分隔，只用于解密）
-AIWEB_FERNET__VERIFY_ON_STARTUP=true   # 加解密哨兵 + 统计库内不可解密的 credential 条数
-AIWEB_FERNET__REENCRYPT_ON_STARTUP=false  # true=把所有密文用当前 key 重写一遍（一次性操作，跑完关掉）
+AIWEB_FERNET__KEYS=                    # 【必须 env】逗号分隔的轮换链：第一项加密，其余只解密
+                                       # as-built：PREVIOUS_KEYS 语义已被这张列表吃掉（列表尾部即旧 key），
+                                       # 故未单独实现；VERIFY_ON_STARTUP / REENCRYPT_ON_STARTUP 仍未实现，
+                                       # 且当前无任何工单认领这两项启动期校验
+AIWEB_FERNET__PREVIOUS_KEYS=           # 轮换后保留的旧 key（逗号分隔，只用于解密）——未实现，保留占位
+AIWEB_FERNET__VERIFY_ON_STARTUP=true   # 加解密哨兵 + 统计库内不可解密的 credential 条数——未实现
+AIWEB_FERNET__REENCRYPT_ON_STARTUP=false  # true=把所有密文用当前 key 重写一遍（一次性操作，跑完关掉）——未实现
 
 ########## 分组 7：抽取层 ##########
 AIWEB_EXTRACT__BATCH_TABLES=200        # 与"批内一事务"配套；改大要看远端 PG 事务时长

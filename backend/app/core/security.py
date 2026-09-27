@@ -1,4 +1,4 @@
-"""口令哈希与访问令牌。口令永不出库、永不进日志、永不进响应体。"""
+"""口令哈希、访问令牌、源库口令的加解密。口令永不出库、永不进日志、永不进响应体。"""
 
 from __future__ import annotations
 
@@ -6,10 +6,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import jwt
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 from pwdlib import PasswordHash
 from pwdlib.hashers.argon2 import Argon2Hasher
 
-from app.core.errors import Unauthorized
+from app.core.errors import AppError, Unauthorized
 from app.settings import get_settings
 
 # argon2id 是 docs/metadata-model.md §2.1 指定的算法；元组顺序即写入时用的算法（取第一个）。
@@ -80,3 +81,35 @@ def decode_access_token(token: str) -> dict[str, Any]:
         raise Unauthorized("登录已过期，请重新登录") from exc
     except jwt.PyJWTError as exc:
         raise Unauthorized("访问令牌无效") from exc
+
+
+# ---------------------------------------------------------------- 源库口令加解密
+
+
+def _multi_fernet() -> MultiFernet:
+    """按 AIWEB_FERNET__KEYS 的顺序拼一把轮换链：第一个加密，其余只解密。
+
+    不设外部 KMS（ADR-0007）：本机部署下多一层网络依赖只换来更低的可用性。
+    """
+    keys = get_settings().fernet.key_list
+    if not keys:
+        raise AppError(
+            "源库口令无法加解密：未配置 AIWEB_FERNET__KEYS。"
+            "生成一把：python -c 'from cryptography.fernet import Fernet;"
+            "print(Fernet.generate_key().decode())'"
+        )
+    return MultiFernet([Fernet(key) for key in keys])
+
+
+def encrypt_secret(plaintext: str) -> bytes:
+    """密文按 bytea 存（metadata-model §2.2）：返回 bytes 而不是 str，
+    否则列会被迫用 text 装 base64，验收里那句 base64 前缀检查就不是在核对二进制了。"""
+    return _multi_fernet().encrypt(plaintext.encode("utf-8"))
+
+
+def decrypt_secret(blob: bytes) -> str:
+    """解不开要说清是"密钥对不上"，不是让 InvalidToken 冒成裸 500。"""
+    try:
+        return _multi_fernet().decrypt(blob).decode("utf-8")
+    except InvalidToken as exc:
+        raise AppError("源库口令解密失败：当前 AIWEB_FERNET__KEYS 里没有能解开它的密钥") from exc

@@ -13,50 +13,18 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import AsyncIterator
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app import deps
 from app.core.security import TIMING_FILLER_DIGEST, hash_password
-from app.main import create_app
 from app.models.user import User
-from app.settings import get_settings
 
 pytestmark = pytest.mark.pg
 
-
-@pytest.fixture
-async def session_factory(
-    pg_migrated: None,
-) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    schema = get_settings().pg.schema_name
-    engine = create_async_engine(os.environ["AIWEB_PG_TEST_DSN"], poolclass=NullPool)
-    # 用例之间互相清一次：username 上有 UNIQUE，下一条不能靠"上一条恰好没同名"
-    async with engine.begin() as conn:
-        await conn.execute(text(f'DELETE FROM "{schema}".users'))
-    try:
-        yield async_sessionmaker(engine, expire_on_commit=False)
-    finally:
-        await engine.dispose()
-
-
-@pytest.fixture
-async def client(
-    session_factory: async_sessionmaker[AsyncSession], jwt_secret: str
-) -> AsyncIterator[AsyncClient]:
-    async def override_get_db() -> AsyncIterator[AsyncSession]:
-        async with session_factory() as session:
-            yield session
-
-    application = create_app()
-    application.dependency_overrides[deps.get_db] = override_get_db
-    async with AsyncClient(transport=ASGITransport(app=application), base_url="http://t") as c:
-        yield c
+# session_factory / client 两个夹具在 tests/integration/conftest.py 里
 
 
 async def test_口令正确时登录换到令牌并访问受保护端点(
@@ -251,7 +219,7 @@ async def test_时间列在库里真的是带时区的(
 ) -> None:
     """文档写的是 timestamptz；`Mapped[datetime]` 不带 timezone=True 会静默建成 timestamp，
     存进去的时刻到展示层整体偏一个时区，而且不报错。"""
-    schema = get_settings().pg.schema_name
+    schema = os.environ["AIWEB_PG__SCHEMA_NAME"]
     async with session_factory() as session:
         rows = (
             await session.execute(

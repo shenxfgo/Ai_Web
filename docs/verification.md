@@ -108,6 +108,12 @@
 > `base_table`/`view` 两个计数，视图的卡片降级路径（§1 的 `v_daily_sales` 考点）由 `view` 那一路触发。
 > 建库脚本把 10/9/1/11 四个数都自检出来（`business_all`/`business_base_table`/`business_view`/
 > `show_full_tables`），任一口径漂移就会在那份清单里露出来。
+>
+> **as-built（006）：这条排除规则住在数据源配置里，不是代码内建的。** `test_connection` 统计
+> `table_count`/`view_count` 时按 `include_schemas` + `include/exclude_tables`（**源原生 LIKE**，
+> 不是正则）过滤，所以要得到上面的 9/1，登记这条源时必须填 `exclude_tables: ["\\_%"]`；
+> 不填就是 10/1（库里真实可见数）。007 同步侧要么沿用"范围由源配置负责"这一语义，
+> 要么把下划线排除升级为内建规则——两处口径必须一致，否则 SSE 的 `total` 和探测报的数会打架。
 
 ## 2. 测试分层
 
@@ -186,8 +192,8 @@
 | 1 | `uv run python scripts/check_env.py` | 无 fatal，vector/pg_trgm/hnsw/schema 全绿；维度一致项通过 |
 | 2 | `uv run alembic upgrade head` | `aiweb` schema 下表齐全 + `alembic_version` 在 aiweb 内（不在 public） |
 | 3 | `uv run python scripts/seed_admin.py` | 建 admin；**第二次运行幂等且不重置口令**；库里存的是 argon2 hash |
-| 4 | 前端登录 → 首登强制改密 | 旧 token 立即失效（token 带 `pwd_ver` 或 `users.token_version`） |
-| 5 | 新建数据源 `demo-mysql` → 测试连接 | 返回"连接成功 / 9 表 1 视图 / 只读能力=OK / MySQL 5.7.x / max_execution_time 支持=yes" |
+| 4 | 前端登录 → 首登强制改密 | 旧 token 立即失效（as-built 005：只有 `users.token_version`（令牌里的 `tv`），没有 `pwd_ver` 那一种） |
+| 5 | 新建数据源 `demo-mysql` → 测试连接 | 返回"连接成功 / 9 表 1 视图 / 只读能力=OK / MySQL 5.7.x / max_execution_time 支持=yes"。要拿到 9/1 必须在**排除表**里填 `_%`（源原生 LIKE 里 `\_` 才是字面下划线）：库里可见的是 11 张，多出来的 `_aiweb_demo_marker`/`_numbers` 这类是脚本内部表，口径见 §1.2 的 as-built 注 |
 | 6 | 立即同步 | SSE 进度到 100%；`sync_jobs.status=success`；phase 序列完整 |
 | 7 | 元数据浏览 → 打开 `order_main` | 字段列表含中文注释；索引含复合索引两列顺序正确；关系显示指向 `customer`/`order_item`；卡片文本可复制 |
 | 8 | 知识库检索预览（调参页）输入"各区域每月回款金额" | 返回 `payment_record`/`order_main`/`customer` 三表且带 `vector_rank`/`keyword_rank`/`rrf_score` 三列排名；把 `final_tables` 改成 2 后第三表消失 |
