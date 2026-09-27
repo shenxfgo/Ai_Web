@@ -742,3 +742,13 @@ PG `format_type` → 内部 `data_type`：`character varying(64)→varchar(64)`�
 
 验收锚点：`meta_index` 表里能看到 `CARDINALITY` / `SUB_PART` 非空——
 这就证明没有退回 SQLAlchemy Inspector 的逐表 `SHOW CREATE TABLE` 方案。
+
+as-built(0007)：这个锚点原来是**半不可满足**的，原因不在抽取侧而在演示库。本机实测
+`ai_web_demo` 的 30 行 `STATISTICS` 里 `CARDINALITY` 非空 30/30（这一半一直成立），
+但 `SUB_PART` 非空 **0/30**——整个演示库一个前缀索引都没建，而 5.7 里只有前缀索引
+（`KEY (col(n))`）会让 `SUB_PART` 非空。也就是说"`sub_part` 从 IS 到 `meta_index_column`
+"这条管道当时只有单测覆盖，live 用例永远看到全 NULL，锚点被建库脚本自己抹平了
+（同 `fk:user_activity_log(must be 0)` 那条自检防的是同一类事故）。
+已按"考点补进夹具"处理：`product` 加了 `KEY idx_product_name (name(32))`，
+于是 `SUB_PART=32` 是**有硬期望值**的断言，而不是"看起来非空就行"。
+详见 verification.md §1 考点表与 §1.2 的漂移补丁说明。

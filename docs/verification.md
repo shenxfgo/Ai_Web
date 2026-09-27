@@ -11,7 +11,7 @@
 | 表 | 行数 | 表注释（中文） | 关键考点 |
 |---|---|---|---|
 | `category` | 40 | `商品分类表，两级树结构` | 自引用 `parent_id`（测 JOIN 图自环处理） |
-| `product` | 1,200 | `商品主表（SKU 粒度）` | `status ENUM('on_sale','off_sale','draft')`、`price DECIMAL(10,2)`、`tags VARCHAR` 里逗号分隔、`created_at DATETIME` |
+| `product` | 1,200 | `商品主表（SKU 粒度）` | `status ENUM('on_sale','off_sale','draft')`、`price DECIMAL(10,2)`、`tags VARCHAR` 里逗号分隔、`created_at DATETIME`、**前缀索引 `idx_product_name(name(32))`**（元数据验收 2 的 `SUB_PART` 靠它才有非空值可断言，见下注） |
 | `customer` | 3,000 | `客户档案表` | `gender ENUM('M','F','U')`、`level ENUM('normal','silver','gold','platinum')`、手机号唯一索引、`register_at DATETIME` |
 | `order_main` | 30,000 | `订单主表（一笔订单一行）` | `customer_id` FK、`status ENUM('pending','paid','shipped','completed','cancelled','refunding')`（**NL2SQL 高频：'已完成订单' 要能映射到枚举值，这是 SAMPLE_DISTINCT 的主要受益点**）、`amount`/`discount`/`pay_type`、`created_at`+`updated_at`、复合索引 `(customer_id,created_at)` |
 | `order_item` | 88,000（>50k 例外，为测聚合与 LIMIT 截断） | `订单明细行表` | `order_id`/`product_id` 双 FK、`qty`/`unit_price`/`is_gift` |
@@ -29,6 +29,15 @@
 > 直接 `SHOW FULL TABLES` 是 **11** 行，因为库里按 §1.2 第 2 步保留了标记表 `_aiweb_demo_marker`，
 > 所以**不能**照字面把 `total` 断言成它的行数。详见 §1.2 末注。
 > 原方案 §10.4 标题的"8 张"是笔误，roadmap 的 P2/P3 验收已按 9 表改齐。
+>
+> **前缀索引是 0007 补进来的考点（2026-09-27）**：原夹具 9 张表全是整列索引，而 MySQL 只在
+> 前缀索引（`KEY (col(n))`）上给 `information_schema.STATISTICS.SUB_PART` 填非空值，
+> 于是"抽取层没有退回逐表 `SHOW CREATE TABLE`"这条验收锚点的 `SUB_PART` 半边**在 live 上永远
+> 测不出来**（30 行 STATISTICS，`SUB_PART` 非空 0 行）。它和 `user_activity_log` 不建外键
+> 是同一类考点，不该由建库脚本自己抹平。`idx_product_name(name(32))` 补在产品名上，
+> 因为按中文名检索本来就是真实写法；期望值因此是硬的：`sub_part == 32`。
+> 建库脚本末尾的自检加了 `index:prefix(sub_part=32)` 一行，`tests/unit/test_demo_mysql_script.py`
+> 钉住它的存在（夹具漂移要当场红，不能等 live 用例发现全 NULL）。
 
 ### 1.1 数据生成要点
 
@@ -108,6 +117,16 @@
 > `base_table`/`view` 两个计数，视图的卡片降级路径（§1 的 `v_daily_sales` 考点）由 `view` 那一路触发。
 > 建库脚本把 10/9/1/11 四个数都自检出来（`business_all`/`business_base_table`/`business_view`/
 > `show_full_tables`），任一口径漂移就会在那份清单里露出来。
+>
+> **已建过的库不会自动长出新考点（0007）**：`demo_db.ps1` 的语义是"库存在就跳过"，而脚本本身
+> 只建不删，所以往 `CREATE TABLE` 里加索引**对已经建好的库无效**——新考点只出现在全新机器上，
+> 老机器反而永久测不到。为此脚本在自检前有一段 `PREPARE`/`EXECUTE` 守卫的**漂移补丁**
+> （`idx_product_name` 不存在才建，存在就只打一行说明），配合这一条命令收敛：
+> ```
+> mysql --defaults-extra-file=backend/.setup/my_login.cnf --default-character-set=utf8mb4 \
+>   ai_web_demo -e "ALTER TABLE product ADD INDEX idx_product_name (name(32));"
+> ```
+> （补丁段让"重放整个脚本"是安全的，但正常路径仍由外层探测拦住，不会替谁重放。）
 >
 > **as-built（006）：这条排除规则住在数据源配置里，不是代码内建的。** `test_connection` 统计
 > `table_count`/`view_count` 时按 `include_schemas` + `include/exclude_tables`（**源原生 LIKE**，

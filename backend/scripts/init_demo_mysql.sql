@@ -96,7 +96,7 @@ SELECT s.n,
 FROM _seq s WHERE s.n BETWEEN 11 AND 40;
 
 -- ---------------------------------------------------------------------
--- 2. product：ENUM + DECIMAL + 逗号分隔 tags
+-- 2. product：ENUM + DECIMAL + 逗号分隔 tags + 前缀索引（SUB_PART 考点）
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS product (
   id INT NOT NULL COMMENT '商品ID，主键',
@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS product (
   PRIMARY KEY (id),
   UNIQUE KEY uk_product_sku (sku),
   KEY idx_product_category (category_id),
+  KEY idx_product_name (name(32)),
   CONSTRAINT fk_product_category FOREIGN KEY (category_id) REFERENCES category (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
   COMMENT='商品主表（SKU 粒度）';
@@ -540,6 +541,26 @@ FLUSH PRIVILEGES;
 -- 数字表只为造数而生，造完即收走：留在库里会污染元数据抽取的对象清单。
 DROP TABLE IF EXISTS _seq;
 
+-- ---------------------------------------------------------------------
+-- 漂移补丁：往已建好的库里补后加的考点（0007）
+--
+-- 为什么需要：外层 demo_db.ps1 的语义是"库存在就跳过"，本脚本又只建不删，所以
+-- 往 CREATE TABLE 里加索引**只对全新建库生效**——老机器上这个考点永远不存在，
+-- 而 live 用例看到的全是 NULL，比报错更糟（它看起来是绿的）。
+-- 因此后加的结构性考点在这里补一次。5.7 没有 CREATE INDEX IF NOT EXISTS，
+-- 用 information_schema 探测 + PREPARE 决定跑哪条语句：重放安全，且缺什么补什么。
+-- ---------------------------------------------------------------------
+SET @need_prefix_index = (
+  SELECT COUNT(*) = 0 FROM information_schema.statistics
+  WHERE table_schema = 'ai_web_demo' AND table_name = 'product' AND index_name = 'idx_product_name'
+);
+SET @patch_sql = IF(@need_prefix_index,
+  'ALTER TABLE product ADD INDEX idx_product_name (name(32))',
+  'SELECT ''idx_product_name 已存在，无需补'' AS patch');
+PREPARE patch_stmt FROM @patch_sql;
+EXECUTE patch_stmt;
+DEALLOCATE PREPARE patch_stmt;
+
 -- =====================================================================
 -- 自检：期望值直接抄自 docs/verification.md §1 的表格，FAIL 就不是"看起来好了"
 -- =====================================================================
@@ -646,6 +667,17 @@ SELECT 'fk:category.self_ref(must be 1)' AS check_name,
 FROM information_schema.key_column_usage
 WHERE constraint_schema = 'ai_web_demo' AND table_name = 'category'
   AND referenced_table_name = 'category' AND column_name = 'parent_id';
+
+-- 前缀索引必须存在，否则元数据验收 2 的 SUB_PART 考点被建库脚本自己抹平：
+-- 整列索引在 5.7 一律给 SUB_PART=NULL，全库就凑不出一行非空，live 用例只能空跑。
+-- 期望值写死成 32（= name(32) 的字符数），不写 ">0"——硬期望值才挡得住列填错长度。
+SELECT 'index:prefix(sub_part=32)' AS check_name,
+       IFNULL(MAX(s.sub_part), -1) AS sub_part,
+       COUNT(*) AS prefix_rows,
+       IF(COUNT(*) = 1 AND MAX(s.sub_part) = 32, 'PASS', 'FAIL') AS verdict
+FROM information_schema.statistics s
+WHERE s.table_schema = 'ai_web_demo' AND s.table_name = 'product'
+  AND s.index_name = 'idx_product_name' AND s.sub_part IS NOT NULL;
 
 -- verification.md §1.2 第 6 步"收尾核对"。这不是 PASS/FAIL 裁决，而是一份人工核对清单，
 -- 同时它正是 extractor/mysql.py 第一批要跑的 SQL —— 拿建库脚本当场验证抽取 SQL 的形状。

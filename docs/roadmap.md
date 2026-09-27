@@ -116,6 +116,8 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 5. 故意让 3 张表 embed 抛错 → `status=partial`、`errors` 含表名、其余 6 张表元数据已落库；
 6. PG 数据源跑通，`test_pg_type_normalize.py` 覆盖 `_text/_int4/_numeric/_timestamptz/_varchar/[]/_jsonb`；
 7. `meta_index` 里 `CARDINALITY`/`SUB_PART` 非空（证明没退回 `SHOW CREATE TABLE` 方案）。
+   as-built(0007)：`SUB_PART` 这一半原先在演示库里**测不出来**（夹具没有前缀索引），已补
+   `product.idx_product_name(name(32))` 并把期望值钉成 `sub_part == 32`，见 verification.md §1 注。
 
 踩坑预警：① 5.7 的 `STATISTICS` 对 MyISAM/视图语义不同，视图要单独分支（列注释全空 → 卡片降级模板）；
 ② 别把源库读和元数据库写混在一个 session；③ `heartbeat_at` 必须在**独立连接**上更新。

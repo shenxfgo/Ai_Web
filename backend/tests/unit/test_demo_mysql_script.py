@@ -156,6 +156,31 @@ def test_category_self_reference_exists(sql: str) -> None:
     assert "REFERENCES category (id)" in body, "自引用外键没了，JOIN 图自环的考点就测不到"
 
 
+def test_product_declares_a_prefix_index(sql: str) -> None:
+    """`SUB_PART` 只有前缀索引才会给非空值——没有它，元数据验收 2 的一半在 live 上永远空跑。
+
+    整列索引在 5.7 一律 `SUB_PART=NULL`，所以补它之前那份夹具（全库 30 行 STATISTICS、非空 0 行）
+    抽出来的 sub_part 管道是**从没被真值验证过**的。长度写死 32：自检与 live 用例都拿它当
+    硬期望值，改成别的长度要三处一起改。
+    """
+    body = _table_body(sql, "product")
+    assert re.search(r"KEY idx_product_name \(name\(32\)\)", body), "前缀索引没了或长度变了"
+    # 自检里也必须有对应的那一行，否则考点漂移只在 live 用例里响（而 live 会被 skip）
+    assert "index:prefix(sub_part=32)" in sql
+    assert re.search(r"MAX\(s\.sub_part\) = 32", sql), "自检没钉住长度，只钉了存在性"
+
+
+def test_later_fixture_points_are_backfilled_for_existing_databases(sql: str) -> None:
+    """外层"库存在就跳过"+ 脚本只建不删 ⇒ 往 CREATE TABLE 加索引对老库无效。
+
+    不加这段，新考点就只存在于全新机器上；老机器上 live 用例看到全 NULL 还是绿的，
+    比红更糟。5.7 没有 CREATE INDEX IF NOT EXISTS，所以是探测 + PREPARE。
+    """
+    assert re.search(r"index_name = 'idx_product_name'", sql), "漂移补丁没有存在性探测"
+    assert "PREPARE patch_stmt FROM @patch_sql" in sql, "补丁段不是幂等的"
+    assert "ALTER TABLE product ADD INDEX idx_product_name (name(32))" in sql
+
+
 def test_ro_password_only_reaches_sql_through_placeholder(sql: str) -> None:
     identified = re.findall(r"IDENTIFIED BY '([^']*)'", sql)
     assert identified == [RO_PASSWORD_PLACEHOLDER] * len(identified), "CREATE USER 里出现了真实口令"
