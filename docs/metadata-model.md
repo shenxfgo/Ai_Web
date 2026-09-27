@@ -356,8 +356,22 @@ ON CONFLICT (datasource_id, catalog_name, schema_name, table_name) DO UPDATE SET
   granularity     = COALESCE(aiweb.meta_table.granularity,  EXCLUDED.granularity),
   is_hidden       = aiweb.meta_table.is_hidden,      -- 人工开关，原样保留
   synced_at       = now();
--- 2) 字段/索引：delete-then-insert per table（子表无人工字段，全量替换最简）
-DELETE FROM aiweb.meta_column WHERE table_id = ANY(%ids);  INSERT ...
+-- 2a) 字段：自然键 (table_id, column_name) upsert，人工列同样 COALESCE 保护
+INSERT INTO aiweb.meta_column (table_id, column_name, <同步列...>, comment_zh, business_desc)
+VALUES (...)
+ON CONFLICT (table_id, column_name) DO UPDATE SET
+  ordinal_position = EXCLUDED.ordinal_position,
+  data_type / raw_data_type / nullable / default_value / is_generated /
+  comment_raw / is_primary_key / is_unique / is_indexed / enum_values /
+  char_length / numeric_precision / numeric_scale   = EXCLUDED.<同名列>,
+  comment_zh    = COALESCE(aiweb.meta_column.comment_zh,    EXCLUDED.comment_zh),
+  business_desc = COALESCE(aiweb.meta_column.business_desc, EXCLUDED.business_desc),
+  synced_at     = now();
+-- upsert 不会碰"源库已删掉"的列，全量替换的语义靠这一步补回来（见下方要点）
+DELETE FROM aiweb.meta_column
+ WHERE table_id = ANY(%ids) AND synced_at < %this_sync_started_at;
+-- 2b) 索引：delete-then-insert per table（这一对子表才真的无人工字段）
+DELETE FROM aiweb.meta_index WHERE table_id = ANY(%ids);  INSERT ...
 -- 3) 关系：只删 extracted，manual/inferred 各自走自己的重建逻辑
 DELETE FROM aiweb.meta_relation
  WHERE datasource_id=%d AND source_kind='extracted'
@@ -368,7 +382,18 @@ DELETE FROM aiweb.meta_relation
 
 - `COALESCE(现有值, 新值)` = "库里已有人工值就保留，只有为空时才接受新值"。
   `is_hidden` 直接原样保留（人工开关，连新值都不接受）。
-- 子表（列/索引）**无人工字段**，所以 delete-then-insert 全量替换最简。
+- **as-built(0007)：原文这一条写的是"子表（列/索引）无人工字段，所以 delete-then-insert 最简"，
+  与 §2.4 自相矛盾**——`meta_column` 就带 `comment_zh` / `business_desc` 两个人工列（§2.4 明确列了它们，
+  而 §3 的人工字段清单也包含这两个名字）。对 `meta_column` 走 delete-then-insert 等于**每次点"同步"
+  就把字段级的中文补录全清光**，幂等重跑的核心承诺当场失效。
+  修正后的口径：**只有 `meta_index` / `meta_index_column` 无人工字段**（`comment` / `is_visible` /
+  `cardinality` / `sub_part` 全部来自 `STATISTICS`，是同步列），它们才用 delete-then-insert；
+  `meta_column` 与主表同构，走自然键 upsert。
+- upsert 换不来"删掉的列消失"这件事，所以补一个 `synced_at < 本轮同步开始时刻` 的清扫。
+  比较基准必须取**本轮同步开始前**捕获的时间戳（用 `sync_jobs.started_at`），不能用语句里的
+  `now()`：PG 的 `now()` 是事务时间戳，同一事务内恒定，拿它和自己比永远不成立。
+- `enum_values` 归同步列而不是人工列：它是源库 `COLUMN_TYPE` 的投影（§8.1 C 的 `enum_def`），
+  同步每次都能重算出来，人工改它没有意义（要改语义写 `comment_zh`）。
 
 ## 4. `meta_relation.source_kind` 与删除差分
 
