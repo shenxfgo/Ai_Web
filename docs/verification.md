@@ -24,9 +24,10 @@
 守卫语料里的表名（`order_main`/`order_item`/`customer`/`payment_record`/`refund_record`/
 `product_stats_wide`/`category`/`product`）与这张演示库一一对应 —— 语料的 `DEMO_TABLES` 白名单就是它。
 
-> **口径已定（2026-09-23）**：以**枚举出来的对象清单为准 = 9 张业务表 + 1 视图**。
-> 同步验收里的 `total` 随之为 10（`SHOW FULL TABLES` 全计）或 9（只计 `BASE TABLE`），
-> 二者只能选一种并让断言与它同源，否则"进度 total 与 `SHOW TABLES` 计数一致"这一步永远测不过。
+> **口径已定（2026-09-23 定，2026-09-27 收尾）**：以**枚举出来的对象清单为准 = 9 张业务表 + 1 视图**。
+> 同步验收里的 `total` 随之为 **10**（排除下划线前缀对象后的全计数，含那张 `VIEW`）；
+> 直接 `SHOW FULL TABLES` 是 **11** 行，因为库里按 §1.2 第 2 步保留了标记表 `_aiweb_demo_marker`，
+> 所以**不能**照字面把 `total` 断言成它的行数。详见 §1.2 末注。
 > 原方案 §10.4 标题的"8 张"是笔误，roadmap 的 P2/P3 验收已按 9 表改齐。
 
 ### 1.1 数据生成要点
@@ -87,7 +88,26 @@
    —— 这条也正是 `extractor/mysql.py` 第一批要跑的 SQL，一举两得（用它验证抽取 SQL 的正确性）。
 
 > `make demo-db` 的语义就是第 1+3 步：先探测 `SHOW DATABASES LIKE 'ai_web_demo'`，
-> **不存在才** pipe `init_demo_mysql.sql`，口令读 `LOCAL_MYSQL_PWD`。
+> **不存在才** pipe `init_demo_mysql.sql`。
+>
+> **口令通道已改（2026-09-27 实测后回写）**：不再读 `LOCAL_MYSQL_PWD` 环境变量，改读
+> `backend/.setup/my_login.cnf`（`[client]` 段 + `--defaults-extra-file`，目录已 gitignore）。
+> 理由：Windows 上 `MYSQL_PWD` 会进子进程环境块、`-p<pwd>` 会进命令行与历史，
+> 而 extra-file 是 mysql 自己的机制，口令不进 argv。外层脚本只校验该文件非空，从不回显其内容。
+>
+> **`aiweb_ro` 的 host 范围已收窄（有意偏离第 4 步示例）**：只开 `'localhost'` 与 `'127.0.0.1'`，
+> 不给 `@'%'`。本机开发没有跨主机应用连接，把账号开到网段是无谓的风险；
+> 哪天需要网段访问，再显式改这一条并同步文档。
+>
+> **`SHOW FULL TABLES` 实测是 11 行，不是 10；口径已拍板（2026-09-27）**：`_aiweb_demo_marker` 是
+> 真实的 `BASE TABLE`，而 §1.2 第 2 步要求库里保留它（`_seq` 已在脚本末尾收走）。
+> **`total` = 排除下划线前缀对象后的 10**（9 张 `BASE TABLE` + 1 张 `VIEW`），
+> **不能**直接取 `SHOW FULL TABLES` / `information_schema.tables` 的行数（那是 11，会把内部标记表
+> 当成业务对象算进进度、并污染表卡片与 prompt）。
+> 同步逻辑内部**必须区分表与视图**：SSE 的 `progress` 事件除 `done/total` 外还带
+> `base_table`/`view` 两个计数，视图的卡片降级路径（§1 的 `v_daily_sales` 考点）由 `view` 那一路触发。
+> 建库脚本把 10/9/1/11 四个数都自检出来（`business_all`/`business_base_table`/`business_view`/
+> `show_full_tables`），任一口径漂移就会在那份清单里露出来。
 
 ## 2. 测试分层
 

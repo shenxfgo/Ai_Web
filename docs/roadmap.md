@@ -104,8 +104,12 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 验收：
 1. `POST /api/sync/jobs` → 返回 job id；
 2. `GET /api/sync/jobs/1/events`（SSE）输出 `event: progress` 序列（含 `phase=extract/embed/upsert`、
-   `done=..., total=10`）并以 `event: done` 结束，`total` 与 `SHOW FULL TABLES` 计数一致
-   （9 张 `BASE TABLE` + 1 张 `VIEW` 全计；若实现只计 `BASE TABLE` 则为 9，两处口径必须同源）；
+   `done=..., total=10`）并以 `event: done` 结束，`total` 与**排除下划线前缀对象后**的库内对象计数一致
+   （**口径已拍板（2026-09-27）：报 10 = 9 张 `BASE TABLE` + 1 张 `VIEW`**；
+   `progress` 事件除 `done/total` 外还要带 `base_table`/`view` 两个计数，视图卡片降级走 `view` 那一路。
+   注意实测直接 `SHOW FULL TABLES` 是 **11** 行，因为建库脚本按 verification.md §1.2 第 2 步在库里
+   保留了标记表 `_aiweb_demo_marker`——**不能**照字面把 `total` 断言成它的行数，
+   详见 verification.md §1.2 末注）；
 3. 同时再发一次 POST → 409 `sync_already_running`（证明部分唯一索引生效，不是代码 race）；
 4. 同步中途 `kill` 进程再重启：日志出现"回收 N 个僵尸 job"，重启后重新同步得到 `status=success`；
 5. 故意让 3 张表 embed 抛错 → `status=partial`、`errors` 含表名、其余 6 张表元数据已落库；
@@ -464,7 +468,7 @@ LLM 探活、embedding 维度实测），`make check-env` / `dev.ps1 check-env` 
 | `migrate` | `uv run alembic upgrade head` |
 | `migrate-new m="..."` | `alembic revision -m` + 手工填；**新迁移必须 import pgvector、必须带 down** |
 | `seed-admin` | `uv run python scripts/seed_admin.py` |
-| `demo-db` | 探测 `SHOW DATABASES LIKE 'ai_web_demo'` → 不存在才 pipe `init_demo_mysql.sql`（口令读 `LOCAL_MYSQL_PWD`） |
+| `demo-db` | 探测 `SHOW DATABASES LIKE 'ai_web_demo'` → 不存在才 pipe `init_demo_mysql.sql`（建库账号口令读 `backend/.setup/my_login.cnf`，见 verification.md §1.2 末） |
 | `dev-backend` / `dev-frontend` | 分别起 uvicorn / vite（`--loop asyncio`） |
 | `dev` | ps1 版用 `Start-Process`/`Start-Job` 并行两个；Makefile 版提示开两个终端（不引 `concurrently`） |
 | `lint` / `fmt` / `typecheck` | `ruff check . && mypy app` / `ruff format .` / `npm run typecheck` |

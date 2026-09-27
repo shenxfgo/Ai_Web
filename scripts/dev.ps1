@@ -40,13 +40,14 @@ function Start-Dev {
 switch ($Target) {
     "help" {
         Write-Host "可用目标（与 Makefile 同名）："
-        Write-Host "  bootstrap  check-env  migrate"
+        Write-Host "  bootstrap  check-env  migrate  demo-db"
         Write-Host "  dev  dev-backend  dev-frontend"
         Write-Host "  lint  fmt  typecheck  test  check  clean"
     }
     "bootstrap" { Invoke-Step $Root @("python", "scripts/bootstrap.py") }
     "check-env" { Invoke-Step $Backend @("uv", "run", "python", "scripts/check_env.py") }
     "migrate" { Invoke-Step $Backend @("uv", "run", "alembic", "upgrade", "head") }
+    "demo-db" { & (Join-Path $PSScriptRoot "demo_db.ps1") }
     "dev-backend" { Invoke-Step $Backend @("uv", "run", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000", "--reload") }
     "dev-frontend" { Invoke-Step $Frontend @("npm", "run", "dev") }
     "dev" { Start-Dev }

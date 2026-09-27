@@ -1,9 +1,9 @@
-# Windows 上没有 make 时改用：powershell -File scripts\dev.ps1 <目标>，目标名一致。
+# Windows 上没有 make 时改用：powershell -NoProfile -ExecutionPolicy Bypass -File scripts\dev.ps1 <目标>，目标名一致。
 SHELL := bash
 BACKEND := backend
 FRONTEND := frontend
 
-.PHONY: help bootstrap check-env migrate dev dev-backend dev-frontend lint fmt typecheck test check clean
+.PHONY: help bootstrap check-env migrate demo-db dev dev-backend dev-frontend lint fmt typecheck test check clean
 
 help:
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/^\([a-z-]*\):.*## /\1\t/'
@@ -17,6 +17,9 @@ check-env: ## 环境体检（配置/目录/元数据库/LLM 探活），有 fail
 migrate: ## 元数据库升级到最新 schema
 	cd $(BACKEND) && uv run alembic upgrade head
 
+demo-db: ## 建本机演示库 ai_web_demo（只探测、只建不删；建库账号走 backend/.setup/my_login.cnf）
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo_db.ps1
+
 dev-backend: ## 起 FastAPI（127.0.0.1:8000，热重载）
 	cd $(BACKEND) && uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 
@@ -24,7 +27,7 @@ dev-frontend: ## 起 Vite（127.0.0.1:5173，/api 代理到 8000）
 	cd $(FRONTEND) && npm run dev
 
 dev: ## 并行起前后端（要分终端观察日志时改用上面两个目标）
-	powershell -NoProfile -File scripts/dev.ps1 dev
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 dev
 
 lint: ## 后端 ruff 静态检查
 	cd $(BACKEND) && uv run ruff check app scripts tests alembic
