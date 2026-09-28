@@ -161,8 +161,11 @@ token 估算**不引真 tokenizer 到写入路径**：`CJK 字符数×1 + ASCII 
   原子切换（同事务把旧 active 置 retired）。维度不同时要**新表/新列**（影子列/影子表），
   激活后旧 profile 向量仍在，可回滚。
 - `scripts/reembed.py`：换模型时全量重建。
-- 未启用向量（`AIWEB_EMBEDDING__DIMENSION=0`）时卡片照样构建，`search_text` 与关键词索引可用，
-  `embedding` 列留 NULL——这是 pgvector 可插拔的具体体现。
+- 未启用向量（`settings.embedding.configured=False`：base_url/key/model 任一不齐，或 `DIMENSION=0`）时
+  卡片照样构建，`search_text` 与关键词索引可用，`embedding` 列留 NULL——这是 pgvector 可插拔的具体体现。
+  **注意"可插拔"指的是运行期不调 embedding 端点，不是迁移期不需要 `vector` 类型**：
+  `AIWEB_EMBEDDING__DIMENSION` 同时是 `kb_card.embedding` 的**列宽**，所以 `0005` 迁移要求它 `>0`，
+  为 `0` 时拒绝建表并给中文 hint。向量路真正的开关是 `embedding.configured`（见 architecture.md §5.1）。
 
 ## 8. 枚举 distinct 值采样
 

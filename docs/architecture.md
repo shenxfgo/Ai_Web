@@ -220,10 +220,13 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 
 **pgvector / embedding 是可插拔增强，不在主链路上。** 语义：
 
-- 未配置向量端点（`AIWEB_EMBEDDING__DIMENSION=0` 或 base_url/key/model 不齐）时，
+- 未配置向量端点（base_url/key/model 不齐，或 `AIWEB_EMBEDDING__DIMENSION=0`）时，
   `settings.embedding.configured` 为 `False`，检索直接走 L1/L2 结构化路径，**链路不断**。
   `/api/healthz` 用 `retrieval_mode` 明说当前形态：`"keyword"` 或 `"vector+keyword"`。
+  `DIMENSION` 从 0005 起兼任 `kb_card.embedding` 的**列宽**（建库期硬依赖 `vector` 类型），
+  见 kb-workflow.md §7 末条与 ADR-0003 补注。
 - 启动体检在未启用向量时把 `embedding` 判为 `ok`（"未启用，检索走结构化路径"），只有启用了才探活并核对维度。
+  as-built(P2-0005)：但 `vector` **扩展**在 `DIMENSION>0` 时就要检（fatal），判据从"启用向量路"改为列宽已定。
 - 启用向量后走的是下面 §5.2 的混合检索（向量路 + 关键词路 RRF 融合），它提升召回质量，但移除后系统仍可问数。
 
 ### 5.2 混合检索完整流程（向量增强启用后）

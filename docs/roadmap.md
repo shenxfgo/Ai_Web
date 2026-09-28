@@ -429,6 +429,11 @@ AIWEB_METRICS__ENABLED=false           # 首版不引 prometheus，留位
 
 - `AIWEB_EMBEDDING__DIMENSION=0` 表示**关闭向量路**（不是"未填"），配合注释
   "未配置向量端点时检索走结构化路径，链路不断"。
+  **as-built(P2-0005) 收窄**：这个键同时是 `kb_card.embedding` 的**列宽**（`vector(dim)`），
+  `0` 不是合法列宽，所以建了 0005 之后 `DIMENSION=0` 会让迁移直接拒绝而不是"列留 NULL"。
+  运行期的开关以 `embedding.configured` 为准（还要 base_url/key/model 齐备），
+  本机 `.env` 因此写 **1536** 而不是 0：列宽定了、HNSW 建了，但没有端点 → 卡片照常构建、向量路不走。
+  这条改动的代价写进 ADR-0003 的补注：**可插拔免掉的是运行期端点依赖，免不掉建库期的 `vector` 类型依赖**。
 - `AIWEB_RETRIEVAL__CATALOG_DIGEST_MAX_TABLES=1000`（新增，L2 检索阶梯用）。
 - `AIWEB_QUERY__ALLOW_SQL_EDIT=admin`（把"手改 SQL 重跑"做成三态开关）。
 - `AIWEB_APP__REQUEST_ID_HEADER=X-Request-Id`（大小写与设计稿的 `X-Request-ID` 以落地文件为准）。
@@ -445,7 +450,7 @@ AIWEB_METRICS__ENABLED=false           # 首版不引 prometheus，留位
 | # | 检查 | 做法 / SQL | 级别 |
 |---|---|---|---|
 | 1 | PG 连通与身份 | `SELECT current_database(), current_user, version(), SHOW server_version_num` | fatal |
-| 2 | `vector` 扩展 | `SELECT extversion FROM pg_extension WHERE extname='vector'`；缺失时给"必须超级用户建扩展"的 hint（0.8.6 无 trusted） | fatal（仅在启用向量路时） |
+| 2 | `vector` 扩展 | `SELECT extversion FROM pg_extension WHERE extname='vector'`；缺失时给"必须超级用户建扩展"的 hint（0.8.6 无 trusted） | fatal（as-built(P2-0005)：判据从"启用向量路"改成 **`AIWEB_EMBEDDING__DIMENSION>0`**——`kb_card.embedding` 的列类型要引用 `vector`，扩展不在则迁移必挂，而 `.env` 一旦按 P2 建表就必然 >0） |
 | 3 | `pg_trgm` / `btree_gin` | 两者 trusted，应用自己 `CREATE EXTENSION IF NOT EXISTS` | fatal（trgm 缺失→warn 并自动降级关键词路） |
 | 4 | HNSW AM 可用 | `SELECT 1 FROM pg_am WHERE name='hnsw'`（PG≥14 + pgvector≥0.5） | fatal |
 | 5 | schema 可写 | `SELECT has_schema_privilege(current_user,'aiweb','CREATE')`；`CREATE SCHEMA IF NOT EXISTS` 试探 | fatal |
@@ -542,7 +547,7 @@ Vite 只暴露 `VITE_` 前缀变量，**前端不放任何密钥**，这里只�
 | 缺失项 | 需要它的具体时点 | 绕行 |
 |---|---|---|
 | 远端 PG DSN + `aiweb` schema 可建权限 | **P1 第一天** | 本机自装 PG；或用 DDL snapshot 单测验证迁移；**P2 端到端无法完成**（最硬的前置阻塞） |
-| `vector` 扩展由谁建（非 trusted） | P1（0001 迁移） | 先写成"检测缺失则清晰报错 + 给 DBA 一句 SQL"；未启用向量路时不阻塞 |
+| `vector` 扩展由谁建（非 trusted） | P1（0001 迁移） | 先写成"检测缺失则清晰报错 + 给 DBA 一句 SQL"；**as-built(P2-0005)**：本机 pgvector 0.8.6 由用户以超管装好并在 `aiweb`/`aiweb_test` 两库各建一次扩展（`vector.control` 无 `trusted`，应用账号建不了）；0001 仍不碰它，但 0005 起它是**建库前置**，不再"未启用向量路时不阻塞" |
 | 是否有 `pg_jieba`/`zhcfg` 中文全文配置 | P4 | 假定没有：`simple` FTS + trgm + 精确标识符 + 应用侧 `pypinyin` 别名 |
 | 测试专用库 `aiweb_test` | P4/P6 集成测试 | pg marker 全 skip，只做 DDL snapshot 单测 |
 | LLM `base_url`/`api_key`/`model` | **P2** | 用 `respx` fixture 假数据打通链路，真模型在 P5 之后再接；P1/P3/P7 不受影响 |

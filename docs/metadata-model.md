@@ -275,13 +275,17 @@ search_text text NOT NULL   -- 关键词检索用（标识符+注释+值，去 m
 token_count int NOT NULL
 meta jsonb DEFAULT '{}'     -- {approx_rows, column_count, tags, confidence}
 index_profile_id bigint NOT NULL
-embedding vector(1536)     -- 维度来自 settings（可插拔增强；未启用向量时全 NULL 不影响链路）
+embedding vector(dim)      -- dim = settings.embedding.dimension，迁移里用 op.execute 渲染，不硬编码
+                             -- 可插拔增强；未启用向量端点时全 NULL 不影响链路
+                             -- as-built(0005)：dim 必须 >0——`vector(0)` 非法，所以"未启用向量"
+                             -- 由 embedding.configured（base_url/key/model 齐不齐）判定，不由 dim=0 判定
 embedded_at timestamptz NULL
 sync_job_id / updated_at / deleted_at
 ```
 
 ```sql
--- 向量索引（仅在启用 embedding profile 时需要）：HNSW（cosine），卡片量小用默认参数起步
+-- 向量索引（as-built(0005)：随建表同批建，不等"启用 embedding profile"——
+-- HNSW 可以建在空表上（这正是选它而非 IVFFlat 的理由），空表建好省掉 P4 再改迁移）
 CREATE INDEX ix_kb_card_emb ON aiweb.kb_card
   USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 -- 关键词索引
