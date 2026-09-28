@@ -124,6 +124,11 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 
 设计要点（每条都为检索或为 LLM 服务）：
 
+- **缺原料时的降级字面（as-built(0008)）**：模板里 `{{ approx_rows | human_int }}` 在 `approx_rows`
+  为 NULL 时会渲染成"约  行"这种半截话，而**视图在 `information_schema.TABLES` 里就是没有行数**
+  （verification §1 给 `v_daily_sales` 出的正是这个考点）。所以【规模】行整行按 NULL 降级为
+  `【规模】行数未知（视图或未分析）`；同理 表注释缺失 → `（源库无表注释）`、
+  列注释缺失 → `（无注释）`、粒度缺失 → `未知：一行代表一条记录`。降级只改字面、**不改卡片数量**。
 - **中英混排、标识符原样**：`pay_amount decimal(18,2): 实付金额`。向量模型和 trgm 都能命中
   "实付金额"和"pay_amount"两个入口。
 - **枚举取值必须进文本**：中文库里 `status='已完成'` 是唯一能对上自然语言的东西；
@@ -138,6 +143,8 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 卡片编辑的语义：编辑后 `template_version` 不变但 `content_hash` 变，标记"人工修订"，
 并触发该表 embedding 重算（`POST /kb/reembed {table_id}`）。
 模板本身变更时升 `AIWEB_EXTRACT__CARD_TEMPLATE_VERSION`（写进 `kb_index_profile`），触发全量重算。
+它是 **int**（§2.6 的列类型就是 `card_template_version int`；`roadmap §配置语义` 原示例值写作 `v1`，
+as-built(0008) 已改成 `1`）。带前缀的 `tplv1` 只出现在 profile 的 `name` 里，那是给人看的展示形态。
 
 ## 6. 分块策略（宽表）
 

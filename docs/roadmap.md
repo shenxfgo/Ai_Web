@@ -369,7 +369,11 @@ AIWEB_EXTRACT__TABLE_ALLOWLIST=        # 空=按数据源 UI 勾选；非空视�
 AIWEB_EXTRACT__SAMPLE_DISTINCT=false   # 枚举列 TOP-N 值采样：扫源库数据，默认关
 AIWEB_EXTRACT__SAMPLE_DISTINCT_MAX_DISTINCT=30   # 只有 NDV<=该值才视为枚举列
 AIWEB_EXTRACT__SAMPLE_ROW_LIMIT=1000
-AIWEB_EXTRACT__CARD_TEMPLATE_VERSION=v1          # 写进 kb_index_profile，模板变更触发重算
+AIWEB_EXTRACT__CARD_TEMPLATE_VERSION=1          # 写进 kb_index_profile，模板变更触发重算
+                                       # as-built(0008)：本行原示例值写作 `v1`，与 metadata-model §2.6
+                                       # 的列类型 `card_template_version int` 对不上（`v1` 进 int 列会在
+                                       # 同步落库时当场报错）。§5 的动词是"**升**版本"、profile 名里的
+                                       # `tplv1` 才是带前缀的展示形态，所以实现按 int 走，示例值改成 1。
 AIWEB_EXTRACT__HEARTBEAT_INTERVAL_S=10
 AIWEB_EXTRACT__ZOMBIE_STALE_S=180      # heartbeat_at 超过此值判僵尸并在启动时回收
 AIWEB_EXTRACT__CJK_WIDTH_AWARE=true    # 列名/注释含中文时的对齐与截断

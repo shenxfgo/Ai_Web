@@ -181,6 +181,17 @@
      对 **DDL 字符串**做断言：包含 `vector(1536)`、`USING hnsw`、`WITH (m=16, ef_construction=64)`、
      `USING gin (search_text gin_trgm_ops)`、`CREATE UNIQUE INDEX ... WHERE status = 'running'`、
      `SET SCHEMA` / `"aiweb".` 前缀。90% 的"迁移写错了"能在无 DB 下被抓到，且跑得极快。
+   - **断言字面的三种写法要分清（as-built(0008)）**：同一条 HNSW 索引在三个地方长得不一样，
+     照本行的字面去断言会必红：
+     ① SQLAlchemy 渲染出的是 `WITH (m = 16, ef_construction = 64)`（等号两边带空格）；
+     ② `metadata-model §2.6` 的手写 DDL 也是这个带空格的形状；
+     ③ 真库 `pg_indexes.indexdef` 回显成 `WITH (m='16', ef_construction='64')`（数字带引号）。
+     所以 schema-only 断言按 ① 的字面比，pg 断言则先把空格和引号抹掉再比 ②/③——
+     这不是"断言写松了"，而是**渲染层与回显层本来就不是同一个字符串**，
+     硬要求一处字面统一反而会把实现逼成字符串拼接。
+   - `vector(dim)` 的渲染方式（as-built(0005)）：`metadata-model §2.6` 原写"迁移里用 `op.execute` 渲染"，
+     实现改走 `pgvector.sqlalchemy.Vector(dim)`（`op.execute` 拼字符串会让列宽与 ORM 的类型各写一份，
+     漂移无人看守）。渲染出的类型名是大写 `VECTOR(1536)`，断言时统一 `.upper()` 再比。
    - ORM↔迁移漂移：`alembic check`（有 DSN 时跑，无 DSN skip）。
    - **剩下的 10%（HNSW 真能建、`vector` 维度上限、trgm 可用、`SET LOCAL hnsw.ef_search` 生效）
      无法在 SQLite 上验证**，只能靠远端 `aiweb_test` 库——这是必须争取远端 PG 访问权的核心理由。
