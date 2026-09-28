@@ -298,18 +298,34 @@ as-built(P2-0009)，P2 只跑 (2)(4)(5) 这三步，其余步骤的位置留着�
 ### 5.3 JOIN 路径推导
 
 - 边权重：`manual` = 0.1、`extracted` = 0.5、`inferred` = 1/confidence；两两 targets 求最短简单路径后取并集。
+  > **as-built(P2-0010)**：本条与下面"环与自关联""多路径歧义""完全推不出路径时降级"三条是
+  > **一整块没人实现的 JOIN 图**（全仓 grep 不到 `join_graph`/BFS，而 verification §2.1 把它当成
+  > 有 6 条单测的单元接缝）。010 只把**候选表之间已有的边**渲染进 prompt 的【JOIN】段
+  > （extracted/manual 全收，inferred 过 ≥0.8），图算法整块归**工单 014**（JOIN 图切片）。
 - 无外键的分析库（现实常态）：按命名约定推断 `t1.c → t2.c'`（列名同、`t2` 的 PK 是该列、类型族兼容），
   打分 `0.35 + 0.25[一侧是PK] + 0.15[类型完全相同] + 0.15[后缀 _id/_no/_code 且前缀与 t2 主名词匹配] + 0.10[t2 表名是 c 去后缀的单/复数变体]`，
   写入 `meta_relation(source_kind='inferred', confidence)`，**只有 ≥0.8 才进 prompt**，且带 `[推断,置信 0.87]` 标签。
   候选度 > 8 的字段（如 `org_id` 出现在 40 张表）需另一端有唯一约束，否则丢弃并 warning（抑制组合爆炸）。
 
-  > **未解决的口径冲突（0007 施工中发现，留给 010/P4 拍板）**：本节的加权打分与
-  > roadmap §P4、verification §2.1 的"**命名约定 = 0.7**"（一个常数）不是同一件事。
-  > 更要紧的是两者**互斥**：常数 0.7 配上面的"≥0.8 才进 prompt"，等于推断出的边永远进不了
-  > prompt——整条无外键 JOIN 推导链在参数上就死了，且不会报错，只会静默降级成单表问答。
-  > 0007 按工单备忘落的是常数 `0.7`（它只负责写库，不负责门槛），**门槛与打分的统一必须在
-  > 010 开工前完成**：要么 010 改用打分公式（演示库里 `user_activity_log.user_id → user.id`
-  > 按公式是 `0.35+0.25+0.15+0.15+0.10=1.00`，能过门槛），要么把门槛降到 0.7 以下。
+  > **as-built(P2-0010)：本节开头的加权公式与 roadmap §P4、verification §2.1 的"命名约定 = 0.7"
+  > 曾是互斥的两套口径**（常数 0.7 配"≥0.8 才进 prompt"，等于推断边永远进不了 prompt，
+  > 且不报错、只静默降级成单表问答）。0007 施工时发现，挂在这里等拍板；**2026-09-28 由用户拍板闭环**：
+  > 公式落地在写侧（`services/relation_infer.py` 算 confidence），门槛保持 ≥0.8 不改，
+  > 常数 `0.7` 降格为**公式的地板**（一项加成都拿不到时的分数，本函数的减法规则下不可达）。
+  > roadmap §P4 与 verification §2.1 那两处"0.7"同步改掉。
+  >
+  > 落地后要认一个事实：`infer_relations()` 的前置条件已经把"目标列是该表单列主键""后缀属
+  > `_id/_no/_code`""表名是去后缀的单/复数变体"三项做成了**恒真**，所以公式实际只剩
+  > "类型完全相同"这一档加成 —— **confidence 只会是 0.85 或 1.00，门槛 ≥0.8 因此不筛掉任何一条边**。
+  > 它不是判别器，只是形式上过了线。真正拦噪声的是本节末"候选度 > 8 需另一端有唯一约束"那条抑制，
+  > 而它需要把索引原料喂进推断函数（现在的签名只有 `columns` + `foreign_keys`），**至今没实现**。
+  > 演示库踩不到（`ai_web_demo` 没有 40 表共用同名列），所以这是一笔**已识别的欠账**，
+  > 与 §5.3 的 BFS/桥表/环/不可达那一整块一起归工单 014（JOIN 图切片），不在 010 范围内。
+  >
+  > 另：本节的算例原写 `user_activity_log.user_id → user.id`，**演示库里没有 `user` 表**
+  > （真表是 `customer`，`user_id` 因此推不出边——0007 验收 4 就钉着这件事）。
+  > 现成的真算例是 `user_activity_log.product_id → product.id`：两侧都是 `INT`，
+  > `0.35+0.25+0.15+0.15+0.10 = 1.00`。
 - 环与自关联（`parent_id → id`）：`max_hops` 截断，并注明"自引用层级，注意递归在 MySQL 5.7 不可用"。
 - 多路径歧义（同对表 ≥2 条等长路径，或 1↔N 二义）→ 标 `ambiguous` 并在结论里请用户澄清。
 - **完全推不出路径时降级为单表问答**，在结论里明说"未能确定跨表关联，建议补充表关系后重问"，
@@ -398,7 +414,7 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | GET | `/datasources/{id}` | read 权 | — | 详情，`connect_password` **永不回传**（回 `password_masked:'••••'` + `has_secret:true`） |
 | PATCH | `/datasources/{id}` | owner/admin | 同上 + `status` | 200（密码字段缺省=不改） |
 | DELETE | `/datasources/{id}` | owner/admin | — | 软删 `deleted_at` |
-| POST | `/datasources/{id}/test` | owner/admin | `{}` 或 `{"connect_password":"临时未保存口令"}` | `{ok, server_version, visible_schemas, est_table_count, table_count, view_count, grants:{read_only:bool, code:'readonly_capability_missing'\|null, warnings[]}, supports_max_execution_time:bool, latency_ms}` **← 建库前先探规模**；`table_count/view_count` 按 `include_schemas + include/exclude_tables`（源原生 LIKE）口径统计，并把探到的 `server_version` 写回 §2.2 那一列；`supports_max_execution_time` 决定 011 的超时能否由源库兜底；`grants.code` 只作机读警告，不阻断（§4.1），阻断留给 011 |
+| POST | `/datasources/{id}/test` | owner/admin | `{}` 或 `{"connect_password":"临时未保存口令"}` | `{ok, server_version, visible_schemas, est_table_count, table_count, view_count, grants:{read_only:bool, code:'readonly_capability_missing'\|null, warnings[]}, supports_max_execution_time:bool, latency_ms}` **← 建库前先探规模**；`table_count/view_count` 按 `include_schemas + include/exclude_tables`（源原生 LIKE）口径统计，并把探到的 `server_version` 写回 §2.2 那一列；`supports_max_execution_time` 决定 011 的超时能否由源库兜底；`grants.code` 在**登记阶段**只作机读警告、不阻断（§4.1，admin 可确认），011 起在**执行阶段**硬阻断（每次问数前重探 `SHOW GRANTS`，结论不缓存，详见 safety §4.1 as-built） |
 | GET | `/datasources/{id}/grants` | admin | — | `[{principal_type,principal_id,principal_name,permission}]` |
 | PUT | `/datasources/{id}/grants` | admin | `{items:[{type:'user'\|'role',id?,role?,permission}]}` | 200（整体替换） |
 | POST | `/datasources/{id}/sync` | sync 权 | `{"force":false}` | 202 `{job_id}`；并发冲突 409。**as-built(007)**：P2 落的是 `POST /api/sync/jobs`（`{datasource_id}` → **200 + counters**，同步执行完再回）。这一行的 202+背景执行与 `force` 覆盖是 P3 的事，届时**只换返回码不动路径**——工单 007 的拍板表里记着这条决定。行权也不是本表写的 "sync 权" 而是 **owner/admin 档**（与 DELETE/test 同一把尺）：`datasource_grants` 至今没有任何读取点（grants 那两行也未实现），"授予某人 sync 权"这句话没有落脚处；且同步会拿这个源的凭据去连库，能触发就等于能试探它的口令，宁可收窄到 owner 也不放宽到 'global'。grants 实现后按本表恢复 "sync 权" 口径 |

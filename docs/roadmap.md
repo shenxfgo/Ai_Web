@@ -130,7 +130,11 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 active 切换用一条 `UPDATE ... WHERE id=:new` 的原子语句；检索按
 全局 top-80 → 权限过滤 → 关键词路(trgm + 精确标识符 + simple FTS) → RRF(k=60) → 聚合到表 →
 JOIN 桥表扩展(hops=2) → token 预算裁切。`networkx` 只建/缓存 JOIN 图（`MultiDiGraph`，
-边带 `confidence`：FK=1.0、命名约定=0.7），BFS 自己实现以便单测。
+边带 `confidence`：FK=1.0、命名约定按 architecture §5.3 的加权公式），BFS 自己实现以便单测。
+as-built(P2-0010)：这里原写"命名约定=0.7"，那是常数口径，与 §5.3 的公式互斥——0.7 配
+"≥0.8 才进 prompt"会让推断边永远进不了 prompt。冲突已由工单 010 在**写侧**闭环
+（`relation_infer.py` 按公式算 confidence，0.7 降为公式地板）；本节这张 JOIN 图本身
+（hops=2 桥表扩展、环、不可达标记）仍属 P4，落点是工单 014。
 
 验收：
 1. `POST /api/kb/reindex` 建 draft → 进度 SSE → `activate` 后 `kb_index_profile` 只有一个 active；

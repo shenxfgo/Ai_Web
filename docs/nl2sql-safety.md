@@ -204,6 +204,15 @@ SET SESSION autocommit = 1;
 - 账号侧要求：**只给 `GRANT SELECT ON <db>.* TO 'aiweb_ro'@'%'`**，数据源表单提示"请建只读账号"。
   UI 检测 `SHOW GRANTS` 里出现 `ALL|INSERT|UPDATE|DROP|CREATE` → 黄色警告（不阻断，admin 可确认）；
   连上的账号不具备只读能力时 `test_connection` 报 `readonly_capability_missing`（能力探测前置）。
+
+  as-built(P2-0011 开工前拍板)：**"不阻断"只属于登记阶段**（`test_connection` 回 200 + 机读码，
+  让 admin 自己决定要不要留这个数据源）；**执行阶段是硬阻断**，011 的 `executor` 在建好会话级只读
+  之前先跑 `SHOW GRANTS`、复用 `grants_verdict`（`datasource_service.py:192`），`code` 非空即拒，
+  错误码 `readonly_capability_missing`，**没有 admin 覆盖旋钮**。理由：第一层拦的是"SQL 形状"，
+  而真实权限属于"账号能力"——形状对得上但账号能写，三层里只有这一格能拦住。
+  代价与取舍：结论**不缓存进元数据库**（缓存分不清"当时只读"和"后来被提权"），所以每条问数
+  多一次 `SHOW GRANTS` 往返（源库内网 ≈1ms，可接受）；`data_sources.readonly_enforced` 是用户在
+  表单里勾的自报家门列，**不作为阻断依据**，只作 UI 提示。
 - 取数：无缓冲 cursor + 逐 1000 行 `fetchmany`，累计到 `max_rows+1` 立即 `cursor.close()`。
   **不做 `KILL <connection_id>`**——`KILL` 是写操作，只读账号本来就无权限，依赖
   `MAX_EXECUTION_TIME` 自杀 + 连接归还前 `ROLLBACK`。这是 MVP 的诚实取舍，写进 known limitation。
@@ -234,6 +243,27 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 | `AIWEB_RESULT__MAX_PAYLOAD_MB` | 2 | 单页 JSON payload 上限 |
 | `AIWEB_QUERY__CONCURRENCY_PER_DS` | 2 | 按数据源限并发（`asyncio.Semaphore`），防连点把源库打满 |
 | `AIWEB_QUERY__RATE_LIMIT_PER_USER_PER_MIN` | 20 | 每用户每分钟问数次数（内存滑动窗口） |
+
+> **as-built(P2-0011 开工前拍板，2026-09-28)**：本表是**目标形态**，P2 实际只有六个键
+> （`Settings.QueryGroup` 实有 `row_limit / timeout_ms / concurrency_per_ds /
+> rate_limit_per_user_per_min / max_explain_rows / allow_sql_edit` 六个，
+> 另有 `ResultGroup.dir / retention_days / preview_rows / max_cell_chars / max_payload_mb` 五个）。
+> 用户拍板"**只用现有键，文档对齐现实**"，
+> 于是：
+> - `HARD_LIMIT` / `MAX_TIMEOUT_MS` **不建**。注入上限就是 `row_limit + 1`，
+>   由守卫的 `check(max_rows=)` 参数带进去（`sql_guard.py:397`），调用方当下只传全局 `row_limit`；
+>   "数据源级 `row_limit` 覆盖"属接口层那一跳（P3），"UI 不许超过天花板"属有 UI 输入的那一档。
+> - `CELL_MAX_CHARS` **不建**，用已有的 `AIWEB_RESULT__MAX_CELL_CHARS`（`ResultGroup.max_cell_chars=1000`）。
+> - `USE_SESSION_MAX_EXEC_TIME` **不建**：011 无条件试 `SET SESSION MAX_EXECUTION_TIME`，
+>   失败就降级靠驱动超时并把降级原因写进错误/日志（源库是否支持在 006 的 `supports_max_execution_time` 里已知）。
+> - `DRY_RUN` **不建**：§3 的 EXPLAIN dry-run 整层属 P3。
+> - `AIWEB_GUARD__FORCE_LIMIT`（§1.2 ⑦ 那个开关）**不建**：强制补 LIMIT 当下是无条件行为，
+>   开关等"允许用户提交不带 LIMIT 的 SQL"这种需求出现时再补。
+> - 并发闸（`CONCURRENCY_PER_DS` / `RATE_LIMIT_PER_USER_PER_MIN`）两键在 `Settings` 里，
+>   **但没有读取点**，真接线属 P3。
+>
+> `.env.example` ↔ `Settings` 由 `test_env_example.py` 钉着一一对应，本表**不在闸里**——
+> 这就是这类漂移能活到今天的原因。
 
 - 截断探测：注入 `max_rows + 1`，取到 `max_rows+1` 行即判定 `truncated=true` 并丢弃最后一行。
 - 单元格保护：`str` 截断；`bytes`/`Binary` → `"<binary 1.2KB>"`；
