@@ -16,13 +16,11 @@
 
 from __future__ import annotations
 
-import configparser
 import json
 import os
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -31,14 +29,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.extractor.mysql import MySQLExtractor
-from tests.integration.conftest import Account
+from tests.integration.conftest import Account, DbAccount
 
 pytestmark = [pytest.mark.pg, pytest.mark.live]
 
 Login = Callable[..., Awaitable[Account]]
 
-BACKEND = Path(__file__).resolve().parents[2]
-CNF = BACKEND / ".setup" / "aiweb_ro.cnf"
 DEMO_DB = "ai_web_demo"
 
 # verification.md §1 的对象与列数口径
@@ -49,23 +45,14 @@ WIDE_COLUMNS = 68
 _CJK = re.compile(r"[一-鿿]")
 
 
-@pytest.fixture(scope="module")
-def account() -> tuple[str, str, str, int]:
-    """(user, password, host, port)——口令只活在这条调用链里。"""
-    if not CNF.exists():
-        pytest.skip(f"缺少 {CNF}：要先跑工单 002 的建库脚本")
-    cp = configparser.ConfigParser()
-    cp.read(CNF, encoding="utf-8")
-    c = cp["client"]
-    return c["user"], c["password"], c.get("host", "127.0.0.1"), int(c.get("port", "3306"))
-
-
 @dataclass
 class SyncRun:
     ds_id: int
     headers: dict[str, str]
     body: dict[str, Any]
-    ro_password: str
+    #: `repr=False`：这条口令是真账号的，用例一失败 pytest 就把帧局部变量倒进终端，
+    #: 默认 dataclass repr 会连着它一起倒出来。断言用 `run.ro_password` 照旧拿得到。
+    ro_password: str = field(repr=False)
     #: 到这里为止真的发到源库的语句原文（验收 6 的靶子）
     sent: list[str]
 
@@ -74,7 +61,7 @@ async def _sync_once(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
 ) -> SyncRun:
     """登记一条指向演示库的源 → 打 `POST /api/sync/jobs`，两边的响应都带回来。
 
@@ -204,7 +191,7 @@ async def test_验收1_十个对象落进_meta_table_且宽表_68_列带中文�
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     run = await _sync_once(client, login, monkeypatch, account)
@@ -263,7 +250,7 @@ async def test_验收2_cardinality_与_sub_part_真的有非空值(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """§10 末锚点：这两列非空 = 没退回逐表 `SHOW CREATE TABLE`。
@@ -315,7 +302,7 @@ async def test_验收3_真外键落成_extracted_且自引用不报错(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     run = await _sync_once(client, login, monkeypatch, account)
@@ -350,7 +337,7 @@ async def test_验收4_埋点表按命名约定推出_inferred_且与_extracted_
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """库里没建约束的 `product_id` 要推出来，库里没有的 `user` 表不许编。
@@ -383,7 +370,7 @@ async def test_验收5_同步两次行数不变且人工列不被覆盖(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """幂等是这一层的**全部价值**：点两次"同步"不该抹掉任何人录过的东西。"""
@@ -447,7 +434,7 @@ async def test_验收6_抽取路径只发_select(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """源库账号是只读的，但这不是放松代码的理由：写语句发过去就是 1142 权限错误。

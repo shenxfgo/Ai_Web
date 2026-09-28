@@ -12,10 +12,8 @@
 
 from __future__ import annotations
 
-import configparser
 import os
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,14 +21,12 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from tests.integration.conftest import Account
+from tests.integration.conftest import Account, DbAccount
 
 pytestmark = [pytest.mark.pg, pytest.mark.live]
 
 Login = Callable[..., Awaitable[Account]]
 
-BACKEND = Path(__file__).resolve().parents[2]
-CNF = BACKEND / ".setup" / "aiweb_ro.cnf"
 DEMO_DB = "ai_web_demo"
 
 # 建库脚本 scripts/init_demo_mysql.sql 的自检口径：9 张 BASE TABLE + 1 个 VIEW
@@ -38,19 +34,8 @@ TABLES = 9
 VIEWS = 1
 
 
-@pytest.fixture(scope="module")
-def account() -> tuple[str, str, str, int]:
-    """(user, password, host, port)——口令只活在这条调用链里。"""
-    if not CNF.exists():
-        pytest.skip(f"缺少 {CNF}：要先跑工单 002 的建库脚本")
-    cp = configparser.ConfigParser()
-    cp.read(CNF, encoding="utf-8")
-    c = cp["client"]
-    return c["user"], c["password"], c.get("host", "127.0.0.1"), int(c.get("port", "3306"))
-
-
 async def _register(
-    client: AsyncClient, login: Login, account: tuple[str, str, str, int], **over: Any
+    client: AsyncClient, login: Login, account: DbAccount, **over: Any
 ) -> tuple[int, dict[str, str], str]:
     """登记一个指向演示库的源，返回 (id, 认证头, 口令)。"""
     user, password, host, port = account
@@ -75,7 +60,7 @@ async def _register(
 async def test_测试连接报得出表数视图数和只读结论(
     client: AsyncClient,
     login: Login,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     ds_id, headers, password = await _register(client, login, account)
@@ -115,7 +100,7 @@ async def test_测试连接报得出表数视图数和只读结论(
 
 
 async def test_口令错时回结构化错误并点出是哪个字段(
-    client: AsyncClient, login: Login, account: tuple[str, str, str, int]
+    client: AsyncClient, login: Login, account: DbAccount
 ) -> None:
     """驱动抛的是 1045，我们得翻成"connect_user 或 connect_password 不对"。
 

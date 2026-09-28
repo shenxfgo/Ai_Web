@@ -30,20 +30,36 @@ from app.services.kb_service import card_doc_uid, sync_cards
 pytestmark = pytest.mark.pg
 
 
-async def _source(session: AsyncSession) -> DataSource:
-    user = User(username="Owner", password_hash=hash_password("x"), role="admin")
-    session.add(user)
-    await session.flush()
-    src = DataSource(
-        name="demo-mysql",
+def _data_source(
+    owner_id: int,
+    name: str = "demo-mysql",
+    *,
+    allow_global: bool = False,
+    secret: str = "x",
+) -> DataSource:
+    """一条 MySQL 源的公共形状（不入 session，由调用方决定何时 flush）。
+
+    为什么要抽出来：`secret_enc` 这一列是"永远不该出现在响应里"的那一列，各测试文件各写一份
+    字面量的话，改的人只改到自己眼前那份，别处就悄悄少了越权/漏口令的断言面。
+    """
+    return DataSource(
+        name=name,
         kind="mysql",
         host="127.0.0.1",
         port=3306,
         connect_user="aiweb_ro",
-        secret_enc=encrypt_secret("x"),
+        secret_enc=encrypt_secret(secret),
         server_version="5.7.44-log",
-        created_by=user.id,
+        allow_global_access=allow_global,
+        created_by=owner_id,
     )
+
+
+async def _source(session: AsyncSession) -> DataSource:
+    user = User(username="Owner", password_hash=hash_password("x"), role="admin")
+    session.add(user)
+    await session.flush()
+    src = _data_source(user.id)
     session.add(src)
     await session.flush()
     return src

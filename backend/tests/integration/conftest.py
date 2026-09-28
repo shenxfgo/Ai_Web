@@ -6,9 +6,12 @@
 
 from __future__ import annotations
 
+import configparser
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -20,6 +23,46 @@ from app import deps
 from app.core.security import hash_password
 from app.main import create_app
 from app.models.user import User
+
+BACKEND = Path(__file__).resolve().parents[2]
+CNF = BACKEND / ".setup" / "aiweb_ro.cnf"
+
+
+class DbAccount(NamedTuple):
+    """演示库的连接四元组，**口令不参与 repr**。
+
+    为什么要自己写 `__repr__`：pytest 一失败就会把 fixture 的实参和整条调用栈的帧局部变量
+    倒进终端——用 tuple 的默认 repr，那条输出里第二位就是真口令，一次红测等于把口令贴进
+    控制台、CI 日志和会话记录。它仍是 tuple 的子类，解包和 `tuple[str, str, str, int]`
+    的注解都照旧。
+    """
+
+    user: str
+    password: str
+    host: str
+    port: int
+
+    def __repr__(self) -> str:
+        host, port = self.host, self.port
+        return f"DbAccount(user={self.user!r}, password=<redacted>, host={host!r}, port={port})"
+
+
+@pytest.fixture(scope="module")
+def account() -> DbAccount:
+    """演示库的 `(user, password, host, port)`——口令只活在这条调用链里。
+
+    读的是 gitignored 的 `.setup/aiweb_ro.cnf`（工单 002 生成的只读账号）：把它抄进
+    `.env` 或测试常量里，就等于把一台真库的入口写进会被 push 的文件。
+    缺文件就 skip，换台机器不该把整个闸口卡红。
+    """
+    if not CNF.exists():
+        pytest.skip(f"缺少 {CNF}：要先跑工单 002 的建库脚本")
+    cp = configparser.ConfigParser()
+    cp.read(CNF, encoding="utf-8")
+    c = cp["client"]
+    return DbAccount(
+        c["user"], c["password"], c.get("host", "127.0.0.1"), int(c.get("port", "3306"))
+    )
 
 
 @pytest.fixture
@@ -33,9 +76,19 @@ async def session_factory(
     """
     schema = os.environ["AIWEB_PG__SCHEMA_NAME"]
     engine = create_async_engine(os.environ["AIWEB_PG_TEST_DSN"], poolclass=NullPool)
-    # 先删 data_sources 再删 users：前者 FK 指向后者
+    # 删除顺序按 FK 来：kb_card 挂在 data_sources 上级联，而它对 kb_index_profile 是 RESTRICT，
+    # 所以必须先清 data_sources，profile 才删得掉。
+    #
+    # profile 为什么也在这一张清单上：随机 schema 是**整轮会话共用**的，用例造的第二个
+    # profile（例如把老 profile 摘掉 active 再建一套新的那种）不会随 data_sources 一起走，
+    # 于是全会话后头每一条"取当前生效 profile"的语句都会撞上它——表现是检索莫名其妙返回空。
+    #
+    # 往这张清单里加东西的时机：新表一有 DDL 就要跟上，否则"每条用例从空表开始"这句话
+    # 会从这行注释开始骗人。010 的 chat_sessions/chat_messages、以及还没建表的
+    # datasource_grants 都在这儿排队（删除顺序照 FK：先下级再上级）。
     async with engine.begin() as conn:
         await conn.execute(text(f'DELETE FROM "{schema}".data_sources'))
+        await conn.execute(text(f'DELETE FROM "{schema}".kb_index_profile'))
         await conn.execute(text(f'DELETE FROM "{schema}".users'))
     try:
         yield async_sessionmaker(engine, expire_on_commit=False)

@@ -15,11 +15,9 @@
 
 from __future__ import annotations
 
-import configparser
 import json
 import os
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,7 +25,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from tests.integration.conftest import Account
+from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_live import (
     TABLES,
     VIEWS,
@@ -40,23 +38,10 @@ from tests.integration.test_sync_live import (
 pytestmark = [pytest.mark.pg, pytest.mark.live]
 
 Login = Callable[..., Awaitable[Account]]
-BACKEND = Path(__file__).resolve().parents[2]
-CNF = BACKEND / ".setup" / "aiweb_ro.cnf"
 
 # 10 个对象里只有 product_stats_wide 过 40 列 → 3 张（主卡 + 2 张切片），其余一表一卡
 CARDS = TABLES + VIEWS + 2
 CARD_TOKEN_LIMIT = 900  # §6 的"单块不超预算"
-
-
-@pytest.fixture(scope="module")
-def account() -> tuple[str, str, str, int]:
-    """(user, password, host, port)——口令只活在这条调用链里，不进断言、不进日志。"""
-    if not CNF.exists():
-        pytest.skip(f"缺少 {CNF}：要先跑工单 002 的建库脚本")
-    cp = configparser.ConfigParser()
-    cp.read(CNF, encoding="utf-8")
-    c = cp["client"]
-    return c["user"], c["password"], c.get("host", "127.0.0.1"), int(c.get("port", "3306"))
 
 
 async def _cards_of(
@@ -78,7 +63,7 @@ async def test_验收1_十个对象各一条table卡_宽表切成三张(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """§6：一表一卡；>40 列 → 主卡 + 每 30 列一张切片。计数进 `sync_jobs.counters.cards`。
@@ -114,7 +99,7 @@ async def test_验收2_枚举六值进卡片_varchar_的tags_不出取值段(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """工单验收 ②③：`已完成订单 → status='completed'` 的唯一来源就是【取值】那一段。
@@ -147,7 +132,7 @@ async def test_验收3_视图卡片降级不报错且带降权系数(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """verification §1 的考点：视图没有 TABLE_ROWS，【规模】要整行降级。
@@ -170,7 +155,7 @@ async def test_验收4_未配向量端点时卡片照落_embedding_为_NULL(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """ADR-0003 的"可插拔"：没有 embedding 端点，链路照样产出可检索的卡片。
@@ -199,7 +184,7 @@ async def test_验收5_两次同步卡片不翻倍且人工注释进卡片(
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
-    account: tuple[str, str, str, int],
+    account: DbAccount,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """§3 的人工列保护一路走到卡片：用户补录的中文要成为下一轮 prompt 的素材。

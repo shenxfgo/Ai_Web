@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class KbCardProfileOut(BaseModel):
@@ -41,3 +41,57 @@ class KbCardOut(BaseModel):
     # 建索引时间：NULL = 这张卡还没向量化（ADR-0003 的"卡片先于向量"）
     embedded_at: datetime | None
     index_profile: KbCardProfileOut
+
+
+class KbSearchRequest(BaseModel):
+    """`POST /kb/search` 的 body（§7）。
+
+    §7 那一行还写着 `top_vector / ef_search / trgm_threshold / mode`，P2 一个都不收：它们
+    全是向量路的调参，而 P2 只有 ILIKE 一条路（阈值走 `AIWEB_RETRIEVAL__TRGM_THRESHOLD`）。
+    不收的方式是**拒**（`extra="forbid"` → 422），不是静默忽略：传了就当场告诉前端"P2 没有这个
+    旋钮"，比默默按默认值跑完再让人怀疑参数没生效要诚实得多。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=200)
+    # 空 = 在我看得见的所有源里找；非空 = 只在指定的这几个里找
+    datasource_ids: list[int] = Field(default_factory=list)
+    k: int = Field(default=5, ge=1, le=50)
+
+
+class KbSearchHitOut(BaseModel):
+    """一条命中理由：哪一列、比的是哪个字段、被哪个词对上的（工单 009 验收 2）。"""
+
+    column_name: str
+    field: str
+    term: str
+
+
+class KbSearchCardOut(BaseModel):
+    card_id: int
+    kind: str
+    seq: int
+    score: float
+    text_preview: str
+
+
+class KbSearchItemOut(BaseModel):
+    """一张候选表。粒度在**表**不在卡——§5.2 (4) 明确"同一张表的多张卡不各自占名额"。
+
+    不带 `datasource_id` / `table_id`：与 `KbCardOut` 同一条理由，`table_uid` 就是对外标识，
+    内部自增 id 出现在响应里只会诱导前端拿它拼 URL。
+    """
+
+    table_uid: str
+    title: str | None
+    score_kw: float
+    matched_term_count: int
+    matched_column_count: int
+    hits: list[KbSearchHitOut]
+    cards: list[KbSearchCardOut]
+
+
+class KbSearchOut(BaseModel):
+    items: list[KbSearchItemOut]
+    took_ms: int

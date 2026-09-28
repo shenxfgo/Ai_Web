@@ -1,7 +1,7 @@
-"""知识库卡片接口：只有一条按表取段文本的读路。
+"""知识库接口：卡片读取 + 检索预览。
 
-`/kb/search`、`/kb/rebuild`、`/kb/status` 都在 architecture §7 的端点表里，但分属 P3（检索）
-与 P4（重建/术语卡），这里不放空壳——一个返回 501 的端点只会让前端以为功能存在。
+`/kb/rebuild`、`/kb/status` 都在 architecture §7 的端点表里，但分属 P4（重建/术语卡），
+这里不放空壳——一个返回 501 的端点只会让前端以为功能存在。
 """
 
 from __future__ import annotations
@@ -11,8 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.deps import get_current_user, get_db
 from app.models.user import User
-from app.schemas.kb import KbCardOut
+from app.schemas.kb import KbCardOut, KbSearchOut, KbSearchRequest
 from app.services import kb_service
+from app.services.nl2sql import retriever
 
 router = APIRouter()
 
@@ -31,3 +32,17 @@ async def list_cards_by_table(
     没授权的 403（`datasource_service.get_authorized` 那一把尺）。
     """
     return await kb_service.cards_of_table(db, actor=actor, table_uid=table_uid)
+
+
+@router.post("/kb/search")
+async def search_preview(
+    payload: KbSearchRequest,
+    actor: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> KbSearchOut:
+    """检索预览：一句问句 → 候选表 + 命中理由。工单 009 的接口层。
+
+    它存在的理由是"人肉验证命中"：012 的 `/chat/ask` 会把检索结果拌进 prompt 里看不见，
+    而阶梯 L1 对不对，只有把命中理由摊开才判得出来。权限同 `/kb/cards` 的 read 权。
+    """
+    return await retriever.search_preview(db, actor=actor, payload=payload)
