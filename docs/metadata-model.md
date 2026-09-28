@@ -269,13 +269,19 @@ kind text CHECK ('table','table_columns','term')
 table_id FK NULL            -- term 卡为 NULL
 seq int DEFAULT 0           -- 同一 table 多卡时的段号
 doc_uid char(32) UNIQUE     -- md5(card_kind|table_uid|seq|index_profile_id)
+    -- as-built(0008)：这里的 `|` 是示意，实际拼接用 **单元分隔符 chr(31)**，与 ADR-0005 给
+    -- `table_uid` 定的同一套：名字/段号里真出现 `|` 时，竖线分隔会让两组不同输入撞出同一个 md5，
+    -- 而 chr(31) 不可能出现在标识符里。算法住在 `kb_service.card_doc_uid()`，别处不重算。
 title text                  -- 'db.orders（订单表）'
 text_md  text NOT NULL      -- 送 embedding 的完整文档
 search_text text NOT NULL   -- 关键词检索用（标识符+注释+值，去 markdown 噪声）
 token_count int NOT NULL
 meta jsonb DEFAULT '{}'     -- {approx_rows, column_count, tags, confidence}
 index_profile_id bigint NOT NULL
-embedding vector(dim)      -- dim = settings.embedding.dimension，迁移里用 op.execute 渲染，不硬编码
+embedding vector(dim)      -- dim = settings.embedding.dimension，迁移里不硬编码
+                             -- as-built(0005)：类型取自 `pgvector.sqlalchemy.Vector(dim)`，
+                             -- **不是**手写 `op.execute("vector(%d)")`——渲染结果同为 `vector(1536)`，
+                             -- 但走类型层才能让 `alembic` 的 ORM↔迁移比对和 `Base.metadata` 说同一件事
                              -- 可插拔增强；未启用向量端点时全 NULL 不影响链路
                              -- as-built(0005)：dim 必须 >0——`vector(0)` 非法，所以"未启用向量"
                              -- 由 embedding.configured（base_url/key/model 齐不齐）判定，不由 dim=0 判定
@@ -310,6 +316,17 @@ is_active bool / created_at / built_at
 > 检索永远只命中 active 的卡片（`WHERE index_profile_id = active`）。否则新旧向量混在一个索引里，
 > 结果不可解释且无法回滚。列类型 `vector(1536)` 是硬约束——维度是列类型的一部分，
 > 换维度必须新表/新列（PG 不支持 `ALTER TYPE` 改它），记进迁移。
+>
+> as-built(0008) 三条落地口径：
+> ① **P2 只落一条行，且直接 `is_active=true`**：`ensure_profile()` 按 `name` 幂等复用，
+> 没有 draft/retired 状态机（那是上面那句"原子切换"，属 P4）。所以 `kb.status` 语义在 P2 就是
+> "当前配置那套 = 唯一那套"，检索侧还谈不上选 profile。
+> ② `name` 的三段里 model 缺省时用占位字面 **`no-embedding`**（未配端点时 `settings.embedding.model`
+> 为空串，而 `name` 是 UNIQUE 键，不能是 `@1536@tplv1` 这种以分隔符开头的残串）。
+> ③ `card_template_version` 是 **int**（§2.6 的列类型），`tplv1` 那个带前缀的形态只出现在 `name` 里。
+> 每次同步行权的位置在 `sync_service` 的 `card_build` 阶段：`index_profile_id` **不进** upsert 的
+> `set_`，因为 `doc_uid` 里已经拌了它——让它可改等于允许一轮同步把卡从旧 profile 搬到新 profile，
+> 而 ①那条"两套各一批行、可回滚"就没了。
 
 ### 2.7 问答
 
