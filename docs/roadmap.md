@@ -144,6 +144,9 @@ as-built(P2-0010)：这里原写"命名约定=0.7"，那是常数口径，与 §
 4. 无 `AIWEB_PG_TEST_DSN` 时 RRF/JOIN 单测仍跑（纯内存），有 DSN 时集成测试额外跑；
 5. 换 `bge-large-zh`(1024) 重建 profile：draft 是 `vector(1024)` 的影子列/影子表，激活后旧向量仍在（可回滚）；
 6. `TOKEN_BUDGET=1000` 时送进 prompt 的表数显著变少且**不报错**，日志记录被裁掉的表名。
+   > **as-built(P2-010)**：这条的能力（按卡片段贪心装填 + `logger.info` 记被裁表名）已由 010 提前交付，
+   > 断言在 `tests/unit/test_prompt_builder.py`；P4 复验时只需把预算换成 1000 再看一次裁切，
+   > 不要重复实现一遍裁切器。
 
 踩坑预警：① **换模型维度必须新表/新列**（`ALTER TYPE` 不支持）；
 ② `SET LOCAL hnsw.ef_search` 必须在事务里，SQLAlchemy 惰性 BEGIN 会让它变成 no-op；
