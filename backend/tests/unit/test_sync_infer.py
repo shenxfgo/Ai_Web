@@ -6,7 +6,7 @@
 
 期望值口径：
 - §5.3 的推断条件（列名同、另一端的主键是该列、类型族兼容）
-- 工单 007 备忘的常数 `confidence=0.7`
+- §5.3 的加权打分公式（010 拍板，取代 007 的常数 0.7；逐档权重钉在 `test_relation_infer.py`）
 - 演示库脚本 `scripts/init_demo_mysql.sql` 里 `user_activity_log` 的设计意图
   （verification §1.1：故意只写列名不建外键）
 """
@@ -66,10 +66,27 @@ def test_推断_product_id_指向_product_的主键() -> None:
         (),
     )
     assert _shape(edges) == [("user_activity_log", "product_id", "product", "id")]
-    # 常数 0.7 出自工单 007 备忘（roadmap P4 / verification §2.1）。§5.3 的加权公式与它冲突，
-    # 且"0.7 配 ≥0.8 门槛"会让推断边永远进不了 prompt——那条冲突已记进 architecture §5.3，
-    # 由 010 拍板，不在这里偷偷选一个。
-    assert edges[0].confidence == 0.7  # type: ignore[index]
+    # §5.3 加权公式（工单 010 拍板，取代 007 的常数 0.7）：这条边四项全中——
+    # 目标是单列 PK(+0.25)、两侧都是 int 类型完全相同(+0.15)、_id 后缀的名词 product
+    # 正是宿主表名(+0.15)、表名就是去后缀的原形(+0.10)，基数 0.35 → **1.00**。
+    # 演示库里真实存在的那条推断边正是它（architecture §5.3 as-built 用它当算例）。
+    assert edges[0].confidence == 1.0  # type: ignore[index]
+
+
+def test_类型族兼容但不完全相同时只少那一档加成() -> None:
+    """键被 ALTER 成 bigint 的迁移场景：族兼容照样连边，但 +0.15 拿不到 → 0.85。
+
+    这一档是公式在 `infer_relations` 里唯一真正会变的加成分量（其余三项被前置减法钉成恒真），
+    所以它必须被钉住——否则"加权公式"和写死一个常数没有区别。
+    """
+    edges = ri.infer_relations(
+        [
+            _col("order_item", "product_id", dtype="bigint"),
+            _col("product", "id", pk=True, dtype="int"),
+        ],
+        (),
+    )
+    assert [e.confidence for e in edges] == [0.85]  # type: ignore[union-attr]
 
 
 def test_推断不凭空造边也不覆盖真外键() -> None:

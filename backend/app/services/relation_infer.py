@@ -13,10 +13,16 @@ from collections.abc import Sequence
 
 from app.extractor.base import InferredRelation, RawColumn, RawForeignKey
 
-# 工单 007 备忘：常数打分，出自 roadmap §P4 / verification §2.1。
-# 与 architecture §5.3 的加权公式冲突（且"0.7 配 ≥0.8 门槛"会让边永远进不了 prompt），
-# 那条冲突已记进 §5.3 等 010 拍板，这里不自行选一个。
-INFERRED_CONFIDENCE = 0.7
+# §5.3 的加权公式（工单 010 拍板取代 007 的常数打分）。
+_BASE = 0.35
+_W_TARGET_PK = 0.25
+_W_IDENTICAL_TYPE = 0.15
+_W_SUFFIX_NOUN = 0.15
+_W_TABLE_VARIANT = 0.10
+# 007 那版常数降为**地板**：本函数的三条前置减法把四项全灭的组合守成了不可达
+# （能走到打分的边必然满足"目标列是该表 PK"和"后缀匹配"），所以它只是一个下限承诺，
+# 不是任何一条真实边的分数。口径见 architecture §5.3 as-built(P2-0010)。
+_FLOOR = 0.7
 
 # §5.3 点名的三种后缀
 _ID_SUFFIXES = ("_id", "_no", "_code")
@@ -29,6 +35,43 @@ _INT_FAMILY = frozenset(
 def _family(data_type: str) -> frozenset[str]:
     base = data_type.partition("(")[0].strip().lower()
     return _INT_FAMILY if base in _INT_FAMILY else frozenset({base})
+
+
+def _identical_type(a: RawColumn, b: RawColumn) -> bool:
+    """§5.3 的"类型完全相同"，比"族兼容"更严的那一档加成。
+
+    光比 `data_type` 不够：varchar(32) 和 varchar(64) 的 `data_type` 都是 `varchar`，
+    长度在 `char_length`/`num_precision`/`num_scale` 里——而"长度不同的两个键能不能等值 JOIN"
+    正是"完全相同"这句话要回答的事。
+    """
+    return (
+        a.data_type.partition("(")[0].strip().lower()
+        == b.data_type.partition("(")[0].strip().lower()
+        and a.char_length == b.char_length
+        and a.num_precision == b.num_precision
+        and a.num_scale == b.num_scale
+    )
+
+
+def inferred_confidence(
+    *,
+    target_is_pk: bool,
+    identical_type: bool,
+    suffix_noun_matches: bool,
+    table_name_variant: bool,
+) -> float:
+    """§5.3 的加权公式，逐项手加，不做归一化。
+
+    单独拆出来是因为 `infer_relations` 的前置条件会让四个布尔里的三个恒真——
+    公式的分档能力全在"类型是否完全相同"这一项上，而这一点值得被单独钉住测试。
+    """
+    score = _BASE + (
+        _W_TARGET_PK * target_is_pk
+        + _W_IDENTICAL_TYPE * identical_type
+        + _W_SUFFIX_NOUN * suffix_noun_matches
+        + _W_TABLE_VARIANT * table_name_variant
+    )
+    return round(max(score, _FLOOR), 2)
 
 
 def _singular(word: str) -> str:
@@ -57,11 +100,9 @@ def infer_relations(
     """
     primary_keys: dict[tuple[str, str], str] = {}
     ambiguous: set[tuple[str, str]] = set()
-    dtype_by_column: dict[tuple[str, str, str], str] = {}
+    by_column: dict[tuple[str, str, str], RawColumn] = {}
     for column in columns:
-        dtype_by_column[(column.schema_name, column.table_name, column.column_name)] = (
-            column.data_type
-        )
+        by_column[(column.schema_name, column.table_name, column.column_name)] = column
         if not column.is_primary_key:
             continue
         key = (column.schema_name, column.table_name)
@@ -97,8 +138,12 @@ def infer_relations(
             to_column = primary_keys.get(target_key)
             if to_column is None:
                 continue
-            other = dtype_by_column.get((*target_key, to_column), "")
-            if _family(column.data_type) & _family(other):
+            other = by_column.get((*target_key, to_column))
+            if other is not None and _family(column.data_type) & _family(other.data_type):
+                # 三个布尔里只有"类型完全相同"在本函数里真会变化——其余三项是上面那些
+                # `continue` 的等价复述（能走到这里就说明后缀、名词、单列 PK 都对了）。
+                # 仍然逐项传给公式而不是直接写 1.00：放宽减法规则时分数会跟着掉。
+                noun_matches = _singular(noun) == _singular(target)
                 edges.append(
                     InferredRelation(
                         schema_name=column.schema_name,
@@ -106,7 +151,12 @@ def infer_relations(
                         column_name=column.column_name,
                         to_table_name=target,
                         to_column_name=to_column,
-                        confidence=INFERRED_CONFIDENCE,
+                        confidence=inferred_confidence(
+                            target_is_pk=True,
+                            identical_type=_identical_type(column, other),
+                            suffix_noun_matches=noun_matches,
+                            table_name_variant=noun_matches and target in _candidate_tables(noun),
+                        ),
                     )
                 )
     return edges

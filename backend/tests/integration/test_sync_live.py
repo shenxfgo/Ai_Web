@@ -354,7 +354,12 @@ async def test_验收4_埋点表按命名约定推出_inferred_且与_extracted_
     assert {(r["from_table"], r["from_column"], r["to_table"]) for r in inferred} == {
         ("user_activity_log", "product_id", "product")
     }, f"推断边集合漂移：{inferred}"
-    assert float(inferred[0]["confidence"]) == 0.7, "0.7 出自 roadmap P4，改它要连文档一起改"
+    # §5.3 加权公式（010 拍板，取代 007 的常数 0.7）：`user_activity_log.product_id → product.id`
+    # 两侧同为 INT，四项加成全中 → 0.35+0.25+0.15+0.15+0.10 = **1.00**。
+    # 这一条是真库上的实测值，不是手算：能顺带证明抽取层给的 `data_type` 两边确实都是 `int`。
+    assert float(inferred[0]["confidence"]) == 1.0, (
+        "confidence 出自 architecture §5.3 公式，改它要连文档一起改"
+    )
     assert all(r["fk_name"] is None for r in inferred), "推断边不该带着约束名"
     # user_id：演示库里既没有 user 也没有 users，推出来就是一条指向不存在对象的边
     assert "user_id" not in {r["from_column"] for r in inferred}

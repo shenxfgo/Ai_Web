@@ -1,0 +1,32 @@
+【候选表】共 {{ tables | length }} 张，按相关度排序：
+{% for t in tables -%}
+{% for s in t.segments -%}
+{{ s }}
+{% endfor -%}
+{% endfor -%}
+{% if joins -%}
+【可 JOIN】以下边从上面这些表出发；边的目标表若没出现在【候选表】里，它只是结构提示，不要写进 SQL：
+{% for j in joins -%}
+- {{ j.from_table }}.{{ j.from_column }} → {{ j.to_table_full }}.{{ j.to_column }}{{ ' [推断,置信 ' ~ j.confidence ~ ']' if j.inferred }}
+{% endfor -%}
+{% endif -%}
+{% if terms -%}
+【术语口径】
+{% for term in terms -%}
+- {{ term.term }}{{ '（同义词：' ~ term.synonyms | join('、') ~ '）' if term.synonyms }}: {{ term.definition }}
+{% endfor -%}
+{% endif -%}
+{% if examples -%}
+【参考示例】只学写法，不要照抄表名列名：
+{% for ex in examples -%}
+问：{{ ex.question }}
+SQL：{{ ex.sql }}
+{% endfor -%}
+{% endif -%}
+【问题】{{ question }}
+
+【输出格式】只输出一个 JSON 对象，不要包在代码围栏里，不要附解释文字：
+`{"sql": "<一条 SELECT，必须带 LIMIT {{ row_limit }}>", "explanation": "<一句话说明口径>", "clarify": "<无法回答时缺什么，能回答时为空字符串>"}`
+{% if not joins -%}
+本次候选表之间没有已确认的关联边：跨表需求要靠【问题】里给出的表名另问，或在 `clarify` 里说明。
+{% endif -%}

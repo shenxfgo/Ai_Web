@@ -1,0 +1,19 @@
+【候选表】共 2 张，按相关度排序：
+【表】ai_web_demo.order_main
+【字段】共 2 个：
+- id int NOT NULL 主键: 订单ID
+- customer_id int NOT NULL: 客户ID
+【表】ai_web_demo.customer
+【字段】共 1 个：
+- id int NOT NULL 主键: 客户ID
+【可 JOIN】以下边从上面这些表出发；边的目标表若没出现在【候选表】里，它只是结构提示，不要写进 SQL：
+- ai_web_demo.order_main.customer_id → ai_web_demo.customer.id
+【术语口径】
+- GMV（同义词：成交额、交易额）: 已支付订单的金额合计
+【参考示例】只学写法，不要照抄表名列名：
+问：上月成交额
+SQL：SELECT 1 LIMIT 10
+【问题】每个客户最近 30 天的 GMV
+
+【输出格式】只输出一个 JSON 对象，不要包在代码围栏里，不要附解释文字：
+`{"sql": "<一条 SELECT，必须带 LIMIT 1000>", "explanation": "<一句话说明口径>", "clarify": "<无法回答时缺什么，能回答时为空字符串>"}`
