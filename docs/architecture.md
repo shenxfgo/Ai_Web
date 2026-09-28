@@ -193,6 +193,20 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 **失败即早退（fail-fast）**：检索为空 → **不生成 SQL**，直接返回 `NO_SCHEMA_FOUND`，
 并给"请补录表注释 / 检查权限 / 点此同步"的具体下一步。宁可拒答，不要让模型对着空 schema 编 SQL。
 
+> **as-built(P2-010)**：④ 这一步落地为纯函数 `services/nl2sql/prompt_builder.build_prompt()`
+> （模板 `app/prompts/nl2sql_system.j2` / `nl2sql_user.j2`），四条口径是原来文档没有、施工时必须拍的：
+> ① **输出契约**：user 消息末尾要求模型只回一个 JSON 对象
+> `{"sql": "…", "explanation": "…", "clarify": "…"}`，不包代码围栏、不附解释文字。
+> 三种畸形返回（围栏 / 答案后跟解释 / 被 `max_tokens` 截断）的兜底**归 012**，010 不设防（拍板）。
+> ② **预算口径**：`AIWEB_RETRIEVAL__TOKEN_BUDGET` 管的是**素材段**（schema → 术语 → few-shot），
+> 问题、输出格式与 system 里的硬约束是固定开销、不参与竞争——roadmap 那句"与 LLM max_output 之和
+> 留出余量"兜的就是这部分。few-shot 另受 `FEW_SHOT_TOKEN_BUDGET` 夹一道，装不下就**整段丢弃**。
+> ③ **裁切粒度是卡片段而不是字符**：008 的主卡带着表头和全部 PK/索引/外键列，
+> 所以"68 列宽表不整段塞爆"的实现是**丢切片、保主卡**；连主卡都装不下的表整张丢弃，
+> 并用 `logger.info` 记下被裁的表名（roadmap P2 验收 6 要求"不报错但要可查"）。
+> ④ **JOIN 段只渲染候选表的直连边**，推断边按 §5.3 的 ≥0.8 门槛过滤（这条门槛今天筛的是
+> 007 时代按常数 `0.7` 落库的历史行，不是新写的边）；BFS/桥表/环/不可达与"候选度>8 抑制"归工单 014。
+
 ### 4.2 图表选型规则（确定性，可单测）
 
 1. 1 行 1 列 → `kpi`（大数字卡）。
