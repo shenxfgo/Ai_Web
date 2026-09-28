@@ -94,16 +94,23 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 
 ## 5. 表级知识卡片模板
 
-卡片文本由 Jinja 模板生成（`app/prompts/card_template.j2`），这张卡既是 embedding 文档，也是喂 prompt 的 schema 段：
+卡片文本由 Jinja 模板生成（`app/prompts/card_template.j2`），这张卡既是 embedding 文档，也是喂 prompt 的 schema 段。
+下面这一段是**模板文件的逐字副本**，不是设计草图（as-built(0008)：`tests/unit/test_kb_card_golden.py` 里有
+一条用例把这段围栏和 `card_template.j2` 逐行比对，改模板必须同时改这里——此前两份各写各的，
+双轴审查一次抓出三处字面漂移）：
 
 ```jinja
-【表】{{ full_name }}  {{ '（视图）' if table_type=='VIEW' else '' }}
+【表】{{ full_name }}{{ '（视图）' if table_type == 'VIEW' else '' }}
 【说明】{{ table_comment or '（源库无表注释）' }}
 【粒度】{{ granularity or '未知：一行代表一条记录' }}
+{% if approx_rows is not none -%}
 【规模】约 {{ approx_rows | human_int }} 行{{ '，最近更新 ' + last_update if last_update else '' }}
-【字段】共 {{ columns | length }} 个{{ '（本卡仅列出第 {{seg_from}}-{{seg_to}} 个，完整清单见主卡）' if shard else '' }}：
+{% else -%}
+【规模】行数未知（视图或未分析）
+{% endif -%}
+【字段】共 {{ column_count }} 个{{ '（本卡仅列出第 ' ~ seg_from ~ '-' ~ seg_to ~ ' 个，完整清单见主卡）' if shard else '' }}：
 {% for c in columns -%}
-- {{ c.name }} {{ c.data_type }}{{ ' NOT NULL' if not c.nullable else ' 可空' }}{{ ' 主键' if c.is_pk }}{{ ' 唯一' if c.is_unique }}: {{ c.comment_zh or c.comment_raw or '（无注释）' }}{% if c.default %} [默认 {{ c.default }}]{% endif %}{% if c.enum_values %} 取值: {{ c.enum_values | join(' / ') }}{% endif %}
+- {{ c.name }} {{ c.data_type }}{{ ' NOT NULL' if not c.nullable else ' 可空' }}{{ ' 主键' if c.is_pk }}{{ ' 唯一' if c.is_unique }}: {{ c.comment_zh or c.comment_raw or '（无注释）' }}{{ ' [默认 ' ~ c.default ~ ']' if c.default else '' }}{{ ' 取值: ' ~ (c.enum_values | join(' / ')) if c.enum_values else '' }}
 {% endfor -%}
 {% if indexes -%}
 【索引】
@@ -114,12 +121,10 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 {% if relations -%}
 【可关联】
 {% for r in relations -%}
-- {{ r.from_column }} → {{ r.to_table_full }}.{{ r.to_column }}{% if r.via %}（经 {{ r.via }} 中转）{% endif %}{{ ' [推断,置信 ' ~ r.confidence ~ ']' if r.kind=='inferred' }}{{ ' [人工确认]' if r.kind=='manual' }}
+- {{ r.from_column }} → {{ r.to_table_full }}.{{ r.to_column }}{{ '（经 ' ~ r.via ~ ' 中转）' if r.via else '' }}{{ ' [推断,置信 ' ~ r.confidence ~ ']' if r.kind == 'inferred' else '' }}{{ ' [人工确认]' if r.kind == 'manual' else '' }}
 {% endfor -%}
 {% endif -%}
-{% if terms -%}
-【术语】{% for t in terms %}{{ t.name }}={{ t.definition }}；{% endfor %}{% endif %}
-【方言】{{ dialect_name }} {{ server_major }}{{ ' — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY' if dialect_name=='mysql' and server_major=='5.7' else '' }}
+【方言】{{ dialect_name }} {{ server_major }}{{ ' — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY' if dialect_name == 'mysql' and server_major == '5.7' else '' }}
 ```
 
 设计要点（每条都为检索或为 LLM 服务）：
@@ -140,7 +145,7 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
   可选 extra `cn`；老仓库字段缩写 `ddgs`→"订单概算" 这类靠它救）。第一版把拼音当可开关的增强项，
   同时用它绕开远端 PG 没有 `pg_jieba`/`zhcfg` 中文分词器的问题。
 
-> as-built(0008) 两条落地口径：
+> as-built(0008) 四条落地口径：
 > ① **标签整段抹掉而不是只抹括号**：`_NOISE_RE` 删的是 `【…】` 整段（【表】【字段】这些标签每张卡
 > 都一样，留着只会稀释 trigram），行首 `- ` 项目符也删，然后按空白折成一行。标识符、中文注释、
 > 枚举取值原样保留——那是关键词路唯一的入口。
@@ -148,6 +153,19 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 > 理由是两边都没有原料来源——`kind='term'` 卡是人工录入（§6 第三行），而 §7 承诺那张卡的 CRUD
 > 端点 `/kb/terms` **无工单认领**；拼音要的是 `pypinyin` 依赖 + 一个开关键，`.env.example` 里也没有。
 > 两者一起记进"文档承诺但无人认领"的清单，动 P4 术语卡时一并补。
+> ③ **`（经 x 中转）` 在 P2 的真卡片上永不出现**：`RelationMeta.via` 字段在、模板也认它，但
+>   `sync_cards` 读 `meta_relation` 时没有可填的原料——中转表（junction table）的识别是 §8.3
+>   推断那一档，归 010。所以模板这一支留着（010 落原料后无需改模板），但 008 的 golden 只能手喂
+>   `via` 才能覆盖到它，真库跑出来的卡永远不带这段。（同时被抹掉的两处字面：视图标记紧跟全名、
+>   中间不加空格；`【字段】共 N 个` 的 N 取**全表**列数而不是本卡列数——切片那句"完整清单见主卡"
+>   说的就是整张表，报本卡列数会让 AI 以为宽表只有 26 列。）
+> ④ **`【规模】…，最近更新 D` 这一支在 P2 的真数据上恒不出现**：`last_update` 取自
+>   `meta_table.last_analyze_at`，而 MySQL 抽取器虽然 SELECT 了 `UPDATE_TIME`
+>   （`app/extractor/mysql.py` 的 §8.1 A 查询），`rows_to_tables()` 并没有把它落进 `RawTable`
+>   （`RawTable` 也没有对应字段），所以 MySQL 侧该列至今为 NULL；PG 侧要读
+>   `pg_stat_user_tables.last_analyze`，007 也没做。**这是 007 的账，不是卡片层的**——
+>   008 只在 golden 里手喂 `last_update` 钉住"有值时怎么渲染"。下一张碰抽取器的工单要么补映射、
+>   要么把这一支从模板里删掉，别让它长期挂一个永不成立的分支。
 
 卡片编辑的语义：编辑后 `template_version` 不变但 `content_hash` 变，标记"人工修订"，
 并触发该表 embedding 重算（`POST /kb/reembed {table_id}`）。

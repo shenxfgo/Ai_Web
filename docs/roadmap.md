@@ -72,7 +72,9 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 - `retriever.search()` 定义成 `Protocol`，P2 给 `LikeRetriever`，P4 换 `HybridRetriever`，
   `pipeline` 只依赖 Protocol——这样 P2/P4 不打架，也让"向量挂了降级回 LIKE"成为生产容错分支。
 - `kb_card.embedding` 列在 P2 就按 `vector(dim)` 建（维度从 settings 渲染进迁移，
-  用 `op.execute` 注入而不是硬编码 1536），HNSW 索引也 P2 就建，P4 只回填数据——
+  as-built(0008)：走 `pgvector.sqlalchemy.Vector(dim)` 类型层，**不是**拼字符串的 `op.execute`——
+  后者会让列宽与 ORM 类型各写一份，`alembic` 的 ORM↔迁移比对就失效；见 `metadata-model §2.6`），
+  HNSW 索引也 P2 就建，P4 只回填数据——
   **避免"P4 才发现维度不对要改迁移"**。
 - `demo_ask.py` 串起：登录拿 token → 取数据源 → 若 `meta_table` 为空则现场跑一次最小抽取 →
   `pipeline.ask(question)` → 打印 `retrieved_tables / sql / guard_verdict / rows`。

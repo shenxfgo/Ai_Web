@@ -286,7 +286,7 @@ embedding vector(dim)      -- dim = settings.embedding.dimension，迁移里不�
                              -- as-built(0005)：dim 必须 >0——`vector(0)` 非法，所以"未启用向量"
                              -- 由 embedding.configured（base_url/key/model 齐不齐）判定，不由 dim=0 判定
 embedded_at timestamptz NULL
-sync_job_id / updated_at / deleted_at
+sync_job_id / created_at / updated_at / deleted_at
 ```
 
 ```sql
@@ -317,13 +317,16 @@ is_active bool / created_at / built_at
 > 结果不可解释且无法回滚。列类型 `vector(1536)` 是硬约束——维度是列类型的一部分，
 > 换维度必须新表/新列（PG 不支持 `ALTER TYPE` 改它），记进迁移。
 >
-> as-built(0008) 三条落地口径：
+> as-built(0008) 四条落地口径：
 > ① **P2 只落一条行，且直接 `is_active=true`**：`ensure_profile()` 按 `name` 幂等复用，
 > 没有 draft/retired 状态机（那是上面那句"原子切换"，属 P4）。所以 `kb.status` 语义在 P2 就是
 > "当前配置那套 = 唯一那套"，检索侧还谈不上选 profile。
 > ② `name` 的三段里 model 缺省时用占位字面 **`no-embedding`**（未配端点时 `settings.embedding.model`
 > 为空串，而 `name` 是 UNIQUE 键，不能是 `@1536@tplv1` 这种以分隔符开头的残串）。
 > ③ `card_template_version` 是 **int**（§2.6 的列类型），`tplv1` 那个带前缀的形态只出现在 `name` 里。
+> ④ `provider` 恒写 **`openai_compatible`**（architecture §5 只认 OpenAI 兼容端点，没有第二家可填），
+> `distance_fn` 由 `profile_row()` **省略**、落 §2.6 列上的 `DEFAULT 'cosine'`——不在代码里重述默认值，
+> 将来真出现非 cosine 的 profile 时改列默认就行。
 > 每次同步行权的位置在 `sync_service` 的 `card_build` 阶段：`index_profile_id` **不进** upsert 的
 > `set_`，因为 `doc_uid` 里已经拌了它——让它可改等于允许一轮同步把卡从旧 profile 搬到新 profile，
 > 而 ①那条"两套各一批行、可回滚"就没了。

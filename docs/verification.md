@@ -140,7 +140,7 @@
 
 | 目标 | 断言方式 | 关键用例 |
 |---|---|---|
-| `token_estimate` | 值域 + 单调性 + 分支 | ① 与 `tiktoken.encode` 计数偏差 ≤8%（`cl100k_base` 可用时）；② 强制走 heuristic 分支时中文/英文/混合三段偏差 ≤25%（宁高估勿低估）；③ 单调：文本变长则估计不减；④ 空串=0；⑤ 超长 JSON 行结果集不炸；⑥ "结果集只喂摘要"路径的预算 ≤`TOKEN_BUDGET` |
+| `token_estimate` | 值域 + 单调性 + 分支（as-built(0008)：本行六条**不由 008 全认领**。008 交付的是 heuristic 纯函数，钉了 ③④ + 五条手算值域用例（`tests/unit/test_token_estimate.py`）。①② 要拿 `tiktoken.encode` 当参照，而 kb-workflow §6 明写"写入路径不引真 tokenizer"，`tiktoken` 至今不是依赖（roadmap 把 `AIWEB_RETRIEVAL__TOKENIZER` 放在检索/prompt 组装那一档）；⑤⑥ 走的是结果集与 `TOKEN_BUDGET` 裁切，属 011。所以 ①②⑤⑥ 归引入依赖的那张工单，不在卡片切片里补） | ① 与 `tiktoken.encode` 计数偏差 ≤8%（`cl100k_base` 可用时）；② 强制走 heuristic 分支时中文/英文/混合三段偏差 ≤25%（宁高估勿低估）；③ 单调：文本变长则估计不减；④ 空串=0；⑤ 超长 JSON 行结果集不炸；⑥ "结果集只喂摘要"路径的预算 ≤`TOKEN_BUDGET` |
 | RRF 融合 | 手算黄金值 | ① 两路各 `[a,b,c]`/`[c,a,b]`、k=60 → 期望顺序与分数硬编码；② 只有一路有结果时仍参与；③ `keyword_weight=0` 退化为纯向量；④ 并列名次的稳定排序（同分按表名字典序，防抖动）；⑤ 空输入返回 `[]` 不抛 |
 | `join_graph` BFS | 图与路径 | ① 无 FK 但 `order_item.order_id → order_main.id` 命名约定推出边、`confidence=0.7`；② 自环 `parent_id` 不产生 1-hop 自引用；③ hops=2 时最长路径不超 2；④ 环（A→B→C→A）不死循环、路径去重；⑤ 桥表扩展：问 A、D 两表时能拉进 B/C，且 `path=[A,B,C,D]` 顺序可渲染进 prompt；⑥ 不可达时返回"需笛卡尔积"标记而不是硬连 |
 | `chart_advisor` | 规则决策表 | 时间+数值→line、类别(NDV≤12)+数值→bar、NDV>12+数值→bar(取 top10 + "其他")、双数值→scatter、单行单值→number、全 NULL 列→table only、行数 >200→不画图；`EChartsOption` 结构快照（键存在性，不比像素） |
