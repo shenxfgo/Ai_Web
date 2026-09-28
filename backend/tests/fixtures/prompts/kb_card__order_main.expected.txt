@@ -1,0 +1,18 @@
+【表】ai_web_demo.order_main
+【说明】订单主表
+【粒度】一行 = 一笔订单
+【规模】约 8,642 行
+【字段】共 5 个：
+- id bigint NOT NULL 主键: 订单ID
+- order_no varchar NOT NULL 唯一: 订单号
+- status enum NOT NULL: 订单状态 [默认 pending] 取值: pending / paid / shipped / completed / cancelled / refunding
+- user_id bigint NOT NULL: 下单用户
+- product_id bigint 可空: 商品ID
+【索引】
+- PRIMARY（唯一 BTREE）: id
+- uk_order_no（唯一 BTREE）: order_no
+- idx_status（BTREE）: status
+【可关联】
+- user_id → ai_web_demo.user.id
+- product_id → ai_web_demo.product.id [推断,置信 0.7]
+【方言】mysql 5.7 — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY

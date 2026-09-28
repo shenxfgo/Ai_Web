@@ -1,0 +1,36 @@
+【表】ai_web_demo.product_stats_wide
+【说明】商品统计宽表
+【粒度】一行 = 一个商品的汇总
+【规模】约 1,024 行
+【字段】共 60 个：
+- c1 int NOT NULL 主键: 主键
+- c2 int 可空: 指标2
+- c3 int 可空: 指标3
+- c4 int 可空: 指标4
+- c5 int 可空: 指标5
+- c6 int 可空: 指标6
+- c7 int 可空: 指标7
+- c8 int 可空: 指标8
+- c9 int 可空: 指标9
+- c10 int 可空: 指标10
+- c11 int 可空: 指标11
+- c12 int 可空: 指标12
+- c13 int 可空: 指标13
+- c14 int 可空: 指标14
+- c15 int 可空: 指标15
+- c16 int 可空: 指标16
+- c17 int 可空: 指标17
+- c18 int 可空: 指标18
+- c19 int 可空: 指标19
+- c20 int 可空: 指标20
+- c21 int 可空: 指标21
+- c22 int 可空: 指标22
+- c23 int 可空: 指标23
+- c24 int 可空: 指标24
+- c25 int 可空: 指标25
+- c60 int 可空: 指标60
+【索引】
+- idx_c60（BTREE）: c60
+【可关联】
+- c60 → ai_web_demo.product.id
+【方言】mysql 5.7 — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY

@@ -33,3 +33,35 @@ def test_默认jwt密钥在prod判fail() -> None:
 
 def test_默认jwt密钥在local只判warn() -> None:
     assert _jwt_verdict("local") == "warn"
+
+
+def _vector_verdict(dimension: int, exts: dict[str, str]) -> list[Any]:
+    checks: list[Any] = []
+    settings = Settings(_env_file=None, embedding={"dimension": dimension})
+    CHECK_ENV.check_embedding_gate(settings, checks, exts)
+    return checks
+
+
+def test_向量扩展在维度已定时缺失判fail_并给出建扩展的那句话() -> None:
+    """roadmap §5 自检表第 2 行 as-built(P2-0005)：判据是 `DIMENSION>0`，不是"启用向量路"。
+
+    0005 之后列类型 `vector(dim)` 就引用着这个扩展，端点配没配都一样。
+    """
+    got = {c.name: c for c in _vector_verdict(1536, {})}
+    assert got["pg.ext.vector"].status == "fail"
+    assert "CREATE EXTENSION vector" in got["pg.ext.vector"].hint
+    assert "超级用户" in got["pg.ext.vector"].hint or "DBA" in got["pg.ext.vector"].hint
+
+
+def test_扩展在位时只报版本号不报问题() -> None:
+    got = {c.name: c for c in _vector_verdict(1536, {"vector": "0.8.6"})}
+    assert got["pg.ext.vector"].status == "ok"
+    assert got["pg.ext.vector"].message == "0.8.6"
+
+
+def test_维度为0时报的是配置而不是扩展() -> None:
+    """`DIMENSION=0` 时扩展在不在都没意义——0005 第一步就拒绝，hint 必须把人指向那个键。"""
+    got = {c.name: c for c in _vector_verdict(0, {"vector": "0.8.6"})}
+    assert got["embedding.dimension"].status == "fail"
+    assert "AIWEB_EMBEDDING__DIMENSION" in got["embedding.dimension"].hint
+    assert "pg.ext.vector" not in got

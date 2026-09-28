@@ -82,3 +82,15 @@ def test_app_defaults_are_local_dev() -> None:
     assert settings.app.host == "127.0.0.1"
     assert settings.query.allow_sql_edit == "admin"
     assert settings.extract.sample_distinct is True
+
+
+def test_card_template_version_is_int_defaulting_to_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """kb-workflow §5 的 `AIWEB_EXTRACT__CARD_TEMPLATE_VERSION`，落进 §2.6 的 int 列。
+
+    同步侧的 profile 名靠它（`model@dim@tplv{version}`）：没有这个键，"改模板触发全量重算"
+    就只剩一句话，没有任何东西跟着变。默认 1 而不是 0——0 会让 profile 名读成 `tplv0`，
+    看起来像"还没发过版"。
+    """
+    assert Settings(_env_file=None).extract.card_template_version == 1
+    monkeypatch.setenv("AIWEB_EXTRACT__CARD_TEMPLATE_VERSION", "2")
+    assert Settings(_env_file=None).extract.card_template_version == 2

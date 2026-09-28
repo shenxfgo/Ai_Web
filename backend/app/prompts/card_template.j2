@@ -1,0 +1,25 @@
+【表】{{ full_name }}{{ '（视图）' if table_type == 'VIEW' else '' }}
+【说明】{{ table_comment or '（源库无表注释）' }}
+【粒度】{{ granularity or '未知：一行代表一条记录' }}
+{% if approx_rows is not none -%}
+【规模】约 {{ approx_rows | human_int }} 行{{ '，最近更新 ' + last_update if last_update else '' }}
+{% else -%}
+【规模】行数未知（视图或未分析）
+{% endif -%}
+【字段】共 {{ column_count }} 个{{ '（本卡仅列出第 ' ~ seg_from ~ '-' ~ seg_to ~ ' 个，完整清单见主卡）' if shard else '' }}：
+{% for c in columns -%}
+- {{ c.name }} {{ c.data_type }}{{ ' NOT NULL' if not c.nullable else ' 可空' }}{{ ' 主键' if c.is_pk }}{{ ' 唯一' if c.is_unique }}: {{ c.comment_zh or c.comment_raw or '（无注释）' }}{{ ' [默认 ' ~ c.default ~ ']' if c.default else '' }}{{ ' 取值: ' ~ (c.enum_values | join(' / ')) if c.enum_values else '' }}
+{% endfor -%}
+{% if indexes -%}
+【索引】
+{% for i in indexes -%}
+- {{ i.name }}（{{ '唯一 ' if i.unique }}{{ i.type }}）: {{ i.columns | join(', ') }}{{ ' 前缀 ' ~ i.sub_part if i.sub_part else '' }}
+{% endfor -%}
+{% endif -%}
+{% if relations -%}
+【可关联】
+{% for r in relations -%}
+- {{ r.from_column }} → {{ r.to_table_full }}.{{ r.to_column }}{{ '（经 ' ~ r.via ~ ' 中转）' if r.via else '' }}{{ ' [推断,置信 ' ~ r.confidence ~ ']' if r.kind == 'inferred' else '' }}{{ ' [人工确认]' if r.kind == 'manual' else '' }}
+{% endfor -%}
+{% endif -%}
+【方言】{{ dialect_name }} {{ server_major }}{{ ' — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY' if dialect_name == 'mysql' and server_major == '5.7' else '' }}

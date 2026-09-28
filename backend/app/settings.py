@@ -137,6 +137,9 @@ class ExtractGroup(BaseModel):
     sample_distinct_max_distinct: int = 30
     min_mysql_version: str = "5.7"
     min_pg_version: str = "12"
+    # kb-workflow §5：卡片模板本身改了要升它，它写进 kb_index_profile（§2.6 的 int 列），
+    # 于是 profile 名里的 tplv{version} 跟着变，新旧卡片因此分属两套可回滚的索引。
+    card_template_version: int = 1
 
 
 class RetrievalGroup(BaseModel):

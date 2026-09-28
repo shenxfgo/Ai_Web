@@ -1,0 +1,8 @@
+【表】ai_web_demo.t_no_comment
+【说明】（源库无表注释）
+【粒度】未知：一行代表一条记录
+【规模】行数未知（视图或未分析）
+【字段】共 2 个：
+- id bigint NOT NULL 主键: （无注释）
+- note text 可空: （无注释）
+【方言】mysql 5.7 — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY

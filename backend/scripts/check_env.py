@@ -74,6 +74,37 @@ def _version_tuple(raw: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def check_embedding_gate(settings: Settings, checks: list[Check], exts: dict[str, str]) -> None:
+    """`vector` 扩展的判据是 **`DIMENSION>0`**，不是"启用向量路"（roadmap §5 第 2 行 as-built）。
+
+    0005 起 `AIWEB_EMBEDDING__DIMENSION` 兼任 `kb_card.embedding` 的列宽：列类型 `vector(dim)`
+    引用这个扩展，端点配没配都一样。所以两种坏情况要分开报——
+    维度为 0 是**配置**问题（迁移第一步就拒绝），扩展缺失是**库**问题（要 DBA 出面）。
+    """
+    dim = settings.embedding.dimension
+    if dim <= 0:
+        checks.append(
+            Check(
+                "embedding.dimension",
+                "fail",
+                f"AIWEB_EMBEDDING__DIMENSION={dim}",
+                "0005 起 AIWEB_EMBEDDING__DIMENSION 是 kb_card.embedding 的列宽，必须 >0"
+                "（text-embedding-3-small 是 1536）。未启用向量端点也要填。",
+            )
+        )
+        return
+    has_vector = "vector" in exts
+    checks.append(
+        Check(
+            "pg.ext.vector",
+            "ok" if has_vector else "fail",
+            exts.get("vector", "未安装"),
+            # 0.8.6 的 vector.control 没有 trusted，应用账号自己建不了，只能 DBA 预建
+            "请超级用户/DBA 执行 CREATE EXTENSION vector;（0.4+ 才支持 HNSW），再重跑迁移",
+        )
+    )
+
+
 async def check_pg(settings: Settings, checks: list[Check]) -> None:
     pg = settings.pg
     min_pg = tuple(int(x) for x in settings.extract.min_pg_version.split("."))
@@ -108,17 +139,7 @@ async def check_pg(settings: Settings, checks: list[Check]) -> None:
                     "pg_trgm 是 trusted 扩展：CREATE EXTENSION IF NOT EXISTS pg_trgm;",
                 )
             )
-            if settings.embedding.configured:
-                has_vector = "vector" in exts
-                # vector 扩展非 trusted，必须超级用户或 DBA 预建
-                checks.append(
-                    Check(
-                        "pg.ext.vector",
-                        "ok" if has_vector else "fail",
-                        exts.get("vector", "未安装"),
-                        "请 DBA 执行 CREATE EXTENSION vector;（0.4+ 才支持 HNSW）",
-                    )
-                )
+            check_embedding_gate(settings, checks, exts)
             schema_exists = (
                 await conn.execute(
                     text("select to_regclass(:probe) is not null"),

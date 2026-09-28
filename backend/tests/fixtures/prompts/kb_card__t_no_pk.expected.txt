@@ -1,0 +1,8 @@
+【表】ai_web_demo.t_no_pk
+【说明】人工核对过的无主键表
+【粒度】一行 = 一个埋点事件
+【规模】约 12,345 行，最近更新 2026-09-20
+【字段】共 2 个：
+- event_type varchar 可空: 事件类型
+- ts datetime 可空: 事件时间
+【方言】mysql 5.7 — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY

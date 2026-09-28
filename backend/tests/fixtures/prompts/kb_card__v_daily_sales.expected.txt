@@ -1,0 +1,9 @@
+【表】ai_web_demo.v_daily_sales（视图）
+【说明】每日销售汇总
+【粒度】一行 = 一天
+【规模】行数未知（视图或未分析）
+【字段】共 3 个：
+- day date 可空: 统计日
+- order_count bigint 可空: 订单数
+- gmv decimal(18,2) 可空: 成交额
+【方言】mysql 5.7 — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY

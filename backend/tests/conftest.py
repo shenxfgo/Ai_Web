@@ -42,6 +42,11 @@ if os.environ.get("AIWEB_PG_TEST_DSN"):
     PG_TEST_SCHEMA = f"aiweb_test_{uuid.uuid4().hex[:8]}"
     os.environ["AIWEB_PG__SCHEMA_NAME"] = PG_TEST_SCHEMA
 
+# 维度是 `kb_card.embedding` 的**列宽**（as-built 0005），不是只有向量路才用得上的参数，
+# 所以迁移与 DDL 断言都读它。verification.md §2.2 的 DDL 字面写的是 `vector(1536)`，
+# 不钉住的话用例结果会跟着开发者机器上的 .env 变——真机换成 1024 时断言就凭空红了。
+os.environ.setdefault("AIWEB_EMBEDDING__DIMENSION", "1536")
+
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """真实 PG 用例默认 skip；配了 DSN 才跑；CI 里可要求不 skip 而是失败。"""

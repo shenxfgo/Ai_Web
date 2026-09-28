@@ -58,6 +58,7 @@ from app.services.datasource_service import (
     root_cause,
     table_scope_filter,
 )
+from app.services.kb_service import sync_cards
 from app.services.relation_infer import infer_relations
 from app.settings import get_settings
 
@@ -558,6 +559,8 @@ class _Tally:
     relations_inferred: int = 0
     tables_stale: int = 0
     tables_failed: int = 0
+    # 工单 008：卡片条数（不是表条数——宽表一张表出多张卡，§6）
+    cards: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -832,6 +835,28 @@ async def run_sync(
         # 空集合会让 expanding bindparam 渲染成 `IN ()`（语法错误），而"什么都没同步到"
         # 恰恰最不该被理解成"上次同步的东西全过期了"。
         if completed_database_ids:
+            # 工单 008（kb-workflow §7）：card_build 是同步作业里第二个落库 phase。
+            # 放在整段抽取之后而不是每个 catalog 内部，因为 `_set_phase` 自己会 commit——
+            # 塞进 `_write_catalog` 就等于把"一个 catalog 一个事务"（§3）当场切成两半。
+            await _set_phase(session, job_id, "card_build", counters=tally.as_dict())
+            synced = await session.execute(
+                select(_TABLE.c.id).where(
+                    _TABLE.c.database_id.in_(completed_database_ids),
+                    _TABLE.c.synced_at >= synced_before,
+                )
+            )
+            # 只给"本轮真的落成了"的表建卡：陈旧表源库已无实体，给它刷一张新卡等于
+            # 继续向 AI 保证一张不存在的表。
+            tally.cards = await sync_cards(
+                session,
+                datasource_id=ds.id,
+                job_id=job_id,
+                table_ids=[int(i) for i in synced.scalars()],
+                dialect_name=ds.kind,
+                server_version=ds.server_version or "",
+            )
+            await session.commit()
+
             stale = await session.execute(
                 meta_table_mark_stale(),
                 {
