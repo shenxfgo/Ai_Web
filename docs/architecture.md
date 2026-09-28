@@ -98,8 +98,8 @@ backend/
 ```
 
 关键接缝：`retriever.search()` 定义成 `Protocol`，最小链路阶段提供 `LikeRetriever`（元数据列注释
-ILIKE + 命中列数排序），完整版换 `HybridRetriever`，`pipeline` 只依赖 Protocol。这样"向量检索不可用时
-降级回结构化路径"是生产可用的容错分支，而不是抛弃代码。
+ILIKE + 按命中的不同词数排序，见 §5.1），完整版换 `HybridRetriever`，`pipeline` 只依赖 Protocol。
+这样"向量检索不可用时降级回结构化路径"是生产可用的容错分支，而不是抛弃代码。
 
 ### 2.2 前端目录
 
@@ -213,10 +213,26 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 
 | 层 | 手段 | 依赖 | 说明 |
 |---|---|---|---|
-| **L1 结构化关键词** | 在元数据库上对表名/列名/`comment_raw`/`comment_zh`/业务描述做精确、前缀、ILIKE、pg_trgm 匹配并按命中列数排序 | 只需 `pg_trgm`（trusted，应用可自建） | 永不下线的主链路；`LikeRetriever` 即其最小实现 |
+| **L1 结构化关键词** | 在元数据库上对表名/列名/`comment_raw`/`comment_zh`/业务描述做精确、前缀、ILIKE、pg_trgm 匹配，并按**命中的不同词数**排序（次键：命中列数） | 只需 `pg_trgm`（trusted，应用可自建） | 永不下线的主链路；`LikeRetriever` 即其最小实现 |
 | **L2 LLM 目录摘要选表** | 把候选表目录（表名 + 一行注释）压成 digest 交给 LLM 直接挑表 | 只需 LLM | 超过 `AIWEB_RETRIEVAL__CATALOG_DIGEST_MAX_TABLES`（默认 1000）时，**先按关键词预筛**再交给模型选表，避免目录本身打爆 prompt |
 | **L3 完整卡片抓取** | 命中的表取其**表级知识卡片全文**（字段、枚举取值、索引、关系、方言约束）进 prompt | 元数据快照 + 卡片构建 | 卡片模板见 kb-workflow.md；宽表按列切片 |
 | **L4 `NO_SCHEMA_FOUND`** | 前三层都拿不到足够证据时明确拒答 | — | 早退，给补录/授权/同步的可执行下一步 |
+
+> **as-built(P2-0009)：L1 的排序主键从"命中列数"改成"命中的不同词数"。**
+> 原口径在演示库真语料上被打穿了：68 列的 `product_stats_wide` 有 10 列的注释都带 `金额`
+> （`refund_amt_*`、`return_rate_*` 两族同名列），命中列数是全场最高的，就把只对上一个词的它
+> 排到了只对上 `订单`+`金额` 两个词、5 列的 `order_main` 前面，roadmap §P2 验收 ① 当场破。
+> 一个词在一族同名列上重复命中是一份证据，不是十份；两个不同的词各自命中才是两份。
+> 所以排序键定为 **（命中的不同词数 ↓，命中列数 ↓，`table_uid` ↑）**，第三键保证并列不抖。
+>
+> 两个连带后果，都写在明处：
+> 1. **P2 的 `score_kw` 只是展示字段，不参与排序**。关键词路的分数是"每个词取 ILIKE/trgm 的最大值
+>    再求和"，它反映"这张卡的文本和问句有多像"，而表次序现在完全由两个计数决定。
+>    同一 (词数, 列数) 下 trgm 分高者不再靠前——这是 P2 的已知取舍，P4 的 RRF（(3)）会把分数
+>    重新变成次序本身。
+> 2. **词数按"不同的词"去重，而 P2 的切词是 2-gram 近似**（见 kb-workflow.md §9），
+>    同族滑窗词（`订单`/`单金`/`金额`）会一起把计数抬上去。同一族词几乎总是成组出现，
+>    所以表与表的相对次序仍稳；接进真分词器（pinyin/中文 tokenizer）后这个口径自动变准。
 
 **pgvector / embedding 是可插拔增强，不在主链路上。** 语义：
 
@@ -262,6 +278,17 @@ query
   先取全局 top-80 再按权限过滤，并在向量 SQL 里就 `JOIN grant` 过滤（应用层过滤只作二次保险）。
 - 换 embedding 模型 / 改卡片模板 = 新建 `kb_index_profile` → 全量重建 → 原子切 active；
   检索永远只命中 active 的卡片，否则新旧向量混在一个索引里，结果不可解释且无法回滚。
+
+as-built(P2-0009)，P2 只跑 (2)(4)(5) 这三步，其余步骤的位置留着不接：
+
+- **(2c) `simple` FTS 这一路 P2 不接**。PG 没有中文分词器，`simple` 配置把整串中文当一个 lexeme，
+  对 L1 等于零贡献；接上只会让 SQL 多一个从不命中的分支。(2a) ILIKE 与 (2b) `similarity()`
+  两路取 max，仍是本节说的"三路 max"的退化形态。
+- **(4) 聚合到表**：分数是"每个词取该卡上的最大值、再跨词求和"，同表多卡按 `boost=0.05×(n-1)`
+  叠加；`table_columns` 切片卡与主卡同 `table_id`，不各自占名额。表次序见上面 §5.1 那条注。
+- **(5) 权限过滤在 SQL 里就做完**（`datasource_id = ANY(有权源)`），不是"先全召回再筛"——
+  召回窗口只有 80 张卡，先筛才有意义。预览端点在这一层之外多一道门：问句**点名**了某个源而
+  当前用户无权时直接 403，而不是静默少一张表（静默过滤留着给 012 的自动链路，理由不同）。
 
 ### 5.3 JOIN 路径推导
 
@@ -386,7 +413,7 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | POST | `/metadata/purge-stale` | admin | `{datasource_id, dry_run:true}` | 预览/执行 |
 | GET | `/kb/status` | read 权 | `?datasource_id` | `{active_profile, card_count, embedded_count, pending_count, last_build_at, dim}` |
 | POST | `/kb/rebuild` | admin | `{datasource_id?, profile_id?}` | 202 job（复用 sync_jobs 的 card_build 阶段） |
-| POST | `/kb/search` | read 权 | `{query,datasource_ids[],k=5,top_vector=80,ef_search=100,trgm_threshold=0.25,mode:'hybrid'\|'vector'\|'keyword'}` | `{items:[{card_id,table_uid,kind,title,score_vec,score_kw,fused,text_preview}],took_ms,used_profile}` |
+| POST | `/kb/search` | read 权 | `{query,datasource_ids[],k=5,top_vector=80,ef_search=100,trgm_threshold=0.25,mode:'hybrid'\|'vector'\|'keyword'}` | `{items:[{card_id,table_uid,kind,title,score_vec,score_kw,fused,text_preview}],took_ms,used_profile}` **← 目标形态**。**as-built(0009)**：P2 这颗只实现关键词路，请求侧只认 `{query,datasource_ids[],k}`（`query` 1..200 字、`k` 1..50；`top_vector/ef_search/trgm_threshold/mode` 传了会被 pydantic 忽略，前端提前接不会报错，`trgm_threshold` 一律取配置值）；响应 `items` 是**表粒度**不是卡粒度（§5.2 (4)），每项 = `{table_uid,title,score_kw,matched_term_count,matched_column_count,hits:[{column_name,field,term}],cards:[{card_id,kind,seq,score,text_preview}]}` + 顶层 `took_ms`。`score_vec/fused/used_profile` **P2 不给**——向量路没接，给了就是编的；`text_preview` 是卡片正文前 200 字（预览端点给人眼判断用，010 拼 prompt 用的是 `cards` 里带回的完整段）。边界口径：点名的源无 read 权 → **403**（不是静默少一张表，理由见 §5.2 (5) 那条注）；不点名 → 在该用户看得见的所有源里找；零命中 → `items:[]`；`query` 空或超长 → 422；未登录 → 401。 |
 | GET | `/kb/cards?table_uid=` | read 权 | `?table_uid` | **as-built(0008)**：一张表的全部卡片段（主卡 `seq=0` 在前，宽表再带 `table_columns` 切片），每项 = 卡片全文 + embedding 元信息（`index_profile:{id,name,model,dimensions,card_template_version}` 与 `embedded_at`，后者 NULL = 还没向量化）。本行原写的 `/kb/cards/{id}`（按单张卡 id 取）**未实现、也不打算实现**：一张表切几段只有服务端按 §6 的策略算得出，要前端先知道段数才能取全素材是倒置的依赖。边界口径：表存在而零张卡 → `[]`（"同步跑过、卡片还没建"是真实中间态，不是"表不存在"）；`table_uid` 找不到 → 404；无 read 权 → 403。 |
 | CRUD | `/kb/terms` | sync 权 | `{name,definition,table_uid?,column?}` | `kind='term'` 卡片 |
 | GET | `/chat/sessions` | user | — | 自己的会话 |
