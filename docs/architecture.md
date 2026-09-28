@@ -387,7 +387,7 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | GET | `/kb/status` | read 权 | `?datasource_id` | `{active_profile, card_count, embedded_count, pending_count, last_build_at, dim}` |
 | POST | `/kb/rebuild` | admin | `{datasource_id?, profile_id?}` | 202 job（复用 sync_jobs 的 card_build 阶段） |
 | POST | `/kb/search` | read 权 | `{query,datasource_ids[],k=5,top_vector=80,ef_search=100,trgm_threshold=0.25,mode:'hybrid'\|'vector'\|'keyword'}` | `{items:[{card_id,table_uid,kind,title,score_vec,score_kw,fused,text_preview}],took_ms,used_profile}` |
-| GET | `/kb/cards/{id}` | read 权 | — | 卡片全文 + embedding 元信息（维度/模型/建索引时间） |
+| GET | `/kb/cards?table_uid=` | read 权 | `?table_uid` | **as-built(0008)**：一张表的全部卡片段（主卡 `seq=0` 在前，宽表再带 `table_columns` 切片），每项 = 卡片全文 + embedding 元信息（`index_profile:{id,name,model,dimensions,card_template_version}` 与 `embedded_at`，后者 NULL = 还没向量化）。本行原写的 `/kb/cards/{id}`（按单张卡 id 取）**未实现、也不打算实现**：一张表切几段只有服务端按 §6 的策略算得出，要前端先知道段数才能取全素材是倒置的依赖。边界口径：表存在而零张卡 → `[]`（"同步跑过、卡片还没建"是真实中间态，不是"表不存在"）；`table_uid` 找不到 → 404；无 read 权 → 403。 |
 | CRUD | `/kb/terms` | sync 权 | `{name,definition,table_uid?,column?}` | `kind='term'` 卡片 |
 | GET | `/chat/sessions` | user | — | 自己的会话 |
 | POST | `/chat/sessions` | user | `{title?,datasource_id?}` | 201 |
