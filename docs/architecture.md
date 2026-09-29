@@ -157,6 +157,11 @@ frontend/src/
 
 `AIWEB_RESULT__DIR=data/results`，每次问数执行产生的行集落在这里，配合：
 
+> **as-built(P2-013)**：这个相对值按**仓库根**解析成绝对路径，判定只有一个地方
+> （`app/settings.py::_under_repo_root`，`ResultGroup.dir` 与 `KbDocsGroup.dir` 共用），
+> 不再随进程 cwd 漂移。理由与现场证据见 [nl2sql-safety.md](./nl2sql-safety.md#7-结果文件下载与目录穿越防护)
+> 的 as-built(P2-013)——012 之前落点跟着 cwd 走，而体检脚本按另一个根检查，两处可以互相错开都显示 ok。
+
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `AIWEB_RESULT__RETENTION_DAYS` | 30 | 落盘结果保留天数 |
@@ -244,15 +249,24 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > ④ **超时上限与来源键名的判定在执行器内部**（`resolve_timeout(row)`，双轴审查收口）——
 > `execute_readonly` 不收 `timeout_ms`/`timeout_source` 入参，调用方无从"传话"。细节见 safety §4.1。
 >
-> **接口层未接线**：本片的 public entry 只有 `execute_readonly`。结果文件的下载半边（realpath 落回
-> 目录内、403/404 不区分）属 013。
+> **as-built(P2-013)**：011 那句"接口层未接线"的下半边已接。下载侧的公共入口是
+> `executor.resolve_result_file(result_dir, run_id)`——纯函数，三道门（名字不合法 / realpath 逃出目录 /
+> 不是文件）塌成**同一档** `ResultFileUnavailable`（404 + 同一句话，原因只进日志）。它仍不是 HTTP
+> 端点：013 拍板"只做纯函数 + 单测，端点归 P8"，与 012 那次"012 不开端点"是同一个道理。细节与
+> 未证明的一格（符号链接在 Windows 需特权，用例自跳）见 safety §7 的 as-built(P2-013)。
 > **012 的接线义务清单**（缺一条就有一格验收假过）：
 > ① `sql_final` 必须来自 `sql_guard.check(max_rows=row_limit)` 的返回值——绕过守卫直调会退化成
 > "整结果集进内存"，因为 ② 的内存上限靠守卫那条顶层 LIMIT 兜底（不变式：`<= row_limit+1`）；
 > ② `row_limit`/`max_cell_chars`/`result_dir` 从 `Settings` 取值传入（`AIWEB_QUERY__ROW_LIMIT` /
 > `AIWEB_RESULT__MAX_CELL_CHARS` / `AIWEB_RESULT__DIR`），任何**请求体字段都不许**映射到这三个参数；
+> `result_dir` 传进来的还必须是 `Settings` 里那个**已按仓库根解析成绝对路径**的值（见 §3.3 的
+> as-built(P2-013)），调用方自己 `Path("data/results")` 再传给执行器会重新引入 cwd 依赖；
 > ③ `QueryTimeout`/`ReadonlyCapabilityMissing`/`NotImplementedSource` 走全局 handler 落成对应 status
-> + code，引擎级 `DBAPIError` 按现有 handler 归 `database_error`（不回显驱动原文）。
+> + code，引擎级 `DBAPIError` 按现有 handler 归 `database_error`（不回显驱动原文）；
+> ④（013 追加）P8 的下载端点**只能**走 `resolve_result_file` 拿路径，不许自己拼 `result_dir / f"{run_id}.csv"`
+> 再 send_file——绕过它就等于把 realpath 那两道门拆了。**归属判定查出的"这不是这个用户的文件"必须落到
+> 同一档 404**，不许换成 403/`Forbidden`：用状态码区分"存在但不是你的"和"不存在"，就是把 run_id 是否存在
+> 做成了可查询的 oracle（safety §7 的不区分原则）。
 >
 > **as-built(P2-012 开工前拍板)**：工单 012 的涉及层只有 `pipeline.py` + `scripts/demo_ask.py`，
 > 而本节⑦ 那句"端点归属 012"是 011 收尾时写的——两边打架，用户拍板按**工单**收口。四条结论：

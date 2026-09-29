@@ -94,6 +94,23 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 4. `demo_ask.py "2024 年每个月的订单总金额是多少"` → 合法 `SELECT`、`guard=pass`、非空结果行；
 5. 同一条命令加 `"把 orders 表删了"` → 必须走到"分类为不可答/无匹配表"分支，**不得**产出 `DROP`；
    即使模型产出 `DROP`，`/api/chat/ask` 的 dry-run 分支要返回 400 `sql_guard_rejected`；
+   > **as-built(P2-013)**：这条验收的后半句是 HTTP 端的（012 已拍板端点归 P8），前半句按
+   > **"不得把 `DROP` 产出成 `sql_raw`/`sql_final`/被执行的 SQL"** 判定，不是"输出里一个 DROP 字面都没有"。
+   > 差别是真跑出来的：`demo_ask.py "把 orders 表删了"` 走的是检索 0 张候选表 → `no_schema_found`
+   > 早退，压根没到模型；换成点名表 `"把 order_main 表删掉"` 时模型确实接到了 prompt，
+   > 而它的回答是 **clarify（追问）分支**，解释文字里原样写出了 `DROP TABLE ai_web_demo.order_main`
+   > 这个字符串——`sql_raw` 为空、未执行、未落结果文件。**判定为通过**：那句 DROP 在 `clarify`
+   > 的追问文本里，而 `{"sql","explanation","clarify"}` 三格是 010 定的输出契约（见 §4.1 as-built ①），
+   > 模型**该**用文字说清它为什么没给 SQL。"输出里不得出现 DROP"这种读法会把拒绝理由本身算成违规，
+   > 逼出来的处置是删掉解释字段——那是拿可解释性换一个字面匹配。
+   > 守卫那半边的真链路证据不在这次实录里（模型没写 DROP SQL），改由桩钉：
+   > `tests/integration/test_pipeline_orchestration.py::test_模型硬产出_DROP_时守卫拦下且一次都不进执行器`
+   > ——路线回复 `sql="DROP TABLE orders"`，断言 `spies.executor_calls == []`（一次都没进执行器）、
+   > `sql_final is None`、违规 code `top_level_not_select`、落库行 `sql_raw` 保留模型原文、
+   > 且 `data/results` 目录为空（**没执行就不会有文件**）。
+   > 拒答文案那半边（验收要"接住人"不只端错误码）钉在 `test_demo_ask_print.py` 的三条下一步用例，
+   > 措辞按 P2 今天真能走的路写（同步是 `POST /api/sync/jobs`，不是界面按钮）。
+   > 见 safety §7、architecture §4.1 的 ④ 与 §3.3。
 6. `uv run pytest tests/guard -q` 全绿；
 7. P2 允许没有 chat endpoint，只做 `pipeline` 单测 + CLI（此项在 P8 才验收）。
 
@@ -465,6 +482,11 @@ AIWEB_METRICS__ENABLED=false           # 首版不引 prometheus，留位
   本机 `.env` 因此写 **1536** 而不是 0：列宽定了、HNSW 建了，但没有端点 → 卡片照常构建、向量路不走。
   这条改动的代价写进 ADR-0003 的补注：**可插拔免掉的是运行期端点依赖，免不掉建库期的 `vector` 类型依赖**。
 - `AIWEB_RETRIEVAL__CATALOG_DIGEST_MAX_TABLES=1000`（新增，L2 检索阶梯用）。
+- **目录类配置的相对路径基准 = 仓库根**（`AIWEB_RESULT__DIR` / `AIWEB_KB_DOCS__DIR`，as-built(P2-013)）：
+  `.env.example` 里写的 `data/results` 与 `knowledge` 是**相对仓库根**，在 `Settings` 装配点一次性
+  resolve 成绝对路径，缺省值也走这个校验（`validate_default=True`）。写绝对路径则原样保留。
+  拍板理由与后果见 safety §7 与 architecture §3.3——之前的现实是执行器按 cwd 走、体检脚本按
+  `backend/` 的父目录拼，两处能互相错开都显示 ok。
 - `AIWEB_QUERY__ALLOW_SQL_EDIT=admin`（把"手改 SQL 重跑"做成三态开关）。
 - `AIWEB_APP__REQUEST_ID_HEADER=X-Request-Id`（大小写与设计稿的 `X-Request-ID` 以落地文件为准）。
 - LLM 探活/重试等 `PROBE_ON_STARTUP`、`MAX_RETRIES` 类键在落地版里由 `scripts/check_env.py` 承担，

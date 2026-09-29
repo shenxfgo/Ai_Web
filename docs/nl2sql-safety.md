@@ -398,8 +398,16 @@ SET LOCAL application_name = 'aiweb-nl2sql';
   - 文件命名 `run_id` = **UTC 时间戳 `%Y%m%d%H%M%S` + `uuid4().hex`**，形状白名单 `[A-Za-z0-9]+`
     （`_RUN_ID` 同一份正则同时给生成器和校验器用，两者不一致的话会出现"生成的名字过不了自己的门"）。
   - 写入侧防护：`result_csv_path(result_dir, run_id)` 对越界 run_id（`..`、`/`、绝对路径、空字节、空串）
-    **一律 `ValueError`**，路径拼出来必在 `result_dir.resolve()` 之内。§7 的下载侧一半（realpath 落
-    回目录内、403/404 不区分）**归 013**。
+    **一律 `ValueError`**，路径拼出来必在 `result_dir.resolve()` 之内。
+  - 下载侧防护 as-built(P2-013)：`resolve_result_file(result_dir, run_id)`（`app/services/nl2sql/executor.py`）
+    是 §7 的另一半，三道门塌成**同一档** `ResultFileUnavailable`（`code=result_file_unavailable`，404）：
+    ① 形状——**复用写入侧那一个 `result_csv_path`**，两边不许各写一份名字语法，它的 `ValueError` 在这里
+    被翻掉（客户端传来的字符串不该让端点吐 500）；② realpath 落回目录内——`..` 与符号链接逃逸挡在这层；
+    ③ 确实是个文件——目录、被清理作业收走的也算拿不到。三档的 `code`/`message`/`status_code` 逐字相同
+    （`test_三种失败的对外说法逐字相同`），原因**只进服务端日志**不进响应体。
+    目录级链接**不算**逃逸：`result_dir` 自己指向别处时 root 跟着一起 resolve，那是运维挪盘的正当做法。
+    **端点本体归 P8**，接线义务已写进 architecture §4.1（含"不是这个用户的文件也回这一档 404，
+    不许换成 403"——403 本身就在宣称"文件存在"）。
   - `execute_readonly` 一次调用生成一个 `run_id`，落在 `ExecutionResult.run_id` 与 `.result_file` 两个字段，
     接口层（012）只把它们抄进响应体，没有任何入参能反向指定。
 
@@ -452,16 +460,23 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 - 结果内容不进版本库（`.gitignore` 的 `data/*`），保留期由 `AIWEB_RESULT__RETENTION_DAYS` 控制；
   体检项 `query.row_limit` > 5000 会 warn，理由就是"结果集落文件也吃磁盘"。
 
-> **as-built(P2-012，2026-09-29)：上面这两条与现状不符，013 开工前要先收口。**
-> `ResultGroup.dir` 的默认值是**相对** `Path("data/results")`，`executor` 按 `Path` 直接用，
-> 于是落点取决于**从哪个目录启动进程**：012 的示踪弹在 `backend/` 下跑，两张 csv 就落在了
-> `backend/data/results/`，而仓库根那个被 `.gitignore` 忽略的 `data/` 一张没有。
-> 两个后果：① 上一条"`.gitignore` 的 `data/*`"**只锚定仓库根**（含斜杠的模式相对 `.gitignore` 所在目录），
-> `backend/data/` 不在忽略范围内——将来谁 `git add -A` 就是把结果集提交进版本库，正对着 ADR-0004 想避免的事；
-> ② 本节的 realpath 校验、`RETENTION_DAYS` 清理、以及"库里只存文件名"那一格，
-> 都必须在**同一个基准**下解析目录根，否则下载侧查到的目录与写入侧落的目录是两个地方。
-> 收口方式（把默认值钉成仓库根绝对路径 / 或让 `Settings` 在读到时 resolve）属配置层口径，
-> 归 013 与用户拍板，本片只把它写在这里并留下现场证据。
+> **as-built(P2-013，2026-09-29)：上面这两条与现状不符的那处已收口。**
+> 012 的现场是：`ResultGroup.dir` 缺省为**相对** `Path("data/results")`，执行器按 `Path` 直接用，
+> 落点取决于进程 cwd（示踪弹在 `backend/` 下跑，csv 就落在 `backend/data/results/`），
+> 而 `scripts/check_env.py::check_dirs` 自己按 `BACKEND_ROOT.parent` 解析——"体检说可写"和
+> "文件真写在哪"当时是两个目录。拍板（用户 2026-09-29）与落地：
+> ① **基准只有一个地方**：`app/settings.py::_under_repo_root` 把相对目录按**仓库根**解析成绝对路径，
+> `ResultGroup.dir` 与 `KbDocsGroup.dir` 共用它（`model_config = ConfigDict(validate_default=True)`
+> 是必需的——pydantic 默认不校验 default，而那个 default 恰恰是元凶）。`check_dirs` 不再自己拼根。
+> 钉它的是 `tests/unit/test_settings.py`（仓库根从测试文件自己的位置独立算出，不复用被测常量）+
+> `tests/unit/test_check_env_secrets.py::test_目录体检报的就是执行器会写的那个目录`。
+> ② `.gitignore` 的两条都留着：`data/*` 锚定仓库根、正好管住新落点；`backend/data/` 是 012 补的，
+> 旧落点那几张历史 csv 仍在忽略范围内（**不迁移、不删除**——它们是 012 的现场证据，清理归
+> `RETENTION_DAYS` 那个作业，而它本身还没有实现点）。
+> ③ **仍未证明的一格**：符号链接逃逸那条用例（`test_目录里的符号链接指向外面时拒绝`）在本机
+> Windows 非管理员、未开开发者模式下 `os.symlink` 报 winerror 1314，**自跳**。闸里的
+> "3 skipped" 有这一格。跳过不等于通过：要在能建符号链接的环境（POSIX / 开了开发者模式的 Windows）
+> 补跑一次才算这一条真验过。
 
 ---
 
