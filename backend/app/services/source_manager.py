@@ -1,8 +1,10 @@
 """源库引擎工厂：把一个 DataSource 行 + 明文口令变成一个只读 async engine。
 
 这里只管"怎么连"，不管"连上之后查什么"（那是 extractor/ 和 executor 的事）。
-按 datasource 缓存连接池的部分等 011（只读执行切片）再上：今天的每个调用点
-（test_connection）要的都是一次性连接，缓存它反而是泄漏。
+按 datasource 缓存连接池 **不在 011 做**：缓存连接池是为并发服务的，而 §4.3 的 P2 拍板把
+并发键（`AIWEB_QUERY__CONCURRENCY_PER_DS`）的接线推到了 P3——两者配套才有意义，单独提前上
+缓存只会把一次性连接该断的没断。011 的每个调用点（test_connection、只读执行）要的都是
+一次性 NullPool 连接，用完 dispose 就断，不留后台连接。
 """
 
 from __future__ import annotations

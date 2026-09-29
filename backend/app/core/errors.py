@@ -85,6 +85,31 @@ class ExtractScopeTooLarge(AppError):
     status_code = status.HTTP_400_BAD_REQUEST
 
 
+class QueryTimeout(AppError):
+    """源库执行超过超时上限被中断（工单 011 验收 ②，safety §4.1/§4.3）。
+
+    单列一档而不是塞进 500：用户能把问句改小、或把 timeout_ms 调大来自救，前端要显示成
+    "查询超时、该改哪一格"而不是"服务异常"。detail 里点名**上限来自哪个配置项**——
+    是数据源级 `timeout_ms`（L4）还是全局 `AIWEB_QUERY__TIMEOUT_MS`，因为这两格改的方法不同。
+    """
+
+    code = "query_timeout"
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
+class ReadonlyCapabilityMissing(AppError):
+    """执行前 `SHOW GRANTS` 探到源账号不是只读账号，硬阻断（工单 011 拍板，safety §4.1）。
+
+    与数据源登记时的"黄色警告不阻断回 200"分档（见 datasource_service.grants_verdict 的口径）：
+    登记只是提示，真正要跑 SQL 了这一层必须拦下来——一个能写的账号一旦进了执行链路，
+    三层防御里最外面的会话只读就可能被 `SET SESSION ... READ WRITE` 之类绕掉。403 而不是 400：
+    请求本身没错，是这条链路被授权层拒绝。
+    """
+
+    code = "readonly_capability_missing"
+    status_code = status.HTTP_403_FORBIDDEN
+
+
 # §6 的三条出路。放在错误类旁边而不是抛出点：编排层（sync_service）与测试桩都要引用同一份，
 # 于是"编排层把 detail 换成别的词"会当场红，而不是前端拿到任意三句话照样绿。
 # 第三条 §6 原文是"admin 用 ?force=true 覆盖上限"——那个开关 P3 才有，现在写上去就是撒谎，
