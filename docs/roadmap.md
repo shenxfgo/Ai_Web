@@ -168,6 +168,11 @@ as-built(P2-0010)：这里原写"命名约定=0.7"，那是常数口径，与 §
 "≥0.8 才进 prompt"会让推断边永远进不了 prompt。冲突已由工单 010 在**写侧**闭环
 （`relation_infer.py` 按公式算 confidence，0.7 降为公式地板）；本节这张 JOIN 图本身
 （hops=2 桥表扩展、环、不可达标记）仍属 P4，落点是工单 014。
+as-built(P2-0014)：**这张图提前到 P2 由工单 014 交付了**（010 只渲染直连边，跨表问答没有可执行路径可用），
+所以本节这一串不再是 P4 的活；两处口径在开工前拍板并已回写 architecture §5.3：
+① `networkx` **照本句原文引入**（`MultiDiGraph` 建图 + 跨请求缓存，BFS 仍自己实现以便单测），
+② `hops` 数的是**桥表张数**而不是边数，跳数定上限、边权重只在上限内定胜负；
+图**存方向、按无向扩展**（真实 FK 恒为子→父，按有向可达则演示库除"子→父"一跳外一律不可达）。
 
 验收：
 1. `POST /api/kb/reindex` 建 draft → 进度 SSE → `activate` 后 `kb_index_profile` 只有一个 active；
@@ -447,7 +452,8 @@ AIWEB_RETRIEVAL__RRF_K=60
 AIWEB_RETRIEVAL__VECTOR_WEIGHT=1.0     # RRF 加权（等权时保持原语义）
 AIWEB_RETRIEVAL__KEYWORD_WEIGHT=1.0
 AIWEB_RETRIEVAL__FINAL_TABLES=8        # 聚合后送入 prompt 的表数
-AIWEB_RETRIEVAL__JOIN_HOPS=2           # JOIN 桥表扩展深度
+AIWEB_RETRIEVAL__JOIN_HOPS=2           # JOIN 桥表扩展深度（as-built(P2-0014)：本键此前只是清单上的承诺、Settings 里没有读取点；014 补上，`hops` 数的是**桥表张数**而不是边数）
+AIWEB_RETRIEVAL__MAX_JOIN_DEGREE=8     # §5.3 的"候选度 > 8"。清单里原本没有这一键，键名由工单 014 开工前拍板；一个键同时管写侧字段度（只告警不丢边）与图侧表度（只禁当桥不禁当端点）
 AIWEB_RETRIEVAL__TOKEN_BUDGET=9000     # prompt 侧；与 LLM max_output 之和留出余量
 AIWEB_RETRIEVAL__HNSW_EF_SEARCH=64     # 每次查询 SET LOCAL hnsw.ef_search
 AIWEB_RETRIEVAL__TRGM_SIMILARITY=0.25  # 低于 PG 默认 0.3，中文短标识符更友好
