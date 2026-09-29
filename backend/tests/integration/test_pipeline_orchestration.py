@@ -577,15 +577,16 @@ async def test_候选里混了别的源时只问一个源(session_factory, spies
 
 
 @respx.mock
-async def test_模型照模板写了_LIMIT_时守卫不补探针(session_factory, spies: Spies) -> None:
-    """真链路上 `sql_raw == sql_final` 的那一支，必须单独有一条用例站在旁边。
+async def test_模型照模板写了_LIMIT_时守卫把它钳回探针(session_factory, spies: Spies) -> None:
+    """真链路上"模型听话"的那一支，必须有一条用例站在旁边。
 
-    prompt 模板要求模型"必须带 LIMIT {{ row_limit }}"，而守卫只在**没有** LIMIT 时补
-    `row_limit+1` 的探针（safety §4.2）。所以模型听话的那一刻，探针就没了：
-    ① 执行侧的 `truncated` 结构上恒为假（缓冲回来的行数不可能超过它自己写的那个数）；
-    ② 验收里"打印的是守卫重生成后的版本、与 raw 不同"只在模型漏写 LIMIT 时成立。
-    前面那条全绿用例用的是**没有 LIMIT** 的手写草稿，正好把这一支绕开了——所以这个洞
-    在只跑桩的测试套件里看不见。钳位怎么修归 003 的语义，见 guard 侧那条钉子。
+    prompt 模板要求模型"必须带 LIMIT {{ row_limit }}"，所以模型写出的行数**等于**上限才是常态，
+    而不是例外。这一支的期望是钳位后的形状（safety §1.2 ⑦）：`+1` 探针在、raw 与 final 不相等。
+    留痕里 `sql_raw` 仍是模型原文——审计要看它说了什么，执行要跑守卫改过的版本，两列分开才有意义。
+
+    探针到执行侧真的变成 `truncated=true` 这一跳**不在本用例的视野里**（executor 被 spy 打桩，
+    它记下行数不记 truncated），钉住它的是 `test_pipeline_live.py`（live）与 2026-09-29 的
+    `demo_ask.py` 实录（safety §1.2 ⑦ 末）。
     """
     limited = DRAFT_SQL + " LIMIT 1000"
     async with session_factory() as session:
@@ -601,8 +602,10 @@ async def test_模型照模板写了_LIMIT_时守卫不补探针(session_factory
             llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
         )
 
-        assert outcome.sql_final == limited  # 一字未改：没有 1001，也没有任何钳位
-        assert "1001" not in (outcome.sql_final or "")
+        assert outcome.sql_raw == limited
+        assert outcome.sql_final is not None and outcome.sql_final.endswith("LIMIT 1001")
         assert spies.executor_calls[0]["row_limit"] == 1000  # 上限与那句 LIMIT 是同一个数
         stored = await session.get(ChatMessage, outcome.message_id)
-        assert stored is not None and stored.sql_raw == stored.sql_final
+        assert stored is not None
+        assert stored.sql_raw == limited
+        assert stored.sql_final == outcome.sql_final

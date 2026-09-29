@@ -123,8 +123,10 @@ def result_csv_path(result_dir: Path, run_id: str) -> Path:
 def split_truncated(rows: list[Any], *, row_limit: int) -> tuple[list[Any], bool]:
     """按 §4.3 的探针法判截断：取到 `row_limit+1` 行即"还有更多"，丢探针行、报 truncated。
 
-    守卫注入的 LIMIT 已经是 `row_limit+1`，所以这里最多会拿到那么多；第 `row_limit+1` 行
-    存在的唯一意义就是当探针，不进结果。
+    守卫保证顶层 LIMIT **至多** `row_limit+1`（缺则补、超则钳），所以这里最多会拿到那么多；
+    第 `row_limit+1` 行存在的唯一意义就是当探针，不进结果。
+    模型自己写了个小于上限的 `LIMIT n` 时那一支**没有探针**，`truncated` 恒假——那是有意的：
+    行数上限没碰到，"被截断"在这个语境里就不成立（§1.2 ⑦）。
     """
     truncated = len(rows) > row_limit
     return (rows[:row_limit] if truncated else rows), truncated
@@ -250,7 +252,8 @@ async def execute_readonly(
     ① 建只读会话**之前**先 `SHOW GRANTS` 复用 `grants_verdict` 硬阻断（判定不缓存）；
     ② 依次执行 §4.1 的 SET 序列（READ ONLY 在前；MAX_EXECUTION_TIME 不支持则降级靠驱动超时）；
     ③ 一次 execute 缓冲取回——**这是 §4.1 "无缓冲 cursor + fetchmany 逐 1000" 的诚实降级**：
-      守卫注入的 LIMIT 就是 `row_limit+1`，内存上限由那一行钉住，与是否流式无关；
+      守卫保证顶层 LIMIT **至多** `row_limit+1`（缺则补、超则钳），内存上限由那个上界钉住，
+      与是否流式无关；
       asyncmy 在流式游标下遇到服务端 3024 会先吐 2013（丢连接）而不是把 3024 传给我们，
       超时分类就废了。缓冲取回 3024 到得了客户端，截断行为一样。
     ④ split_truncated 丢探针行、serialize_cell 逐格转 JSON 安全值、write_result_csv 落盘。
@@ -258,7 +261,8 @@ async def execute_readonly(
     超时上限与其来源键名由 `resolve_timeout(row)` 在执行器内部判定，**调用方无法指定**——
     验收 ② 的"上限来自哪个配置项"必须是事实而不是传话。
     **内存安全前提**：`sql_final` 只能来自 `sql_guard.check(max_rows=row_limit)` 的返回值
-    （注入的 LIMIT row_limit+1 是缓冲取回的唯一上限）；绕过守卫直调会退化成整结果集进内存。
+    （守卫输出的顶层 LIMIT 恒 `<= row_limit+1`，那是缓冲取回的唯一上限）；绕过守卫直调会退化成
+    整结果集进内存。
 
     一次性 NullPool engine（source_manager 口径：011 不缓存连接池，缓存与并发闸同属 P3）。
     """

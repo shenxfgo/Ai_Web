@@ -21,7 +21,7 @@ def test_合法只读查询被放行并强制带上limit(sql: str) -> None:
     if "OFFSET" in sql.upper():
         assert out.sql_final.upper().endswith("LIMIT 5 OFFSET 10"), "分页偏移不得被改坏"
     if "LIMIT" not in sql.upper():
-        # 注入值是 HARD_LIMIT + 1，多取一行用来探测 truncated
+        # 缺 LIMIT 时注入 max_rows + 1，多取一行用来探测 truncated（HARD_LIMIT 那个键不建，见 §4.2）
         assert out.sql_final.endswith("LIMIT 1001")
     # 幂等：重生成的 SQL 必须还能被严格解析
     reparsed = sql_guard.parse(out.sql_final, dialect="mysql")

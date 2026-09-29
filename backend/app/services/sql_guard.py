@@ -364,6 +364,27 @@ def _table_violations(
     return out
 
 
+def _limit_row_count(stmt: exp.Expression) -> int | None:
+    """顶层 LIMIT 那个**确定的**非负行数；不是这个形状就返回 None。
+
+    None 不等于"没有 LIMIT"，而是"证不了它小"：`LIMIT ALL`（pg 语法，mysql 方言下落成标识符）、
+    `LIMIT 1 + 1`（表达式）、`LIMIT 1e3`（`int()` 认不出的数字写法）都会落成 None。
+    负数也归这一档：sqlglot 把 `LIMIT -1` 落成 `Neg` 而不是数字 `Literal`，所以这里读不到数——
+    钳位顺带把它从"源库报 1210 Incorrect arguments"变成一条能跑的截断查询。
+    """
+    limit = stmt.args.get("limit")
+    if limit is None:
+        return None
+    expr = limit.expression
+    if isinstance(expr, exp.Literal) and expr.is_number:
+        try:
+            rows = int(str(expr.this))
+        except ValueError:
+            return None
+        return rows if rows >= 0 else None
+    return None
+
+
 def guard(
     sql: str,
     *,
@@ -391,9 +412,12 @@ def guard(
         return GuardResult(ok=False, sql_final=None, tables=refs, violations=tuple(violations))
 
     final: exp.Expr = stmt
-    if stmt.args.get("limit") is None:
+    rows = _limit_row_count(stmt)
+    if rows is None or rows >= max_rows:
         # 不包一层子查询：MySQL 5.7 优化器会丢掉子查询里的 ORDER BY，直接加在最外层更稳。
         # limit() 只长在 exp.Query 上，而 _check_top_level 已经保证 stmt 是它的后代。
+        # 只在"读得出一个确定且小于上限的行数"时保留模型自己写的数（"前 5 名"不该被抬到上限）；
+        # 其余一律钳成 max_rows+1：它既是缺 LIMIT 时的探针，也是超限/不可证时的内存上限。
         final = cast("exp.Query", stmt).limit(max_rows + 1)
 
     return GuardResult(
