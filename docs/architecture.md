@@ -238,6 +238,56 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 >   > 代价是标题不能声称"列出来的表都能用"——模板写的是
 >   > "边的目标表若没出现在【候选表】里，它只是结构提示，不要写进 SQL"，
 >   > 与 system 那句"只能引用给定的表"对齐。钉住处：`tests/unit/test_prompt_builder.py::test_目标表被预算裁掉后边仍在可_join_段_但标题已声明不可引用`。
+>   > **as-built(P2-014) 补刀**：本条的"只渲染直连边"已被 ③ 顶替——【可 JOIN】的**唯一来源**现在是
+>   > `join_graph` 的输出（路径 + 单边提示两种形状），010 的两条口径（`inferred ≥0.8`、按起点筛）
+>   > 原样搬到图侧（门槛住在 `_admissible`，一条边"能不能进图"全由它判；"按起点筛"住在 `joinable_edges`），
+>   > `prompt_builder` 只剩**预算裁切后的存活判定**。
+>   > 标题那句也改了口：路径可能跨桥表，"每行是一组可执行的关联条件"，见 `app/prompts/nl2sql_user.j2`。
+
+> **as-built(P2-014)**：③ 这一步落地为 `services/nl2sql/join_graph.py`，公共表面是六个入口
+> （外加两个纯函数 `build_graph`/`expand`，单测直接钉它们）：
+> `load_relations`（唯一真 IO：读 `meta_relation`，按 `database_id` 卡两端、排除 `is_stale`）、
+> `graph_for`（`networkx.MultiDiGraph` 建图 + 进程内缓存，键 `(datasource_id, database_id)`、
+> 上限 32 条按插入顺序淘汰）、
+> `expansion_for`（BFS 自写：跳数=桥表张数定上限、§5.3 权重定胜负、并列才标 `ambiguous`、
+> 不可达标 `needs_cartesian`、表度 > `MAX_JOIN_DEGREE` 只禁当桥不禁当端点）、
+> `structure_hints`（010 那份"候选表自己声明的边"清单的图侧版本，按起点筛、**不吃** `max_degree`）、
+> `joinable_edges`（`structure_hints` 的单库内核）、`invalidate`（按库一级，没有"整源清"那一档）。
+> 三条接线口径是这一片真正的风险点，各自钉了用例：
+> ① **失效住在 `run_sync` 的 `finally`，不在成功分支末尾**——一个 catalog 一个事务，
+> 第二个库失败回滚时第一个库的提交**不会**退回去，所以"提交过的库各清一次、回滚的那个不许清"
+> 只有在 finally 里才同时成立（钉在 `tests/integration/test_sync_cache_pg.py`，
+> 中间那一格的证据是响应 `status=partial` 而 `warehouse` 的键还在）。
+> ② **桥表卡片由 `pipeline` 补查**，`join_graph` 保持零 IO——①~⑦ 才用手算图跑纯函数；
+> 补进来的桥表**不占** `final_tables_k` 名额但一起过 `token_budget`，被裁的桥表让经过它的路径整体消失
+> （`JoinLine.requires` 带路径全部 uid 就是为了这一判定，钉在 `test_prompt_builder.py`）。
+> ③ **图只出结构化事实，措辞归 `pipeline`**：降级单表与歧义那两句是 `notes`，模板里
+> 010 那句 `{% if not joins %}` 兜底已删——同一件事两处各写一份，改文案就要动两处。
+> 已知缝（诚实记）：路径本来存在、却因桥表卡片被预算裁掉而整条消失时，"只按单表回答"那句**不会**补上，
+> 兜底靠标题那句"只能引用给定的表"；不为此把 notes 也做成带 `requires` 的对象，理由见
+> `pipeline._join_notes` 的 docstring。
+> CLI 那头的 `{② 检索 → ③ JOIN 图 → ④ 进 prompt 的表}` 是本片新加的一行，原来的"③ 进 prompt 的表"
+> 顺移成 ④（与 §4.1 的编号对齐）。
+> **真链路实录（2026-09-29，真 LLM + 真演示库，`chat_messages#13`）**：
+> `demo_ask.py "每个产品的订单总金额最高的前10个产品名称和金额是多少"`——
+> 检索 5 张候选，图给 **10 行【可 JOIN】、0 句关联说明**，其中最长的是三跳
+> （`payment_record → order_main ← order_item → product`，两张桥表正好顶满 `hops=2`），
+> ④ 进 prompt 的表 6 张（比候选多出的那一张就是桥表补查：`order_main`/`order_item`/
+> `product_stats_wide` 都在名单里）。模型据此写出
+> `SELECT p.name, SUM(oi.qty*oi.unit_price) … FROM ai_web_demo.order_item oi JOIN ai_web_demo.product p ON p.id = oi.product_id … LIMIT 10`、
+> 守卫 PASS、执行 10 行未截断、⑧ 选 bar、⑨ 结论 240 字。
+> 各步耗时 `retrieve 28ms → join_graph 6ms → schema 6ms → prompt 5ms → generate 2789ms → guard 8ms
+> → execute 324ms → chart 0ms → conclude 4701ms = 合计 7867ms`。
+> 图这一步的查询账：一次问数取两遍图（`expansion_for` 给路径、`structure_hints` 给直连边），
+> 两遍各自发一次"候选属于哪个 `(源, 库)`"的分组查询，图本体按库分键进进程内缓存——
+> 所以**冷链路三次 SELECT**（分组 ×2 + 读该库 `meta_relation` ×1）、**热链路两次**（只剩两次分组查询）。
+> **同一条问句的上一次运行（`#10`）⑨ 结论是空串**：上游用 200 回了空正文（`conclude 9135ms`、
+> `conclusion=''`、`error_code` 为 NULL），`_message_content` 只判"是不是字符串"、空串照收，
+> pipeline 因此静默落一个空结论。同一问句连跑三次（`#11`/`#12`/`#13`，结论 150/208/240 字）
+> 都正常，所以那是上游抖动、不是本片接线；
+> 但"空结论没有任何兜底或告警"是**真实的缺口**——012-B 认领的三档畸形返回管的是 ⑤ 的 SQL 正文，
+> ⑨ 的正文形状至今没有任何工单认领，已记入工单 014 的交付记录（连同"下载端点归 P8、
+> `RETENTION_DAYS` 清理作业无实现点"一起，是同一类"文档承诺了但没人认领"的洞）。
 
 > **as-built(P2-011)**：⑦ 这一步落地为 `services/nl2sql/executor.execute_readonly(...)`（async），
 > 返回 `ExecutionResult(columns, rows, truncated, row_count, run_id, result_file)`。三个口径要记：
@@ -529,6 +579,21 @@ as-built(P2-0009)，P2 只跑 (2)(4)(5) 这三步，其余步骤的位置留着�
   > 边（那只是结构提示，标题已写明），而**被预算裁掉的桥表必须让经过它的路径整体从【可 JOIN】消失**，
   > 否则就是要求模型 JOIN 一张没给卡片的表，正面违反 010 钉死的"只能引用给定的表"。
   > 桥表的**卡片**由 `pipeline` 补查（`join_graph` 保持零 IO，六条验收才能用手算图跑纯函数）。
+  >
+  > **as-built(P2-0014)：建图侧的三条口径**（都只有读代码的人看得懂、但改代码的人会踩）：
+  > ① **自环不进图**（`_admissible` 挡在 `build_graph` 之前，不是进图后再特殊对待）。`MultiDiGraph`
+  > 上一条 `A→A` 的自环会让"无向邻居"里 `A` 出现两次，`_bridge_banned` 的度因此多算 1；
+  > 而自环本来就不跨表，卡片【可关联】行仍由 008 的渲染器直接读 `meta_relation` 给出，不经本模块。
+  > ② **门槛只有一处**：一条边"能不能进图"全由 `_admissible` 判（自环、`inferred` 且缺分或
+  > 低于 0.8 的都进不来），判定住在 `build_graph` 里——`load_relations` 只负责把行读出来、
+  > 不带任何策略，改门槛不必碰 SQL。路径、结构提示、表度门槛这些"图建好之后的东西"因此
+  > 一律不再复查 confidence：门槛散在两处迟早分叉，而 010 的双轴审查已经在收它的辖区
+  > （只管【可 JOIN】，卡片【可关联】那一半不管）。
+  > ③ **平行边按 `(source_kind, from_column, to_column)` 存**，与 `uq_meta_relation_key` 同档：
+  > 同一对列上 `manual` 与 `extracted` 可以并存（那条唯一约束认的就是这三档），旧 key 少了
+  > `source_kind`，后加入的一条会**原地覆盖**前一条——不是多留一条边，而是属性被换掉。
+  > 并存之后由 `_adjacency` 取权重最小者，权重并列时**先插入的赢**，而插入顺序由
+  > `_relations_statement` 的 `ORDER BY`（补了 `source_kind` 才是全序）决定，不看存储引擎的心情。
 
 
 ---
