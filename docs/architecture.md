@@ -272,6 +272,25 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > `max_tokens` 截断（大括号不闭合）→ **不猜**，直接 `llm_bad_response` 早退。理由与守卫的
 > "改一个字符就换一棵 AST"同一条：半截 SQL 补全出来的东西没人能证明模型本来想说什么，
 > 而这条链路的失败成本是执行一条没人授权的语句。`clarify` 非空 → 不执行，本轮就是追问。
+>
+> **as-built(P2-012 施工后，2026-09-29)**：上面那四条按拍板落地，另有五处施工现实要记下来：
+> ① **步名清单以代码为准**：`retrieve → schema → prompt → generate → guard → execute → chart → conclude`
+> 八格（① 登录、⑩ 返回不是 pipeline 的步）。每格是**增量**耗时，合计写进 `latency_ms`；
+> `result_stats.elapsed_ms` 单独记 `execute` 那一步，两列分开才答得出"慢在模型还是慢在源库"。
+> **逐步耗时目前只在 stdout**（`AskOutcome.steps` 是它的载体，库里没有这一格）——
+> 把它端给界面是 P8 的活，而 §6 那条 `done` 帧现在只写着 `latency_ms`，**没有逐步那一段**。
+> 所以这是一个"要不要扩这一帧"的待决项，不是"已经存了、只是没显示"。
+> ② **三类早退不留假步**：检索为空 / 畸形返回 / 守卫拒绝各自在其之后的步就断掉了，
+> 补 chart/conclude 两个 0ms 会把"没跑"渲染成"跑完但没结果"。
+> ③ **终局留痕写在 `finally`，但那一次 commit 不许顶掉真故障**：元数据库自身就是故障源时
+> （连接断、超时、schema 被删），失败的 commit 会抛 `PendingRollbackError` 盖掉 `QueryTimeout`，
+> 调用方拿到一个与现场无关的码。所以留痕失败只 `logger.exception`，`AskOutcome.message_id` 留 `None`
+> （这就是它为什么不是 `int`——`0` 会被读成"有一行 id=0 的记录"，而它不存在）。
+> ④ **`result_columns` 只有 `name`**：§2.7 称其为"列定义"，但行出 executor 时已过 `serialize_cell`，
+> `Decimal`/`datetime` 的源库类型在那一刻就丢了。填不进列的东西不在列里写。
+> ⑤ **模型听话地写了 `LIMIT` 的那一支，守卫不补探针**，`truncated` 因此恒假——这不是本片能改的
+> （动的是守卫裁决语义），口径与钉子见 nl2sql-safety §9.2 ⑧。验收里"`sql_final` 是重生成后的版本、
+> 与 `sql_raw` 不同"因此在真链路上**只在模型漏写 LIMIT 时成立**，两种形状各有一条用例站着。
 
 ### 4.2 图表选型规则（确定性，可单测）
 
@@ -293,6 +312,16 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > ③ **`type` 的字面值就是 §6 存储里那一个**：`kpi` / `line` / `bar` / `pie` / `scatter` / `table`。
 > verification §2.1 那行写的"单行单值→number"是同一样东西的旧名，已统一成 `kpi`——
 > golden 快照锁字面，两个名字会直接变成对不上的断言。
+>
+> **as-built(P2-012 施工后，2026-09-29)**：实现时又撞出两条下线条件，都是"形状在此输入下无定义"
+> 而不是"保守起见"：
+> ⑦ **列名重复 → table**。`SELECT SUM(a) AS 金额, SUM(b) AS 金额` 是合法 SQL，而 `ChartSpec` 的
+> `x`/`series` 存的是**列名**（§2.7）——`x="金额"` 指第几列没有答案。取值一律按**下标**
+> （`numeric_column_slots` 回 `(下标, 列名)`），因为 `columns.index("金额")` 只会回到第一次出现，
+> 摘要表里那一行的 sum/min/max 全是错值且错得看不出来。
+> ⑧ **非有限值不算数值**。`float()` 认 `NaN`/`Infinity` 两个字面量，而 `serialize_cell` 对
+> int/float/str **原样透传**，所以两者都到得了这里。认它作数值的话，一格 `NaN` 把整列合计毒成
+> `NaN`，"合计≈100 判饼图"和摘要的 sum/avg 全废——废的形式是"那一格照样显示成数字"，看不出来。
 
 ---
 

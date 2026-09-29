@@ -327,6 +327,17 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 > `.env.example` ↔ `Settings` 由 `test_env_example.py` 钉着一一对应，本表**不在闸里**——
 > 这就是这类漂移能活到今天的原因。
 
+> **as-built(P2-012，2026-09-29)**：
+> - **L4 的 `data_sources.row_limit` 已经接线**，上面那句"数据源级 `row_limit` 覆盖属 P3"作废。
+>   012 的示踪弹把 `resolve_row_limit(ds)` 接进 pipeline，与 011 的 `resolve_timeout(ds)` 共用
+>   同一条判定（列值 `> 0` 才覆盖全局）。为什么不写成 `ds.row_limit or settings.query.row_limit`：
+>   `or` 只兜 `None`/`0`，而这一格是手插行也能填的整数列——`-5` 会一路进 `split_truncated`
+>   渲染成 `rows[:-5]`，把**真结果**从尾部吃掉还不报截断。
+> - **`truncated` 在真链路上恒为假**（未决，见 §9.2 ⑧）。下面那句"注入 `max_rows+1`"
+>   只在**语句本来没有 LIMIT** 时发生，而 ④ 的 prompt 模板正是要模型写
+>   `LIMIT {{ row_limit }}`（`nl2sql_user.j2:29`）。模型听话的那一刻守卫无事可做，
+>   探针就不存在，执行侧拿到的行数不可能超过 `row_limit`。桩测全绿是因为手写草稿没带 LIMIT。
+
 - 截断探测：注入 `max_rows + 1`，取到 `max_rows+1` 行即判定 `truncated=true` 并丢弃最后一行。
 - 单元格保护：`str` 截断；`bytes`/`Binary` → `"<binary 1.2KB>"`；
   `Decimal` → **str**（避免前端精度丢失，不能让金额变成 `0.30000000000000004`）；日期 → ISO 字符串。
@@ -402,6 +413,17 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 - 同一套约束适用于 `knowledge/` 覆盖层的文件读写（目录根来自配置，不由用户拼接）。
 - 结果内容不进版本库（`.gitignore` 的 `data/*`），保留期由 `AIWEB_RESULT__RETENTION_DAYS` 控制；
   体检项 `query.row_limit` > 5000 会 warn，理由就是"结果集落文件也吃磁盘"。
+
+> **as-built(P2-012，2026-09-29)：上面这两条与现状不符，013 开工前要先收口。**
+> `ResultGroup.dir` 的默认值是**相对** `Path("data/results")`，`executor` 按 `Path` 直接用，
+> 于是落点取决于**从哪个目录启动进程**：012 的示踪弹在 `backend/` 下跑，两张 csv 就落在了
+> `backend/data/results/`，而仓库根那个被 `.gitignore` 忽略的 `data/` 一张没有。
+> 两个后果：① 上一条"`.gitignore` 的 `data/*`"**只锚定仓库根**（含斜杠的模式相对 `.gitignore` 所在目录），
+> `backend/data/` 不在忽略范围内——将来谁 `git add -A` 就是把结果集提交进版本库，正对着 ADR-0004 想避免的事；
+> ② 本节的 realpath 校验、`RETENTION_DAYS` 清理、以及"库里只存文件名"那一格，
+> 都必须在**同一个基准**下解析目录根，否则下载侧查到的目录与写入侧落的目录是两个地方。
+> 收口方式（把默认值钉成仓库根绝对路径 / 或让 `Settings` 在读到时 resolve）属配置层口径，
+> 归 013 与用户拍板，本片只把它写在这里并留下现场证据。
 
 ---
 
@@ -540,4 +562,5 @@ def test_allow(sql):
 | ⑥ `CROSS_CATALOG` 独立规则 | 归 `table_not_allowed`（catalog 非空的白名单条目本来就不存在） |
 | ③ `Union/Except/Intersect` 递归校验臂 | 未写：sqlglot 对 `SELECT 1 UNION DROP TABLE x` 直接 ParseError，规则跑不到那一层 |
 | ⑤ `AIWEB_GUARD__DANGLING_EXTRA_RULES` 追加黑名单 | 未实现。"拒绝一切 Anonymous" 已经是超集，追加黑名单只在"想放开某个函数"时才有意义，而那不在 v1 计划里 |
-| ⑦ `HARD_LIMIT` 收敛模型自写的 `LIMIT 999999` | 未收敛，交给第三层的行数上限截断 + `truncated` 标记 |
+| ⑦ `HARD_LIMIT` 收敛模型自写的 `LIMIT 999999` | 未收敛：`max_rows` 的语义是"**缺 LIMIT 时补多少**"，不是"最多允许多少"（`sql_guard.py:394-397` 只在 `limit is None` 时动手）。原写的"交给第三层的行数上限截断 + `truncated` 标记"**012 核实为不成立**，见 ⑧ |
+| ⑧ `truncated` 与内存上限在真链路上双双落空（**未决，要拍板**） | 两个后果同源：守卫只补不钳。① prompt 模板要求模型写 `LIMIT {{ row_limit }}`（`nl2sql_user.j2:29`），模型一写守卫就不补 `+1` 探针，`split_truncated` 因此**恒报未截断**——"这 1000 行只是前 1000 行"这句话说不出来；② 模型写 `LIMIT 5000` 时那句**原样放行**，011 的"缓冲取回的内存上限由守卫注入的 `row_limit+1` 钉住"这个前提对它不成立。修法是钳 `min(n, max_rows+1)`（`n ≥ max_rows` 才补探针，`n < max_rows` 尊重模型自己按问题意图选的量），但那是 003 的裁决语义，**不在 012 尾巴上偷偷改**。现状已钉两处：`tests/guard/test_guard_api.py`（守卫侧两个形状）+ `tests/integration/test_pipeline_orchestration.py`（编排侧 `sql_raw == sql_final` 那一支） |

@@ -231,6 +231,9 @@ logs/
 # 结果集落盘目录：只保留目录说明，内容不进版本库
 data/*
 !data/README.md
+# 同上的第二个落点：AIWEB_RESULT__DIR 的默认值是相对路径，从 backend/ 启动就落在这里
+# （口径与后果见 docs/nl2sql-safety.md §7 的 as-built(P2-012)）
+backend/data/
 # knowledge/ 是人工维护的知识文件，属于版本库内容，不忽略
 # 本地环境变量（含口令），只提交 .env.example
 .env

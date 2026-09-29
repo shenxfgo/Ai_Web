@@ -102,6 +102,12 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 ③ decimal → float 精度丢失，首版按字符串返回；④ prompt 里必须给"必须带 LIMIT"与"只能引用给定表"
 两条硬约束，否则 guard 拒绝率极高、白测一天；⑤ `parse` 与 `.sql()` 两处的 `read`/`dialect` 参数要一致。
 
+> **as-built(P2-012)**：④ 那句"必须带 LIMIT"有一根 012 才看见的倒刺——守卫的截断探针 `+1`
+> **只在语句本来没有 LIMIT 时注入**，于是模型越听话，`truncated` 越恒假（⑥ 那一档见 safety §9.2 ⑧）。
+> 教训不是"约束写错了"，是**"桩给的草稿要照模板写"**：012 的桩用例手写的那句没带 LIMIT，
+> 所以 `LIMIT 1001` 断言全绿，而真 LLM 每次都带。验收 4 强制真端点跑一次，抓出来的正是这种
+> "桩测绿在一条真链路上不存在的路径上"。
+
 ### P3｜生产级元数据抽取 + 同步作业（SSE / 分批 / 心跳）（5 人日）
 
 要点：MySQL 侧手写 `information_schema` 批量 SQL（`COLUMNS`/`STATISTICS`/`KEY_COLUMN_USAGE`/

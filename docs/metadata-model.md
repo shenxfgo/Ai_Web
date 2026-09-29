@@ -342,7 +342,7 @@ aiweb.chat_messages :
   retrieved jsonb NULL                          -- [{card_id,table_uid,score_vec,score_kw,fused}] ★可解释性
   prompt_tokens / completion_tokens int
   sql_raw text NULL                             -- LLM 原文
-  sql_final text NULL                           -- guard 重写后实际执行的（含 LIMIT）
+  sql_final text NULL                           -- guard 重写后实际执行的（缺 LIMIT 时才补，见下）
   guard_result jsonb NULL                       -- {ok,violations:[{code,field,message}]}
   executed bool / error_code text / error_message text
   result_columns jsonb / result_stats jsonb     -- {row_count,truncated,elapsed_ms,dialect,结果文件引用}
@@ -375,6 +375,13 @@ aiweb.chat_feedback : id / message_id FK UNIQUE / user_id / verdict CHECK('up','
 > 装一个估算值就等于谎报。
 > ④ `executed`/`error_code`/`error_message` 是早退分支的落点：检索为空、畸形返回、守卫拒绝三类
 > 都必须留下一行（`executed=false`），"拒了但没痕迹"等于没拒。
+> ⑤ `result_columns` 上面称"列定义"，实际**只有 `{"name": …}`**——行出 executor 时已过
+> `serialize_cell`，`Decimal`/`datetime` 的源库类型在那一刻就丢了，填不进列的东西不在列里写。
+> `test_chat_pg.py` 里原本那个 `{"name":…, "type":…}` 夹具字面同步改成只有 `name`，
+> 否则两处形状各自长，P8 的渲染层会按不存在的那一格去接。
+> ⑥ `result_stats.elapsed_ms` 记的是 **`execute` 那一步**的耗时，不是整条链的合计（合计在
+> `latency_ms`）。两列分开才答得出"慢在模型还是慢在源库"。同键里还多一个 `run_id`——
+> 它是结果文件的身份，013 的下载侧只认这个引用，不认路径。
 
 ## 3. 人工列与同步列的分离（幂等重跑的关键）
 
