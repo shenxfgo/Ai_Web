@@ -80,7 +80,7 @@ backend/
 │   │   ├── sql_guard.py            # ★ sqlglot AST 只读白名单
 │   │   ├── source_manager.py       # 按 datasource 缓存只读 async engine/pool
 │   │   └── nl2sql/
-│   │       ├── pipeline.py         # 编排 + SSE 事件产出
+│   │       ├── pipeline.py         # 编排 ②→⑨ + 会话落库（HTTP/SSE 端点归 P8，as-built(P2-012)）
 │   │       ├── retriever.py        # Protocol 接缝：LikeRetriever → HybridRetriever
 │   │       ├── join_graph.py       # 关系图 & JOIN 路径 BFS（纯函数）
 │   │       ├── prompt_builder.py   # Jinja2 → system/user messages
@@ -190,6 +190,12 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
   ⑨ 结论生成（≤50 行喂 markdown 表；更多行只喂 sum/avg/min/max + top/bottom 5 摘要）
 ```
 
+> **as-built(P2-012 开工前拍板)**：这两处 `spec`/`EChartsOption` 是**翻译后**的形状。012 的
+> `chart_advisor` 与 `chat_messages.chart_spec` 存的是 metadata-model §2.7 的自有形状
+> `{type,x,series,title}`，把它变成 ECharts option 是 P8 接口层/前端的活。这样切是因为选型规则
+> （§4.2）是确定性的领域判断，而 ECharts 的 option 结构是渲染细节——绑在一起的话，换图表库
+> 就要动选型函数和它的单测。
+
 **失败即早退（fail-fast）**：检索为空 → **不生成 SQL**，直接返回 `NO_SCHEMA_FOUND`，
 并给"请补录表注释 / 检查权限 / 点此同步"的具体下一步。宁可拒答，不要让模型对着空 schema 编 SQL。
 
@@ -236,8 +242,8 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > ④ **超时上限与来源键名的判定在执行器内部**（`resolve_timeout(row)`，双轴审查收口）——
 > `execute_readonly` 不收 `timeout_ms`/`timeout_source` 入参，调用方无从"传话"。细节见 safety §4.1。
 >
-> **接口层未接线**：本片的 public entry 只有 `execute_readonly`，`POST /api/chat/ask` 的 ⑦ 归属 012；
-> 结果文件的下载半边（realpath 落回目录内、403/404 不区分）属 013。
+> **接口层未接线**：本片的 public entry 只有 `execute_readonly`。结果文件的下载半边（realpath 落回
+> 目录内、403/404 不区分）属 013。
 > **012 的接线义务清单**（缺一条就有一格验收假过）：
 > ① `sql_final` 必须来自 `sql_guard.check(max_rows=row_limit)` 的返回值——绕过守卫直调会退化成
 > "整结果集进内存"，因为 ② 的内存上限靠注入的 LIMIT 兜底；
@@ -245,16 +251,48 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > `AIWEB_RESULT__MAX_CELL_CHARS` / `AIWEB_RESULT__DIR`），任何**请求体字段都不许**映射到这三个参数；
 > ③ `QueryTimeout`/`ReadonlyCapabilityMissing`/`NotImplementedSource` 走全局 handler 落成对应 status
 > + code，引擎级 `DBAPIError` 按现有 handler 归 `database_error`（不回显驱动原文）。
+>
+> **as-built(P2-012 开工前拍板)**：工单 012 的涉及层只有 `pipeline.py` + `scripts/demo_ask.py`，
+> 而本节⑦ 那句"端点归属 012"是 011 收尾时写的——两边打架，用户拍板按**工单**收口。四条结论：
+> ① **012 不开任何 HTTP 端点**，`POST /api/chat/ask`（含 §6 的 SSE 契约）整块归 **P8**。理由：SSE 的
+> 验收本体就是"DevTools 里逐帧推进"和"关浏览器后 `pg_stat_activity` 稳定"（roadmap P8 验收 2/4），
+> 没有前端的流式端点无法真验收，只能算假绿。上面那条清单的 ③ 因此在 012 只成立一半：四类异常在
+> pipeline 里以**稳定 code** 出现在返回值/上抛，HTTP status 映射等 P8 建端点时再做。
+> ② **⑧⑨ 归本片**，取最小实现：`chart_advisor` 按 §4.2 做纯函数（规则口径见那里的 as-built），
+> ⑨ 走第二次 LLM 调用、按本节 ⑨ 原文只喂摘要 + 前 50 行。`chat_messages.chart_spec` 存的是
+> **自有形状 `{type,x,series,title}`**（metadata-model §2.7），§6 那帧里的 `spec: EChartsOption` 是
+> P8 从这一形状翻译出来的，不是 012 的产物。
+> ③ **chat 两表本片建**（迁移 `0006_chat`：`chat_sessions` + `chat_messages`；`chat_feedback` 归 P9）。
+> 这一条推翻了工单 012 原先那句"数据层：无新增"——009 早就写着 retrieval 结果落
+> `chat_messages.retrieved`，而没有这两张表时 pipeline 的可解释性就只活在 stdout 里。
+> 结果行**照旧不进库**（ADR-0004），库里只有 `result_columns` / `result_stats`（含结果文件引用）。
+> ④ **三种畸形 LLM 返回的兜底口径**（010 拍板归本片，见上面 §4.1 ④ as-built ①）。模型该回的是
+> 单个 JSON 对象 `{"sql","explanation","clarify"}`，实际会给出三种残形状，处置分档：
+> ` ```sql` 围栏、JSON 前后粘解释文字 → **可恢复**，剥围栏 / 取第一个 `{` 到最后一个 `}` 再解析；
+> `max_tokens` 截断（大括号不闭合）→ **不猜**，直接 `llm_bad_response` 早退。理由与守卫的
+> "改一个字符就换一棵 AST"同一条：半截 SQL 补全出来的东西没人能证明模型本来想说什么，
+> 而这条链路的失败成本是执行一条没人授权的语句。`clarify` 非空 → 不执行，本轮就是追问。
 
 ### 4.2 图表选型规则（确定性，可单测）
 
 1. 1 行 1 列 → `kpi`（大数字卡）。
 2. 首列是日期/时间/整数序数（distinct 占比 > 0.6）+ ≥1 数值列 → 单数值列用 **line**（时间）/ **bar**（离散类别）；
    多数值列且列名同族（`2024-01`、`2024-02`… 或 `_sum` 后缀）→ 转长表后 **stacked bar** / **multi-line**。
-3. 首列低基数文本（distinct ≤ 20 且非时间）+ 1 数值 → **bar**；合计≈100 或列名含 ratio/pct/share/rate → **pie**（series ≤6，其余归"其他"）。
+3. 首列低基数文本（**NDV ≤ 12** 且非时间）+ 1 数值 → **bar**；合计≈100 或列名含 ratio/pct/share/rate → **pie**（series ≤6，其余归"其他"）。
 4. 2 个数值列、无类别列、行数 ≥ 30 → **scatter**。
 5. 列数 ≥ 8 或 distinct/rows > 0.9 → **table**（不画图）。
 6. 一律给 `fallback='table'`，UI 提供手动切换 tab —— 图表类型判断永远会错，逃生门必须留。
+
+> **as-built(P2-012 开工前拍板)**：这四条今天由 012 落成真代码（`services/chart_advisor.py`，纯函数），
+> 三处口径是拍出来的，改任何一条都要同时动 verification §2.1 与 roadmap P8 验收 5：
+> ① **类别阈值是 12 不是 20**——原文写 `distinct ≤ 20`，而 verification §2.1 与 roadmap P8 验收 5
+> 两处都写 NDV≤12（两处一致、本处孤证），按 12 收口。**>12 时仍然画 bar，但只取 top10 + "其他"**
+> （这条原本只写在 verification 里，现在两边各有对方缺的规则，一并补齐）。
+> ② 补两条 verification 有、这里没有的下线条件：**全 NULL 的候选列不参与选型**（只能 table）、
+> **行数 > 200 不画图**（点太密，图比表更难读）。
+> ③ **`type` 的字面值就是 §6 存储里那一个**：`kpi` / `line` / `bar` / `pie` / `scatter` / `table`。
+> verification §2.1 那行写的"单行单值→number"是同一样东西的旧名，已统一成 `kpi`——
+> golden 快照锁字面，两个名字会直接变成对不上的断言。
 
 ---
 

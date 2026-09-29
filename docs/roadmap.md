@@ -78,6 +78,12 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
   **避免"P4 才发现维度不对要改迁移"**。
 - `demo_ask.py` 串起：登录拿 token → 取数据源 → 若 `meta_table` 为空则现场跑一次最小抽取 →
   `pipeline.ask(question)` → 打印 `retrieved_tables / sql / guard_verdict / rows`。
+  > **as-built(P2-012 开工前拍板)**：本行那句"登录拿 token"与验收 7（"P2 允许没有 chat endpoint，
+  > 只做 `pipeline` 单测 + CLI"）互斥，按**验收 7** 收口：012 不开端点，所以没有 token 可拿——
+  > `demo_ask.py` 是**进程内**装配，pipeline 收 `actor: User` 对象，鉴权走
+  > `datasource_service.get_authorized` 同一条路（与 HTTP 层共用同一个函数，权限面不因为绕过
+  > 端点而变小）。验收 5 后半句"`/api/chat/ask` 的 dry-run 分支要返回 400"同理落不到 P2，
+  > 013 工单已按"在 pipeline 返回值上断言 `sql_guard_rejected`"执行，HTTP 那半归 P8。
 
 验收：
 1. `init_demo_mysql.sql` 建成 `ai_web_demo`（9 表 + 1 视图，见 verification.md §1 的枚举清单），`SHOW TABLES` 可见；

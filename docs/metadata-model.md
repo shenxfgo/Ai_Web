@@ -362,6 +362,20 @@ aiweb.chat_feedback : id / message_id FK UNIQUE / user_id / verdict CHECK('up','
 > （`{row_count,truncated,elapsed_ms,dialect,结果文件引用}`）与 `chart_spec`。
 > 见 architecture.md §3.3。
 
+> **as-built(0006 / P2-012)**：这两张表由工单 012 建（迁移 `0006_chat`），`chat_feedback` **不建**——
+> 它是 few-shot 采纳的来源，而采纳入口在 P9。P2 落地时有四格的真实状态要写清楚，否则下一片会
+> 以为这些列已经在动了：
+> ① `question_resolved` 恒 NULL——① 改写这一步的开关 `AIWEB_RETRIEVAL__ENABLE_REWRITE` 缺省就是
+> `false`（省一次 LLM 往返），关掉时"原文"与"对齐后"是同一句，写两份是冗余而不是信息。
+> ② `retrieved` 里的 `score_vec`/`fused` 恒 `null`，只有 `score_kw` 有值——L1 是唯一的检索档，
+> 向量与 RRF 融合是 P4。这正是要留着这一列的理由：**可解释性要能区分"没命中"和"没算"**。
+> ③ `prompt_tokens`/`completion_tokens` P2 恒 `0`（列建 NOT NULL）。不是忘了，是原料不存在：
+> `llm_client.complete()` 只返回 `choices[0].message.content`，响应体里的 `usage` 被丢掉了。
+> 真 usage 归 P8（流式那侧本来就要从末帧取）， heuristic 估算**不许**写进这一列——它是审计列，
+> 装一个估算值就等于谎报。
+> ④ `executed`/`error_code`/`error_message` 是早退分支的落点：检索为空、畸形返回、守卫拒绝三类
+> 都必须留下一行（`executed=false`），"拒了但没痕迹"等于没拒。
+
 ## 3. 人工列与同步列的分离（幂等重跑的关键）
 
 `comment_raw` 由同步写，`comment_zh` / `business_desc` / `granularity` / `is_hidden` 是人工字段，
