@@ -1,8 +1,10 @@
-"""问数 prompt 组装（architecture §4.1 ④，工单 010）。
+"""问数 prompt 组装（architecture §4.1 的 ④ 与 ⑨，工单 010 / 012）。
 
 纯函数：输入是构造出来的卡片对象，不碰 DB、不碰凭据，输出直接就是 `llm_client` 吃的 messages。
-段落顺序出自 §4.1：schema 卡片 → JOIN → 术语 → few-shot → 问题 → 输出格式
+④ 的段落顺序出自 §4.1：schema 卡片 → JOIN → 术语 → few-shot → 问题 → 输出格式
 （角色与硬约束在 system，见 `nl2sql_system.j2`）。
+⑨ 的素材出自同一节的"≤50 行喂 markdown 表；更多行只喂摘要"，住在这一层是因为
+**"给模型看哪些行"和"给模型看哪些列"是同一种判断**——都由预算与意图决定，都不该上抬到编排层。
 
 为什么这两句硬约束值得被逐字钉死：少了"只能引用给定的表"，模型会去 JOIN 一张没给的表，
 守卫按表白名单拒；少了"必须带 LIMIT"，守卫会自己补一条 LIMIT——但补出来的行数上限来自配置，
@@ -19,6 +21,7 @@ from typing import Any, Final
 
 from jinja2 import Environment, FileSystemLoader
 
+from app.services.chart_advisor import is_number, numeric_column_slots
 from app.services.token_estimate import estimate_tokens
 
 logger = logging.getLogger(__name__)
@@ -225,6 +228,141 @@ def build_prompt(
                 examples=kept_examples,
                 question=question,
                 row_limit=row_limit,
+            ),
+        },
+    ]
+
+
+# ============================================================ ⑨ 结论生成的素材
+
+
+_MAX_ROWS_IN_PROMPT: Final = 50
+"""§4.1 ⑨ 的原文阈值：≤50 行喂整表，超过就只喂摘要——68 列宽表全量进 prompt 会先把
+上下文吃掉，而结论要的是"数出来的是什么"，不是每一行。"""
+
+_TOP_BOTTOM: Final = 5
+"""§4.1 ⑨ 的"top/bottom 5"：摘要里保留的头尾行数。"""
+
+
+def _markdown_table(columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+    """结果集 → markdown 表。空格与竖线形状是给模型看的，不是给人看的，所以不做对齐。"""
+    out = ["| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"]
+    out += ["| " + " | ".join("" if v is None else str(v) for v in row) + " |" for row in rows]
+    return "\n".join(out)
+
+
+def _cell(row: Sequence[Any], index: int) -> Any:
+    """按**下标**取一格：列名可以重复（`SELECT a, a`），下标不会。行比列短时按空处理。"""
+    return row[index] if index < len(row) else None
+
+
+def _as_float(value: Any) -> float | None:
+    """序列化后的数值格可能是字符串（safety §4.3），也可能是被截出来的空位。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return float(value) if is_number(value) else None
+
+
+def _result_summary(columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
+    """摘要分支：每个数值列的 sum/avg/min/max + 按最后一个数值列排的头尾各 5 行。
+
+    排序键取**最后一个**数值列，因为 SQL 的习惯是把度量放在维度之后
+    （`SELECT 月份, SUM(金额)`），取第一列会在 `SELECT 金额, 月份` 这种少数写法上排错。
+    """
+    measures = numeric_column_slots(columns, rows)
+    lines = [f"（结果共 {len(rows)} 行，只给摘要，未列出的行不在这里）", ""]
+    lines += ["| 数值列 | 合计 | 均值 | 最小 | 最大 |", "| --- | --- | --- | --- | --- |"]
+    for index, name in measures:
+        values = [v for v in (_as_float(_cell(row, index)) for row in rows) if v is not None]
+        if not values:
+            continue
+        lines.append(
+            f"| {name} | {sum(values):.2f} | {sum(values) / len(values):.2f}"
+            f" | {min(values):.2f} | {max(values):.2f} |"
+        )
+    if measures:
+        key_index, key_name = measures[-1]
+        # 空值排到最后：摘要里的头尾是"最值的头尾"，一格空的行既不该占榜首也不该占榜尾。
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                _as_float(_cell(row, key_index)) is None,
+                -(_as_float(_cell(row, key_index)) or 0.0),
+            ),
+        )
+        lines += [
+            "",
+            f"按 {key_name} 取前 {_TOP_BOTTOM} 行：",
+            _markdown_table(columns, ordered[:_TOP_BOTTOM]),
+            "",
+            f"按 {key_name} 取后 {_TOP_BOTTOM} 行：",
+            _markdown_table(columns, ordered[-_TOP_BOTTOM:]),
+        ]
+    return "\n".join(lines)
+
+
+def result_brief(
+    *,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    token_budget: int | None = None,
+) -> str:
+    """结果集 → 进 ⑨ prompt 的那段素材（§4.1 ⑨ 的两条分支）。
+
+    分支只按行数判：≤50 行喂整表（"一行都不许少"），超过喂摘要（`_result_summary`）。
+    这是 §4.1 ⑨ 原文的形状，不因预算改道——把"装不下就换摘要"当兜底是会反噬的：
+    摘要要开一张 stats 表加两张头尾表，**小窄结果的摘要比整表更长**，换过去等于把
+    "超预算"变成"更超预算"。
+
+    `token_budget` 承担的是 verification §2.1 的 `token_estimate` ⑥（"摘要路径的预算
+    ≤TOKEN_BUDGET"）：算一遍选中素材的体量，**超了就告警不改道**——语义与 010 那条
+    "被裁掉的表要 logger.info 记下"同一条（P4 验收 6：不报错但要可查）。真按预算裁行的
+    那一刀要等"给模型看哪些行"有口径之后，属引依赖的那一档（roadmap §P4）。
+    传数就是 `Settings.retrieval.token_budget`，`None`（与 `build_prompt` 同一套默认值口径）
+    意为不看预算。
+    """
+    brief = (
+        _markdown_table(columns, rows)
+        if len(rows) <= _MAX_ROWS_IN_PROMPT
+        else _result_summary(columns, rows)
+    )
+    if token_budget is not None:
+        used = estimate_tokens(brief)
+        if used > token_budget:
+            logger.warning(
+                "⑨ 的素材超出预算：%d > %d（分支=%s 行数=%d 列数=%d）",
+                used,
+                token_budget,
+                "整表" if len(rows) <= _MAX_ROWS_IN_PROMPT else "摘要",
+                len(rows),
+                len(columns),
+            )
+    return brief
+
+
+def build_conclusion_prompt(
+    *,
+    question: str,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[Any]],
+    row_count: int,
+    truncated: bool,
+    token_budget: int | None = None,
+) -> list[dict[str, Any]]:
+    """⑨ 结论生成的 messages：素材是 `result_brief` 的结果，不是整张结果表。
+
+    这里的 `row_count` 与 `len(rows)` 可以不相等（executor 丢过探针行、也截过断），
+    所以两个都传：模板里那句"共 N 行"要说的是真实行数。
+    """
+    return [
+        {"role": "system", "content": _ENV.get_template("conclusion_system.j2").render()},
+        {
+            "role": "user",
+            "content": _ENV.get_template("conclusion_user.j2").render(
+                question=question,
+                row_count=row_count,
+                truncated=truncated,
+                brief=result_brief(columns=columns, rows=rows, token_budget=token_budget),
             ),
         },
     ]

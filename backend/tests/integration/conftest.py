@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import configparser
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
@@ -23,6 +23,7 @@ from app import deps
 from app.core.security import hash_password
 from app.main import create_app
 from app.models.user import User
+from app.settings import get_settings
 
 BACKEND = Path(__file__).resolve().parents[2]
 CNF = BACKEND / ".setup" / "aiweb_ro.cnf"
@@ -84,9 +85,12 @@ async def session_factory(
     # 于是全会话后头每一条"取当前生效 profile"的语句都会撞上它——表现是检索莫名其妙返回空。
     #
     # 往这张清单里加东西的时机：新表一有 DDL 就要跟上，否则"每条用例从空表开始"这句话
-    # 会从这行注释开始骗人。010 的 chat_sessions/chat_messages、以及还没建表的
-    # datasource_grants 都在这儿排队（删除顺序照 FK：先下级再上级）。
+    # 会从这行注释开始骗人。012 的 chat_sessions/chat_messages 已跟上（删序照 FK：
+    # messages → sessions → data_sources，sessions 对 users 是 CASCADE，但显式删才不依赖
+    # 外键方向对不对）。还没建表的 datasource_grants 在这儿排队。
     async with engine.begin() as conn:
+        await conn.execute(text(f'DELETE FROM "{schema}".chat_messages'))
+        await conn.execute(text(f'DELETE FROM "{schema}".chat_sessions'))
         await conn.execute(text(f'DELETE FROM "{schema}".data_sources'))
         await conn.execute(text(f'DELETE FROM "{schema}".kb_index_profile'))
         await conn.execute(text(f'DELETE FROM "{schema}".users'))
@@ -149,3 +153,19 @@ def login(
         )
 
     return _login
+
+
+@pytest.fixture
+def results_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """把结果目录钉进 tmp_path：早退用例要断言"一根 csv 都没落"，就得知道该看哪个目录。
+
+    012 起放在这里而不是某个测试模块里：编排用例与 live 用例都要它，而 fixture 靠
+    参数名解析，跨模块 import 会被 ruff 判成 F811（同名重定义）。
+    """
+    target = tmp_path / "results"
+    monkeypatch.setenv("AIWEB_RESULT__DIR", str(target))
+    get_settings.cache_clear()
+    try:
+        yield target
+    finally:
+        get_settings.cache_clear()

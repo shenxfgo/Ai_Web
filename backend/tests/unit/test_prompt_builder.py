@@ -1,12 +1,13 @@
-"""prompt 组装（工单 010）：段落顺序、两条硬约束、预算裁切。
+"""prompt 组装（工单 010 / 012）：段落顺序、两条硬约束、预算裁切、⑨ 的结果摘要。
 
-接缝按 architecture §4.1 ④ 与 verification §2.1 的 `prompt_builder` 行：
+接缝按 architecture §4.1 ④⑨ 与 verification §2.1 的 `prompt_builder` 行：
 输入是构造出来的卡片对象，不碰 DB、不碰凭据，输出直接就是 `llm_client` 吃的 messages。
 期望值口径全部来自文档：段落顺序出自 architecture §4.1，两句硬约束出自 roadmap §P2 踩坑 ④。
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -18,8 +19,11 @@ from app.services.nl2sql.prompt_builder import (
     Term,
     _example_line,
     _term_line,
+    build_conclusion_prompt,
     build_prompt,
+    result_brief,
 )
+from app.services.token_estimate import estimate_tokens
 
 
 def _table(
@@ -255,3 +259,124 @@ def test_golden_整段_user_message() -> None:
         row_limit=1000,
     )[1]["content"]
     assert user == GOLDEN.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------- ⑨：结果摘要进 prompt（工单 012）
+
+
+def test_50行以内给整表_一行都不许少() -> None:
+    """§4.1 ⑨ 的"前 50 行整表"分支：小结果集再做摘要纯属自毁——模型看不到月份对不上号。"""
+    assert (
+        result_brief(
+            columns=["月份", "金额"],
+            rows=[["2024-01", "10.5"], ["2024-02", "20.25"], ["2024-03", None]],
+        )
+        == "| 月份 | 金额 |\n"
+        "| --- | --- |\n"
+        "| 2024-01 | 10.5 |\n"
+        "| 2024-02 | 20.25 |\n"
+        "| 2024-03 |  |"
+    )
+
+
+def test_正好50行仍走整表分支_51行才切摘要() -> None:
+    """阈值是"超过 50"而不是"达到 50"：边界钉一条，否则下次有人把 `<=` 改成 `<` 没人知道。"""
+    full = [[f"2024-{i:02d}", str(i)] for i in range(1, 51)]
+    assert "| 月份 | 金额 |" in result_brief(columns=["月份", "金额"], rows=full)
+    assert "只给摘要" not in result_brief(columns=["月份", "金额"], rows=full)
+
+    over = [*full, ["2025-01", "51"]]
+    assert "只给摘要" in result_brief(columns=["月份", "金额"], rows=over)
+
+
+def _60_rows() -> list[list[str]]:
+    """60 行：`得分=2i` 单调升、`金额=100-i` 单调降，两个数值列的排序方向相反。
+
+    故意让"第一个数值列"与"最后一个数值列"排出完全不同的头尾，这样"取哪一列当排序键"
+    就不是一个能被巧合蒙过去的断言。
+    """
+    return [[f"c{i}", str(i * 2), str(100 - i)] for i in range(1, 61)]
+
+
+def test_超50行只给摘要_没列出的行不许出现() -> None:
+    """摘要分支的全部意义是"不整表喂进去"，所以数一行首格出现的次数，不看内容看数量。
+
+    期望值手算：得分=2i 合计 2×(1+…+60)=3660、均值 61；金额=100−i 合计 6000−1830=4170、均值 69.5。
+    """
+    out = result_brief(columns=["名称", "得分", "金额"], rows=_60_rows())
+    assert "（结果共 60 行，只给摘要，未列出的行不在这里）" in out
+    assert "| 数值列 | 合计 | 均值 | 最小 | 最大 |" in out
+    assert "| 得分 | 3660.00 | 61.00 | 2.00 | 120.00 |" in out
+    assert "| 金额 | 4170.00 | 69.50 | 40.00 | 99.00 |" in out
+    # 首格出现的行数 = 前 5 + 后 5：文本列（cN）不进度量表，所以它只可能来自那两张表
+    assert out.count("| c") == 10
+
+
+def test_摘要的头尾按最后一个数值列排() -> None:
+    """排序键取**最后一个**数值列（§4.1 ⑨ 的口径：度量常写在维度之后）。
+
+    按"得分"排的话 `c60`（得分 120）会进前 5；按"金额"排它落在最后一名。两者只可能有一个成立。
+    """
+    out = result_brief(columns=["名称", "得分", "金额"], rows=_60_rows())
+    top, bottom = out.split("按 金额 取后 5 行：")
+    head = top.split("按 金额 取前 5 行：")[1]
+    assert "| c1 | 2 | 99 |" in head
+    assert "| c5 | 10 | 95 |" in head
+    assert "| c60 | 120 | 40 |" in bottom
+    assert "| c56 | 112 | 44 |" in bottom
+    assert "| c60 |" not in head
+
+
+def test_超预算时只告警不改道_小窄结果的摘要比整表还长() -> None:
+    """预算的语义是"看一眼并报一声"，不是"换个分支"。
+
+    换分支那一刀会反噬：三列 2 行的整表只有几十个字，同数据的摘要要开 stats 表加两张头尾表，
+    **更长**。所以这里把预算压得比整表还小，断的是"回的还是整表"——
+    它同时也是"摘要没被当成兜底"的证据。
+    """
+    rows = [["2024-01", "10.5"], ["2024-02", "20.25"]]
+    table = result_brief(columns=["月份", "金额"], rows=rows, token_budget=1)
+    assert "| 月份 | 金额 |" in table and "只给摘要" not in table
+
+
+def test_典型60行的摘要远在预算之内_预算不是摆设() -> None:
+    """verification §2.1 的 `token_estimate` ⑥ 写的是"摘要路径的预算 ≤TOKEN_BUDGET"。
+
+    1500 是缺省预算的字面量，不跟 `Settings` 走：跟着配置断等于断"它不小于自己"。
+    """
+    out = result_brief(columns=["名称", "得分", "金额"], rows=_60_rows(), token_budget=1500)
+    assert estimate_tokens(out) <= 1500
+
+
+def test_摘要装不下预算时留下告警_而不是静默把上下文顶爆(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """几百个数值列的摘要确实能长过预算；那一刀不裁（再裁就只剩"共 N 行"），但必须可查。"""
+    columns = ["名称"] + [f"m{i}" for i in range(600)]
+    rows = [[f"c{r}"] + [str(i + r) for i in range(600)] for r in range(60)]
+    with caplog.at_level(logging.WARNING):
+        out = result_brief(columns=columns, rows=rows, token_budget=1500)
+    assert "超出预算" in caplog.text
+    assert "只给摘要" in out  # 报了警，但一个字没裁
+
+
+def test_结论prompt是两条消息且素材来自摘要() -> None:
+    """⑨ 走第二次 LLM 调用：角色顺序与"共 N 行"取真实 row_count 而不是 len(rows)。
+
+    executor 会丢探针行也可能截断，两者可以不相等——模板里那句"共 N 行"必须是真实行数，
+    所以这里故意传 60 行而只给 2 行数据。截断的话术出自 conclusion_user.j2。
+    """
+    messages = build_conclusion_prompt(
+        question="2024 年订单总金额是多少",
+        columns=["月份", "金额"],
+        rows=[["2024-01", "10.5"], ["2024-02", "20.25"]],
+        row_count=60,
+        truncated=True,
+    )
+    assert [m["role"] for m in messages] == ["system", "user"]
+    assert "结论生成器" in messages[0]["content"]
+    user = messages[1]["content"]
+    assert "【问题】2024 年订单总金额是多少" in user
+    assert "【结果】共 60 行（已被行数上限截断）" in user
+    assert "| 2024-02 | 20.25 |" in user
+    assert "不要输出 markdown 表格" in user

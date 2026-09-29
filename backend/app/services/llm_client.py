@@ -116,6 +116,15 @@ class LlmClient:
         return {"authorization": f"Bearer {self._llm.api_key}"}
 
     @property
+    def model(self) -> str:
+        """这次请求要问的模型名。
+
+        公开它只有一个理由：`chat_messages.model` 是审计列，记的必须是**这次真问了哪个**，
+        而不是调用方各自再读一次 Settings（读两处就会漂移，尤其测试里客户端与 Settings 不同源）。
+        """
+        return self._llm.model
+
+    @property
     def _url(self) -> str:
         # base_url 由 settings 单点决定，不绑在注入的 http client 上（绑两处会漂移）
         return f"{self._llm.base_url.rstrip('/')}/chat/completions"

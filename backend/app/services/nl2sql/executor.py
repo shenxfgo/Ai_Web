@@ -168,6 +168,8 @@ _TIMEOUT_CODES = frozenset({3024, "57014"})
 # 调用方如果再传 timeout_source 字符串，012 一撒谎验收 ② 就假过——所以不留这个入参。
 _GLOBAL_TIMEOUT_KEY = "AIWEB_QUERY__TIMEOUT_MS"
 _DS_TIMEOUT_KEY = "data_sources.timeout_ms"
+_GLOBAL_ROW_LIMIT_KEY = "AIWEB_QUERY__ROW_LIMIT"
+_DS_ROW_LIMIT_KEY = "data_sources.row_limit"
 
 
 def resolve_timeout(row: DataSource) -> tuple[int, str]:
@@ -176,6 +178,22 @@ def resolve_timeout(row: DataSource) -> tuple[int, str]:
         return row.timeout_ms, _DS_TIMEOUT_KEY
     # 兜的是"旧行/手插行没有列值"的形态；正常登记路径永远走上一支（列是 NOT NULL）。
     return get_settings().query.timeout_ms, _GLOBAL_TIMEOUT_KEY
+
+
+def resolve_row_limit(row: DataSource) -> int:
+    """行数上限：L4 的 `data_sources.row_limit` 覆盖 L3 全局缺省。
+
+    判定规则与 `resolve_timeout` 同一条。
+
+    为什么不写成 `row.row_limit or settings.query.row_limit`：`or` 只兜 `None`/`0`，而这一格是
+    手插行也能填的整数列——`-5` 会原样进 `sql_guard.check(max_rows=-5)`，守卫注入 `LIMIT -4`
+    （MySQL 语法错，白问一次），更要紧的是 `split_truncated(rows, row_limit=-5)` 会渲染成
+    `rows[:-5]`，把**真结果**从尾部吃掉还不报截断。超时那一侧 011 已经按 `> 0` 判过，
+    两边共用一条规则，注释才不会各说各话。
+    """
+    if row.row_limit is not None and row.row_limit > 0:
+        return row.row_limit
+    return get_settings().query.row_limit
 
 
 def classify_source_error(exc: Exception, *, timeout_ms: int, timeout_source: str) -> NoReturn:
