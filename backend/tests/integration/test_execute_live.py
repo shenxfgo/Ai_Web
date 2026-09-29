@@ -65,8 +65,6 @@ async def test_只读查询跑通且_decimals_datetime_序列化落_csv(
             "select id, amount, created_at from ai_web_demo.order_main limit 3", row_limit=100
         ),
         row_limit=100,
-        timeout_ms=15000,
-        timeout_source="AIWEB_QUERY__TIMEOUT_MS",
         max_cell_chars=1000,
         result_dir=tmp_path,
     )
@@ -93,8 +91,6 @@ async def test_行数超上限_truncated_true_且_csv_是完整上限行(
         password=account.password,
         sql_final=_guard("select id from ai_web_demo.order_main", row_limit=5),
         row_limit=5,
-        timeout_ms=15000,
-        timeout_source="AIWEB_QUERY__TIMEOUT_MS",
         max_cell_chars=1000,
         result_dir=tmp_path,
     )
@@ -130,8 +126,6 @@ async def test_会话只读生效_引擎拒绝写_而这不是应用拒的(accou
             password=account.password,
             sql_final="update ai_web_demo.order_main set amount = 1 where id = 1",
             row_limit=100,
-            timeout_ms=15000,
-            timeout_source="AIWEB_QUERY__TIMEOUT_MS",
             max_cell_chars=1000,
             result_dir=tmp_path,
         )
@@ -142,11 +136,11 @@ async def test_会话只读生效_引擎拒绝写_而这不是应用拒的(accou
 async def test_慢查询被超时真中断_错误点名配置来源(account: DbAccount, tmp_path: Path) -> None:
     """验收 ②：`SET SESSION MAX_EXECUTION_TIME` 到点由源库自杀，翻成 QueryTimeout 并带键名。
 
-    这里绕过守卫直接给执行器喂 SQL（守卫本来就禁 sleep；这条测执行层超时中断，不是守卫拦不拦）。
-    用 `sleep(1)` **每行**都睡 1 秒而不是 `select sleep(2)` 一次：
-    MySQL 的 MAX_EXECUTION_TIME 只在**行边界**检查——`count(*)` 从头到尾只吐一行，中间从不看时钟；
-    单条 `select sleep(2)` 也只有一行，同样查不到。所以要让**每一行都慢**，第一条完成就超预算，
-    行边界检查当场命中 300ms 阈值，报 3024（本坑第一次踩就交过学费，注释钉在这里免得再翻车）。
+    上限与来源都由执行器从 `row.timeout_ms` 判定（工单 as-built：来源判定不收调用方），
+    所以这里给 DataSource 造 timeout_ms=300，detail 里的键名应当是 `data_sources.timeout_ms`。
+    绕过守卫直接喂 SQL（守卫本来就禁 sleep；这条测执行层超时中断，不是守卫拦不拦）。
+    用 `sleep(1)` **每行**都睡 1 秒而不是 `select sleep(2)` 一次：MySQL 只在**行边界**检查
+    MAX_EXECUTION_TIME，单行语句（sleep(2)、count(*)）从头到尾不查时钟，必须每行都慢。
     """
     with pytest.raises(QueryTimeout) as caught:
         await execute_readonly(
@@ -154,8 +148,6 @@ async def test_慢查询被超时真中断_错误点名配置来源(account: DbA
             password=account.password,
             sql_final="select sleep(1) from ai_web_demo.order_item limit 5",
             row_limit=100,
-            timeout_ms=300,
-            timeout_source="data_sources.timeout_ms",
             max_cell_chars=1000,
             result_dir=tmp_path,
         )

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
 from app.services.nl2sql.executor import serialize_cell
@@ -33,6 +33,18 @@ def test_datetime_走_iso_字符串() -> None:
     assert serialize_cell(aware, max_cell_chars=1000) == "2024-03-05T14:30:00+08:00"
     # 纯日期
     assert serialize_cell(date(2024, 3, 5), max_cell_chars=1000) == "2024-03-05"
+    # 纯时间：TIME 列
+    assert serialize_cell(time(14, 30, 0), max_cell_chars=1000) == "14:30:00"
+
+
+def test_timedelta_按_mysql_time_字面量形状回() -> None:
+    # asyncmy 对 TIME 列与 timediff() 返回 timedelta；str() 会给 Python 规范形
+    # （"-1 day, 23:00:00"），与 mysql> 手工对数（verification §3 第 10 步）逐位对不上。
+    # 手算期望：MySQL TIME 的 H 可负、可超 24。
+    assert serialize_cell(timedelta(hours=1), max_cell_chars=1000) == "1:00:00"
+    assert serialize_cell(timedelta(hours=-1), max_cell_chars=1000) == "-1:00:00"
+    assert serialize_cell(timedelta(hours=30), max_cell_chars=1000) == "30:00:00"
+    assert serialize_cell(timedelta(seconds=45), max_cell_chars=1000) == "0:00:45"
 
 
 def test_bytes_回可读占位() -> None:

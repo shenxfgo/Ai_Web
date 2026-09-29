@@ -9,7 +9,7 @@ from __future__ import annotations
 import csv
 import re
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, NoReturn
@@ -27,6 +27,7 @@ from app.core.logging import get_logger
 from app.models.datasource import DataSource
 from app.services.datasource_service import grants_verdict, root_cause
 from app.services.source_manager import create_source_engine
+from app.settings import get_settings
 
 _logger = get_logger(__name__)
 
@@ -64,6 +65,20 @@ def _bytes_placeholder(value: bytes) -> str:
     return f"<binary {round(size / 1024, 1)}KB>"
 
 
+def _format_timedelta(value: timedelta) -> str:
+    """按 MySQL TIME 字面量的 `[-]H:MM:SS` 形状回，而不是 Python `str(timedelta)` 的规范形。
+
+    `str(timedelta(hours=-1))` 是 "-1 day, 23:00:00"、`str(timedelta(hours=30))` 是
+    "1 day, 2:00:00"——用户手工 `mysql> SELECT duration ...` 逐位对数时（verification §3 第 10 步）
+    界面对不上原文就是这个原因。total_seconds 归一到整秒后手工拆分，H 可负、可超 24。
+    """
+    total = round(value.total_seconds())
+    sign = "-" if total < 0 else ""
+    hours, rem = divmod(abs(total), 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{sign}{hours}:{minutes:02d}:{seconds:02d}"
+
+
 def serialize_cell(value: Any, *, max_cell_chars: int) -> Any:
     """把驱动返回的一个单元格转成 JSON 安全值（safety §4.3 的单元格保护）。
 
@@ -72,8 +87,10 @@ def serialize_cell(value: Any, *, max_cell_chars: int) -> Any:
     """
     if isinstance(value, Decimal):
         return str(value)
-    if isinstance(value, (datetime, date)):
+    if isinstance(value, (datetime, date, time)):
         return value.isoformat()
+    if isinstance(value, timedelta):
+        return _format_timedelta(value)
     if isinstance(value, (bytes, bytearray, memoryview)):
         return _bytes_placeholder(bytes(value))
     if isinstance(value, str) and len(value) > max_cell_chars:
@@ -118,7 +135,7 @@ def write_result_csv(path: Path, *, columns: list[str], rows: list[tuple[Any, ..
 
     编码用 utf-8-sig：演示库列注释与数据都是中文，裸 utf-8 在 Excel 里会乱码，
     而 BOM 是唯一让"下载下来直接能看"成立的做法。行里的值已由 serialize_cell 转好，
-    None 写成空单元格。
+    None 写成空单元格——`csv.writer` 默认就把 None 写成空，这里的显式转换只是把意图落在字面。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as fh:
@@ -140,9 +157,25 @@ def enforce_readonly_grants(grant_lines: list[str]) -> None:
         raise ReadonlyCapabilityMissing("源账号不是只读账号，拒绝执行", detail=verdict["warnings"])
 
 
-# 源库到点自杀的错误码：MySQL 是 3024（MAX_EXECUTION_TIME），PG 是 SQLSTATE 57014。
-# 只有这两种翻成 QueryTimeout；其余错误原样抛，让调用方按 §4.1 分档处理。
+# 源库到点自杀的错误码：int 档是 MySQL 驱动的 errno（3024=MAX_EXECUTION_TIME 中断），
+# str 档是 PG 的 SQLSTATE（"57014"=statement_timeout 中断）——异步驱动抛回来的原文两种都有，
+# 别"优化"成纯 int 集合，那样 PG 分支会永远匹配不上。
 _TIMEOUT_CODES = frozenset({3024, "57014"})
+
+
+# 超时上限的来源判定收在执行器里而不是调用方：`data_sources.timeout_ms` 是 NOT NULL 列
+# （server_default=15000，登记时把全局缺省落进列值），执行期取到的值**恒**来自这一格。
+# 调用方如果再传 timeout_source 字符串，012 一撒谎验收 ② 就假过——所以不留这个入参。
+_GLOBAL_TIMEOUT_KEY = "AIWEB_QUERY__TIMEOUT_MS"
+_DS_TIMEOUT_KEY = "data_sources.timeout_ms"
+
+
+def resolve_timeout(row: DataSource) -> tuple[int, str]:
+    """返回 (超时上限, 来源键名)。行上没有有效值才落全局缺省，来源名跟着值走。"""
+    if row.timeout_ms is not None and row.timeout_ms > 0:
+        return row.timeout_ms, _DS_TIMEOUT_KEY
+    # 兜的是"旧行/手插行没有列值"的形态；正常登记路径永远走上一支（列是 NOT NULL）。
+    return get_settings().query.timeout_ms, _GLOBAL_TIMEOUT_KEY
 
 
 def classify_source_error(exc: Exception, *, timeout_ms: int, timeout_source: str) -> NoReturn:
@@ -190,8 +223,6 @@ async def execute_readonly(
     password: str,
     sql_final: str,
     row_limit: int,
-    timeout_ms: int,
-    timeout_source: str,
     max_cell_chars: int,
     result_dir: Path,
 ) -> ExecutionResult:
@@ -206,11 +237,17 @@ async def execute_readonly(
       超时分类就废了。缓冲取回 3024 到得了客户端，截断行为一样。
     ④ split_truncated 丢探针行、serialize_cell 逐格转 JSON 安全值、write_result_csv 落盘。
 
+    超时上限与其来源键名由 `resolve_timeout(row)` 在执行器内部判定，**调用方无法指定**——
+    验收 ② 的"上限来自哪个配置项"必须是事实而不是传话。
+    **内存安全前提**：`sql_final` 只能来自 `sql_guard.check(max_rows=row_limit)` 的返回值
+    （注入的 LIMIT row_limit+1 是缓冲取回的唯一上限）；绕过守卫直调会退化成整结果集进内存。
+
     一次性 NullPool engine（source_manager 口径：011 不缓存连接池，缓存与并发闸同属 P3）。
     """
     if row.kind != "mysql":
         raise NotImplementedSource(f"kind={row.kind} 的只读执行尚未实现")
 
+    timeout_ms, timeout_source = resolve_timeout(row)
     engine = create_source_engine(row, password, timeout_ms=timeout_ms)
     try:
         async with engine.connect() as raw_conn:
@@ -229,7 +266,9 @@ async def execute_readonly(
                             "源库不支持 MAX_EXECUTION_TIME，降级靠驱动侧连接超时", exc_info=exc
                         )
                         continue
-                    classify_source_error(exc, timeout_ms=timeout_ms, timeout_source=timeout_source)
+                    # 非降级的 SET 失败直接上抛，由外层 except 统一分档——
+                    # 在这里再调一次 classify 的话，非超时异常会被分档两遍。
+                    raise
 
             result = await conn.execute(text(sql_final))
             columns = list(result.keys())
