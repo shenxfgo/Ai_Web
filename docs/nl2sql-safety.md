@@ -200,7 +200,22 @@ SET SESSION wait_timeout = <timeout_ms/1000 + 10>;
 SET SESSION autocommit = 1;
 ```
 
+> **as-built(P2-011)：本表是"目标顺序"，`session_statements('mysql', ...)` 实际只发四条 SET**——
+> `READ ONLY` → `MAX_EXECUTION_TIME` → `wait_timeout` → `autocommit=1`。
+> `sql_mode` 那条注释已经写明"不改，仅读取并记入日志"，属于观察项而不是执行项，011 不做；
+> `NETWORK_COMPRESSION` 在 asyncmy 上没有对应会话变量（是 MySQL 服务端 `--skip-network-compression`
+> 启动参数或客户端握手选项），发出去就是 1193 unknown sysvar，与 §4.1 想要的"失败忽略"结果一样，
+> 索性不发。两条都是"注释里的意图已达成，语句本身跳过"。
+
 - `SET SESSION TRANSACTION READ ONLY` 前**不能在已有事务里**。
+
+  > **as-built(P2-011)：落地方式 = 拿到连接后立刻 `await conn.execution_options(isolation_level="AUTOCOMMIT")`**。
+  > SQLAlchemy 2.0 的 AsyncConnection 会 autobegin，不切 AUTOCOMMIT 的话紧随 `show grants`（本身是
+  > SELECT）就把事务开了，随后那条 `SET SESSION TRANSACTION READ ONLY` 会被 MySQL 5.7 拒。
+  > AUTOCOMMIT 让每条 SET/SELECT 各自即时提交，不进 SQLAlchemy 的事务包裹。
+  > 另：`execution_options` 在 async 侧是 awaitable（同 `AsyncConnection` 上的 `run_sync` 一样要 await），
+  > 写成 `conn = raw_conn.execution_options(...)` 会得到一个 coroutine 而不是 connection。
+
 - 账号侧要求：**只给 `GRANT SELECT ON <db>.* TO 'aiweb_ro'@'%'`**，数据源表单提示"请建只读账号"。
   UI 检测 `SHOW GRANTS` 里出现 `ALL|INSERT|UPDATE|DROP|CREATE` → 黄色警告（不阻断，admin 可确认）；
   连上的账号不具备只读能力时 `test_connection` 报 `readonly_capability_missing`（能力探测前置）。
@@ -216,7 +231,30 @@ SET SESSION autocommit = 1;
 - 取数：无缓冲 cursor + 逐 1000 行 `fetchmany`，累计到 `max_rows+1` 立即 `cursor.close()`。
   **不做 `KILL <connection_id>`**——`KILL` 是写操作，只读账号本来就无权限，依赖
   `MAX_EXECUTION_TIME` 自杀 + 连接归还前 `ROLLBACK`。这是 MVP 的诚实取舍，写进 known limitation。
-- `asyncmy` 的 `read_timeout` 与 `MAX_EXECUTION_TIME` 谁先触发要实测：驱动先断会留下服务端仍在跑的查询。
+
+  > **as-built(P2-011)：本条降级为"缓冲 `execute()` + `fetchall()`"**。理由不是"实现偷懒"，而是
+  > 流式取数会让**超时分类废掉**：asyncmy 在 `stream(partitions(1000))` 下遇到服务端 3024
+  > 不会把 3024 传给我们，而是先吐 2013（Lost connection）并挂一条
+  > `coroutine '_finish_unbuffered_query' was never awaited` 警告；分类器拿不到 timeout code，
+  > `QueryTimeout` 就翻不出来，验收 ② 直接假过。缓冲取回时 3024 到得了客户端，行为一致，
+  > 而**内存上限由守卫注入的 `LIMIT row_limit+1` 钉住**，与是否流式无关。
+  > 代价：绕过守卫直调 `execute_readonly` 的话没有那一行兜底，会退化成"整结果集进内存"——
+  > 012 接线时必须保证 `sql_final` 只能来自 `sql_guard.check(max_rows=...)` 的返回值。
+  > 等 asyncmy 修好流式模式下的 3024 传播再回到本条的原口径。
+
+- `MAX_EXECUTION_TIME` **只在行边界检查**。这意味着：`count(*)` 从头到尾只吐一行，中间从不看时钟；
+  单条 `SELECT SLEEP(n)` 同样只有一行，也查不到；两者都不会触发超时中断。演示库要测这个必须让
+  **每一行都慢**（011 的 live 用例用 `select sleep(1) from order_item limit 5`，第一行结束即命中阈值）。
+
+  > **as-built(P2-011)：源库不支持 `MAX_EXECUTION_TIME`（MySQL < 5.7.4，errno 1193 unknown sysvar）时
+  > 降级靠驱动侧 `read_timeout`**：分类器 `_is_unsupported_max_execution_time` 命中 1193 后 warning +
+  > `continue`，其余 SET 语句照旧执行、执行本身不阻断。演示库 5.7 支持该变量，这条**live 不测**——
+  > 降级分支只在单测的 `session_statements` 顺序里存在，触发路径要真·5.7.3 才能演，P2 不设这个环境。
+
+- 错误码分档 as-built(P2-011)：3024（MySQL `MAX_EXECUTION_TIME` 自杀）与 PG `"57014"` 翻成 `QueryTimeout`；
+  1792（会话 READ ONLY 挡写）/ 1142（账号无写权限）走原始 `DBAPIError` **不翻译**，是"引擎拒 ≠ 应用拒"
+  的证据（验收 ① 靠这两档分开断言）；翻译了反而分不清拦下来的是 MySQL 还是我们。演示库上 aiweb_ro
+  只有 SELECT 权限，实测 1142 先命中，(1792, 1142) 都算通过。
 
 ### 4.2 PostgreSQL
 
@@ -230,6 +268,16 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 ```
 
 连接串可选带 `target_session_attrs=prefer-standby`：有备库时走只读副本，这是 PG 侧最强的一道防线。
+
+> **as-built(P2-011)**：`session_statements('postgres', ...)` 只发**两条**——
+> `SET default_transaction_read_only = on` 和 `SET statement_timeout = '<n>ms'`。
+> `BEGIN; SET LOCAL ...` 那一串属于"事务级"写法，需要执行器把 SET 和真实查询包在同一个事务里；
+> 011 的 MySQL 侧走的是 AUTOCOMMIT，PG 侧不做双分支实现，统一 `SET`（会话级）够用。
+> `application_name` / `lock_timeout` / `idle_in_transaction_session_timeout` 三条是观测/微优化项，
+> P2 没启用。
+> **且 `execute_readonly` 目前只走 MySQL 分支**，PG kind 直接抛 `NotImplementedSource`——与 006
+> `test_connection`、007 抽取的现状对齐；PG 主链在 006-011 全线通了再上（roadmap §P2 未把 PG 主链
+> 列为验收）。
 
 ### 4.3 行上限与截断
 
@@ -269,6 +317,23 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 - 单元格保护：`str` 截断；`bytes`/`Binary` → `"<binary 1.2KB>"`；
   `Decimal` → **str**（避免前端精度丢失，不能让金额变成 `0.30000000000000004`）；日期 → ISO 字符串。
   `executor` 统一 `default=str` + 按列 `type` 显式序列化，否则 naive `datetime` 进 `json.dumps` 会 500。
+
+  > **as-built(P2-011)**：`serialize_cell(value, *, max_cell_chars)` 就是这一条的**唯一入口**，
+  > 顺序是 Decimal → datetime/date → bytes → str 超长 → 原样透传（int/float/bool/None）。
+  > `default=str` 只在 `json.dumps` 兜"未知的类型"，不进入本条主路径。
+  > bytes 占位分档：`<binary 3B>`（<1KiB）与 `<binary 1.2KB>`（≥1KiB，`round(n/1024, 1)`）。
+
+- 结果 csv 落盘形态 as-built(P2-011)：
+  - 编码 **`utf-8-sig`**（带 BOM），Excel 打开中文列头/单元格不乱码；写入时 `newline=""` 交给 csv 模块自己管
+    CRLF/LF，跨平台一致。
+  - 文件命名 `run_id` = **UTC 时间戳 `%Y%m%d%H%M%S` + `uuid4().hex`**，形状白名单 `[A-Za-z0-9]+`
+    （`_RUN_ID` 同一份正则同时给生成器和校验器用，两者不一致的话会出现"生成的名字过不了自己的门"）。
+  - 写入侧防护：`result_csv_path(result_dir, run_id)` 对越界 run_id（`..`、`/`、绝对路径、空字节、空串）
+    **一律 `ValueError`**，路径拼出来必在 `result_dir.resolve()` 之内。§7 的下载侧一半（realpath 落
+    回目录内、403/404 不区分）**归 013**。
+  - `execute_readonly` 一次调用生成一个 `run_id`，落在 `ExecutionResult.run_id` 与 `.result_file` 两个字段，
+    接口层（012）只把它们抄进响应体，没有任何入参能反向指定。
+
 - 抽取侧同样保护：全部 IS 查询前 `SET SESSION max_execution_time` / `SET LOCAL statement_timeout`，
   批大小固定 200，批间 `await asyncio.sleep(EXTRACT__BATCH_INTERVAL_MS)`，单连接串行，不开并发打源库。
 

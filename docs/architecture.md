@@ -221,6 +221,24 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 >   > "边的目标表若没出现在【候选表】里，它只是结构提示，不要写进 SQL"，
 >   > 与 system 那句"只能引用给定的表"对齐。钉住处：`tests/unit/test_prompt_builder.py::test_目标表被预算裁掉后边仍在可_join_段_但标题已声明不可引用`。
 
+> **as-built(P2-011)**：⑦ 这一步落地为 `services/nl2sql/executor.execute_readonly(...)`（async），
+> 返回 `ExecutionResult(columns, rows, truncated, row_count, run_id, result_file)`。三个口径要记：
+> ① **会话准备 = AUTOCOMMIT + SHOW GRANTS 硬阻断 + 四条 SET**（顺序与降级细节见 safety §4.1 的
+> as-built）。执行前的 `SHOW GRANTS` 判定**不缓存**、`readonly_enforced` 列**不作阻断依据**——这两条
+> 是 006 拍板过、011 沿用不重开。
+> ② **取数用缓冲 `execute()+fetchall()`，不是"无缓冲 cursor + fetchmany 逐 1000"**。理由是 asyncmy
+> 流式游标下 3024 会变 2013 从而废掉超时分类；内存上限由守卫注入的 `LIMIT row_limit+1` 钉住，
+> 与是否流式无关。原口径的理由仍在 safety §4.1，本片的降级作为 as-built 记录，等 asyncmy 修好再回到原口径。
+> ③ **错误分档三挡**：`QueryTimeout`（3024/"57014"，detail 点名 timeout_ms 配置来源）→ `ReadonlyCapabilityMissing`
+> （SHOW GRANTS 判定，403）→ **原始 `DBAPIError` 不翻译**（1792/1142 是"引擎拒 ≠ 应用拒"的证据，
+> 翻译了就分不清）。这三挡的验收分别钉在 `tests/integration/test_execute_live.py` 与
+> `tests/unit/test_executor_timeout.py` / `test_executor_grants.py`。
+>
+> **接口层未接线**：本片的 public entry 只有 `execute_readonly`，`POST /api/chat/ask` 的 ⑦ 归属 012；
+> 结果文件的下载半边（realpath 落回目录内、403/404 不区分）属 013。
+> 现网调用 `execute_readonly` 的唯一生产路径必须保证 `sql_final` 来自 `sql_guard.check(max_rows=...)`
+> 的返回值——绕过守卫直调会退化成"整结果集进内存"，因为 ② 的内存上限靠那一行兜底。
+
 ### 4.2 图表选型规则（确定性，可单测）
 
 1. 1 行 1 列 → `kpi`（大数字卡）。
