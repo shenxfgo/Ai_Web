@@ -1,8 +1,11 @@
 """010 的全文加载：把检索给的 `table_uid` 补成 prompt 素材。
 
 单独有这一步的原因写在工单里：009 的 `CardMatch.text_preview` 只有 200 字
-（检索只需要判别力，不需要全文），而 prompt 要全文；关联边压根不在召回查询里，
-得回 `meta_relation` 取。这两件事都属于"检索的输出要给 prompt 消费"，所以落在检索侧。
+（检索只需要判别力，不需要全文），而 prompt 要全文。
+
+这里**不查关联边了**（010 时查过）：【可 JOIN】的唯一来源是 `join_graph`，
+真库那一半钉在 `tests/integration/test_join_graph_rows.py`。留着两处事实源的话，
+`is_stale` 与 inferred ≥0.8 两道门槛就得各写一份，而两边的口径并不一样。
 """
 
 from __future__ import annotations
@@ -73,16 +76,18 @@ async def test_顺序按传入的_table_uid_而不是数据库返回顺序(sessi
         assert [t.full_name for t in tables] == ["ai_web_demo.customer", "ai_web_demo.order_main"]
 
 
-async def test_关联边带上目标表全名与来源档位(session_factory) -> None:
+async def test_装载侧不带关联边而节点身份是_table_uid(session_factory) -> None:
+    """库里那条边还在，这里一条都不带（工单 014）：【可 JOIN】的唯一来源是 `join_graph`。
+
+    两句各钉一半：
+    - `relations` 没了 —— 两处各有一份边事实源时，`is_stale` 与 inferred ≥0.8 两道门槛就得写
+      两份，而两份口径本来就不一样（010 那份 SQL 连 `is_stale` 都不看）。
+    - `uid` 就是 `meta_table.table_uid` —— 它是 `build_prompt` 判"这行 JOIN 引用的表还在不在"
+      唯一能对上号的身份：按 `full_name` 对不行，两张源库同名的表会同名。
+    """
     async with session_factory() as session:
         actor, uids = await _wide_and_target(session)
         tables = await load_schema_tables(session, actor=actor, table_uids=uids)
-        rel = tables[0].relations[0]
-        assert rel.from_column == "col_001"
-        assert rel.to_table_full == "ai_web_demo.customer"
-        assert rel.to_column == "id"
-        assert rel.kind == "extracted"
-        # 真外键不打折：confidence 列的 server_default 是 1.0（§2.4）
-        assert rel.confidence == 1.0
-        # 目标表自己不该带上这条边（边是从 from_table 出发的直连边，反向遍历归工单 014）
-        assert tables[1].relations == ()
+
+        assert [t.uid for t in tables] == uids
+        assert not any(hasattr(t, "relations") for t in tables)

@@ -26,7 +26,7 @@ from sqlalchemy import Select, Table, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.kb import KbCard, KbIndexProfile
-from app.models.meta import MetaColumn, MetaRelation, MetaTable
+from app.models.meta import MetaColumn, MetaTable
 from app.models.user import User
 from app.schemas.kb import (
     KbSearchCardOut,
@@ -36,7 +36,7 @@ from app.schemas.kb import (
     KbSearchRequest,
 )
 from app.services import datasource_service
-from app.services.nl2sql.prompt_builder import RelationEdge, SchemaTable
+from app.services.nl2sql.prompt_builder import SchemaTable
 from app.settings import get_settings
 
 # 一段"词"要么是 ASCII 标识符（含下划线），要么是一串连续汉字；其它字符一律当分隔符。
@@ -241,7 +241,6 @@ _PREVIEW_CHARS: Final = 200
 _CARD = cast("Table", KbCard.__table__)
 _PROFILE = cast("Table", KbIndexProfile.__table__)
 _META_TABLE = cast("Table", MetaTable.__table__)
-_META_RELATION = cast("Table", MetaRelation.__table__)
 _META_COLUMN = cast("Table", MetaColumn.__table__)
 
 
@@ -501,14 +500,18 @@ async def search_preview(
 async def load_schema_tables(
     session: AsyncSession, *, actor: User, table_uids: Sequence[str]
 ) -> list[SchemaTable]:
-    """把检索给的 `table_uid` 补成 prompt 素材：当前生效 profile 的卡片**全文** + 直连关联边。
+    """把检索给的 `table_uid` 补成 prompt 素材：当前生效 profile 的卡片**全文**。
 
-    这一步住在检索侧而不是 prompt 侧，是因为它补的正是检索输出的两处"够自己用但不够 prompt 用"：
-    `CardMatch.text_preview` 只有 200 字（召回只要判别力），而关联边根本不在召回查询里。
-    `prompt_builder` 因此保持纯函数——它收的永远是齐料，不碰库。
+    这一步住在检索侧而不是 prompt 侧，是因为它补的正是检索输出的那处"够自己用但不够 prompt 用"：
+    `CardMatch.text_preview` 只有 200 字（召回只要判别力）。`prompt_builder` 因此保持纯函数——
+    它收的永远是齐料，不碰库。
 
-    逐表两次查询（卡片、边）而不是批量：传入顺序就是检索的相关度顺序，
-    而【候选表】段的顺序是要进 prompt 的语义（§4.1 ④），批量后重排更容易出错。
+    关联边不在这里查了（010 时查过）：【可 JOIN】的唯一来源是 `join_graph`，
+    它自己读 `meta_relation` 并把表全名带在边上。一张表一条边查询留在这里，
+    就会有两份"这些表之间有哪些边"的事实，而它们对 `is_stale` 与门槛的口径并不一样。
+
+    逐表查而不是批量：传入顺序就是检索的相关度顺序，而【候选表】段的顺序是要进 prompt 的语义
+    （§4.1 ④），批量后重排更容易出错。
     """
     profile_id = await _active_profile_id(session)
     if profile_id is None:
@@ -551,46 +554,5 @@ async def load_schema_tables(
         if not segments:
             continue
 
-        target = _META_TABLE.alias("meta_table_prompt_target")
-        rows = (
-            await session.execute(
-                select(
-                    _META_RELATION.c.from_column_name,
-                    _META_RELATION.c.source_kind,
-                    _META_RELATION.c.confidence,
-                    _META_RELATION.c.to_column_name,
-                    target.c.catalog_name.label("to_catalog_name"),
-                    target.c.schema_name.label("to_schema_name"),
-                    target.c.table_name.label("to_table_name"),
-                )
-                .join(target, target.c.id == _META_RELATION.c.to_table_id)
-                .where(_META_RELATION.c.from_table_id == table_id)
-                # 顺序要稳：同一张表两次问数拿到同一份 JOIN 段，golden 才不会被排序抖动打穿。
-                .order_by(
-                    _META_RELATION.c.source_kind,
-                    _META_RELATION.c.from_column_name,
-                    target.c.table_name,
-                    _META_RELATION.c.to_column_name,
-                )
-            )
-        ).mappings()
-        relations = tuple(
-            RelationEdge(
-                from_column=str(row["from_column_name"]),
-                to_table_full=".".join(
-                    part
-                    for part in (
-                        row["to_catalog_name"],
-                        row["to_schema_name"],
-                        row["to_table_name"],
-                    )
-                    if part
-                ),
-                to_column=str(row["to_column_name"]),
-                kind=str(row["source_kind"]),
-                confidence=None if row["confidence"] is None else float(row["confidence"]),
-            )
-            for row in rows
-        )
-        out.append(SchemaTable(full_name=full_name, segments=segments, relations=relations))
+        out.append(SchemaTable(uid=uid, full_name=full_name, segments=segments))
     return out

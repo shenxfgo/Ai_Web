@@ -36,39 +36,27 @@ _ENV: Final = Environment(
     keep_trailing_newline=False,
 )
 
-# §5.3："只有 ≥0.8 才进 prompt"——辖区是【可 JOIN】这份可执行边清单，不是"整份 prompt 里不许出现"：
-# 卡片全文的【可关联】行仍会带上同一条低置信边（008 的渲染器不看 confidence，而 010 的口径是
-# 卡片原文进 prompt、装配层不做二次加工）。写侧今天最低给 0.85，所以这道门槛筛的是 007 时代
-# 按常数 0.7 落库的历史行。
-_INFERRED_PROMPT_FLOOR: Final = 0.8
-
-
-@dataclass(frozen=True)
-class RelationEdge:
-    """一条关联边的 prompt 视角：只要渲染与门槛判定要用的那五个字段。
-
-    刻意不复用 `kb_service.RelationMeta`（卡片渲染用那个）：本模块是**零 DB 依赖的叶子**——
-    单测构造这些 dataclass 就能跑完整装配，import 卡片层会把 sqlalchemy 一起拖进来。
-    """
-
-    from_column: str
-    to_table_full: str
-    to_column: str
-    kind: str = "extracted"
-    confidence: float | None = None
+# §5.3 的门槛（inferred ≥0.8）与"边按起点筛"两条口径，014 起住在 `join_graph` 那一侧：
+# 【可 JOIN】的行由图算出来、由 pipeline 渲染成 `JoinLine` 送进来，
+# 本模块只做**预算裁切后的存活判定**。
+# 门槛不在这里再判一遍是刻意的——两处各筛一次，就会有两套"为什么这条 JOIN 没了"。
 
 
 @dataclass(frozen=True)
 class SchemaTable:
-    """一张表的 prompt 素材：卡片段（主卡在前、列切片按 `seq` 升序）+ 它参与的关联边。
+    """一张表的 prompt 素材：`table_uid` + 卡片段（主卡在前、列切片按 `seq` 升序）。
 
     段而不是一整篇文本，是因为预算裁切要能**只丢切片、留主卡**——008 的主卡带着表头和全部
     PK/索引/外键列，丢了切片"这张表叫什么、主键是谁"还在，丢了整张表就什么都没了。
+
+    `uid` 在 014 之前是没有的：那时关联边挂在卡片上，筛边看卡片就够了。现在【可 JOIN】的行
+    来自图（图以 uid 为节点 id），而"这张表的卡片在不在 prompt 里"是裁预算那一刻才知道的事实，
+    所以存活判定必须能按 uid 对上号——按 `full_name` 对不行，两张源库同名的表（不同源）会同名。
     """
 
+    uid: str
     full_name: str
     segments: tuple[str, ...] = ()
-    relations: tuple[RelationEdge, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,37 +73,19 @@ class Example:
 
 
 @dataclass(frozen=True)
-class _JoinLine:
-    from_table: str
-    from_column: str
-    to_table_full: str
-    to_column: str
-    confidence: float | None
-    inferred: bool
+class JoinLine:
+    """【可 JOIN】里的一行：渲染好的文本 + 它引用到的**表 uid 全集**。
 
-
-def _join_lines(tables: Sequence[SchemaTable]) -> list[_JoinLine]:
-    """候选表之间的**直连边**（010 的范围）；BFS/桥表扩展归工单 014。
-
-    只渲染从候选表出发的一跳：目标表即使没被检索到，它的名字也已经出现在源表的卡片全文
-    【可关联】段里，所以"只能引用给定的表"这句约束不会被这条渲染破坏。
+    拆成两件事的理由是裁预算发生在 `build_prompt` 内部：pipeline 拿到图的时候还不知道哪张表
+    会被裁掉，所以它只能把"这行要靠谁才成立"交出来，由这里在裁完之后判存活。
+    一条路径的 `requires` 是它**每一张表**（含桥表）——桥表被裁，整条路径就撤（拍板 9：
+    路径是"可执行"承诺，留半条等于要求模型 JOIN 一张没给卡片的表）；
+    单边结构提示的 `requires` 只有起点，对端本来就可以没卡片（010 的口径，标题那句已声明）。
+    两种行共用一个形状，差别只在 `requires` 里放谁。
     """
-    lines: list[_JoinLine] = []
-    for table in tables:
-        for rel in table.relations:
-            if rel.kind == "inferred" and (rel.confidence or 0) < _INFERRED_PROMPT_FLOOR:
-                continue
-            lines.append(
-                _JoinLine(
-                    from_table=table.full_name,
-                    from_column=rel.from_column,
-                    to_table_full=rel.to_table_full,
-                    to_column=rel.to_column,
-                    confidence=rel.confidence,
-                    inferred=rel.kind == "inferred",
-                )
-            )
-    return lines
+
+    requires: tuple[str, ...]
+    text: str
 
 
 def _cut_tables(
@@ -194,6 +164,8 @@ def build_prompt(
     *,
     question: str,
     tables: Sequence[SchemaTable],
+    joins: Sequence[JoinLine] = (),
+    notes: Sequence[str] = (),
     terms: Sequence[Term] = (),
     examples: Sequence[Example] = (),
     row_limit: int = 1000,
@@ -205,6 +177,11 @@ def build_prompt(
     `token_budget=None` 时不裁切（单测与调试用）；传数就是 `AIWEB_RETRIEVAL__TOKEN_BUDGET`，
     管的是**素材段**（schema → 术语 → 示例）——问题、输出格式和 system 里的硬约束是固定开销，
     由 roadmap §P2 那句"与 LLM max_output 之和留出余量"负责，不参与竞争。
+
+    `joins` 是图算出来、pipeline 渲染好的【可 JOIN】行，`notes` 是同一层的降级与澄清话术
+    （"只按单表回答""这两张表的关联有歧义"）。两者都住在**卡片段之后**进预算：
+    它们本身几百 token，真正吃掉预算的是卡片全文，所以这里不做裁切，只做**存活判定**——
+    桥表被裁掉时经过它的路径整体消失（拍板 9），留半条等于要求模型 JOIN 一张没给卡片的表。
     """
     kept_tables: list[SchemaTable] = list(tables)
     kept_terms: list[Term] = list(terms)
@@ -217,13 +194,28 @@ def build_prompt(
         left_for_examples = token_budget - used - term_used
         kept_examples = _cut_examples(kept_examples, left_for_examples, few_shot_budget)
 
+    alive = {table.uid for table in kept_tables}
+    kept_joins: list[JoinLine] = []
+    missing: set[str] = set()
+    for line in joins:
+        absent = set(line.requires) - alive
+        if absent:
+            missing |= absent
+        else:
+            kept_joins.append(line)
+    if missing:
+        # 被谁裁掉的必须可查——"我明明同步了外键，为什么 prompt 里没有这条 JOIN"是高频问题，
+        # 而答案此刻只剩下"某张表没进预算"这一件事，日志里不说就没人接得住。
+        logger.info("JOIN 行随表被裁（缺席的表 uid）：%s", "、".join(sorted(missing)))
+
     return [
         {"role": "system", "content": _ENV.get_template("nl2sql_system.j2").render()},
         {
             "role": "user",
             "content": _ENV.get_template("nl2sql_user.j2").render(
                 tables=kept_tables,
-                joins=_join_lines(kept_tables),
+                joins=kept_joins,
+                notes=notes,
                 terms=kept_terms,
                 examples=kept_examples,
                 question=question,

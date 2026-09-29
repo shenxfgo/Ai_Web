@@ -21,6 +21,7 @@ dependencies = [
   "pymysql>=1.2.3",
   "jinja2>=3.1",
   "pgvector>=0.3",
+  "networkx>=3.7",
 ]
 
 [dependency-groups]
@@ -47,6 +48,11 @@ ignore = ["B008", "RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["app"]
+
+[tool.ruff.lint.per-file-ignores]
+# 跨模块复用夹具的 pytest 写法：夹具只在自己模块内自动可见，别的模块要用就得 import 进来，
+# 而形参必须与它同名才解析得到——F811 把这一手当成"重复定义"，而它正是这条 import 存在的理由。
+"tests/integration/test_sync_cache_pg.py" = ["F811"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

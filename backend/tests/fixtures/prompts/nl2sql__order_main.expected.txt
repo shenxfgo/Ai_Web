@@ -6,7 +6,7 @@
 【表】ai_web_demo.customer
 【字段】共 1 个：
 - id int NOT NULL 主键: 客户ID
-【可 JOIN】以下边从上面这些表出发；边的目标表若没出现在【候选表】里，它只是结构提示，不要写进 SQL：
+【可 JOIN】每行是一组可执行的关联条件（同一张查询里的 JOIN，可能经过桥表跨多跳）；某张表没出现在【候选表】里时，它只是结构提示，不要写进 SQL：
 - ai_web_demo.order_main.customer_id → ai_web_demo.customer.id
 【术语口径】
 - GMV（同义词：成交额、交易额）: 已支付订单的金额合计

@@ -62,7 +62,8 @@ def test_屏幕上那句_sql_是守卫重生成后的而不是模型原文(
 
 _MARKERS = (
     "② 检索",
-    "③ 进 prompt 的表",
+    "③ JOIN 图",
+    "④ 进 prompt 的表",
     "⑤ 模型给的 SQL",
     "⑥ 守卫判定",
     "⑦ 执行",
@@ -80,6 +81,29 @@ def test_每一步的产物都有一行_包括耗时合计(capsys: pytest.Captur
         assert marker in text, marker
     assert "retrieve 10ms → execute 200ms" in text
     assert "20260929abc.csv" in text  # 结果文件引用要能顺着查到那张 csv
+
+
+def test_JOIN_图那两栏原样端出来_桥表路径与降级说明各一行(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """工单 014 的人工实录就看这几行：跨表路径到底进没进 prompt，屏幕上要一眼看得出。
+
+    断"原样"而不是"有几行"：`join_lines` 的文本由 pipeline 的渲染器给出（桥表名在里面），
+    脚本再格式化一次，实录读到的就和真 prompt 里的【可 JOIN】不是同一句话了。
+    """
+    demo = load_script("demo_ask_print", DEMO_ASK)
+    demo._print_outcome(
+        _outcome(
+            join_lines=[
+                "- ai_web_demo.payment_record.order_id → ai_web_demo.order_main.id，"
+                "ai_web_demo.order_item.product_id → ai_web_demo.product.id"
+            ],
+            join_notes=["本次候选表之间没有可执行的跨表关联路径：只按单表回答，"],
+        )
+    )
+    text = capsys.readouterr().out
+    assert "ai_web_demo.order_item.product_id → ai_web_demo.product.id" in text
+    assert "只按单表回答" in text
 
 
 def test_早退时把_error_code_与那句下一步打在终局行(capsys: pytest.CaptureFixture[str]) -> None:

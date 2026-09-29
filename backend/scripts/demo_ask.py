@@ -78,7 +78,14 @@ def _print_outcome(out: pipeline.AskOutcome) -> None:
     print(f"[② 检索] {len(out.retrieved)} 张候选表")
     for r in out.retrieved:
         print(f"    - {r['table_uid'][:8]}…  score_kw={r['score_kw']}")
-    print(f"[③ 进 prompt 的表] {len(out.tables)} 张：" + "、".join(out.tables or ["—"]))
+    # ③ 是 §4.1 新加的那一步（工单 014）：跨表问数能不能走通，答案全在这几行里——
+    # 一行 JOIN 都没有时，后面的 SQL 只可能是单表的，那一句"关联说明"会替模型把这件事说明白。
+    print(f"[③ JOIN 图] {len(out.join_lines)} 行可 JOIN，{len(out.join_notes)} 句关联说明")
+    for line in out.join_lines:
+        print(f"    {line}")
+    for note in out.join_notes:
+        print(f"    ！{note}")
+    print(f"[④ 进 prompt 的表] {len(out.tables)} 张：" + "、".join(out.tables or ["—"]))
 
     print(f"[⑤ 模型给的 SQL] {out.sql_raw or '—（没产出，看下面的终局）'}")
     guard = out.guard_result or {}

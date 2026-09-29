@@ -7,6 +7,7 @@ Protocol 的桩、executor 走 monkeypatch 的 spy。为什么要 pg 夹具：�
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,12 @@ from app.models.datasource import DataSource
 from app.models.user import User
 from app.services.llm_client import LlmClient
 from app.services.nl2sql import executor, pipeline
+from app.services.nl2sql.join_graph import (
+    Expansion,
+    JoinPath,
+    JoinStep,
+    RelationEdge,
+)
 from app.services.nl2sql.prompt_builder import SchemaTable
 from app.services.nl2sql.retriever import CardMatch, RetrievedTable
 from app.settings import LlmGroup, get_settings
@@ -138,6 +145,8 @@ class Spies:
     def __init__(self) -> None:
         self.executor_calls: list[dict[str, Any]] = []
         self.card_requests: list[list[str]] = []
+        #: 让某张表的卡片"补不出来"，用来造桥表缺卡那种真实情形（`_seed_cards` 之外的捷径）。
+        self.missing_cards: set[str] = set()
 
     async def execute_readonly(self, row: Any, **kwargs: Any) -> Any:
         self.executor_calls.append({"ds_id": row.id, **kwargs})
@@ -151,19 +160,32 @@ class Spies:
         )
 
     async def load_cards(self, _session: Any, **kwargs: Any) -> list[SchemaTable]:
-        self.card_requests.append(list(kwargs["table_uids"]))
+        requested = list(kwargs["table_uids"])
+        self.card_requests.append(requested)
         return [
             SchemaTable(
-                full_name="ai_web_demo.order_main",
+                uid=uid,
+                full_name=_FULL_NAMES.get(uid, f"ai_web_demo.tbl_{uid[:6]}"),
                 segments=("# 表 ai_web_demo.order_main —— 订单主表\n【主键】id\n",),
-                relations=(),
             )
+            for uid in requested
+            if uid not in self.missing_cards
         ]
 
 
-def _found(datasource_id: int, table_id: int) -> RetrievedTable:
+# 检索桩给的 uid 是编的，而守卫按**表全名**放行，所以"哪个 uid 渲染成哪张表"必须是固定的：
+# 改了这张表，`DRAFT_SQL` 里的 `ai_web_demo.order_main` 就白名单外了。
+_FULL_NAMES = {
+    "u" * 32: "ai_web_demo.order_main",
+    "o" * 32: "ai_web_demo.other_src",
+    "b" * 32: "ai_web_demo.t_bridge",
+    "c" * 32: "ai_web_demo.order_item",
+}
+
+
+def _found(datasource_id: int, table_id: int, *, table_uid: str = "u" * 32) -> RetrievedTable:
     return RetrievedTable(
-        table_uid="u" * 32,
+        table_uid=table_uid,
         table_id=table_id,
         datasource_id=datasource_id,
         title="订单主表",
@@ -175,7 +197,7 @@ def _found(datasource_id: int, table_id: int) -> RetrievedTable:
             CardMatch(
                 card_id=77,
                 table_id=table_id,
-                table_uid="u" * 32,
+                table_uid=table_uid,
                 datasource_id=datasource_id,
                 kind="table",
                 seq=0,
@@ -244,6 +266,7 @@ async def test_一次完整问数把九步串起来并留痕(
 
         assert [name for name, _ in outcome.steps] == [
             "retrieve",
+            "join_graph",
             "schema",
             "prompt",
             "generate",
@@ -324,6 +347,7 @@ async def test_守卫拒绝时一次都不进执行器(session_factory, spies: S
         assert outcome.guard_result["violations"][0]["code"] == "table_not_allowed"
         assert [name for name, _ in outcome.steps] == [
             "retrieve",
+            "join_graph",
             "schema",
             "prompt",
             "generate",
@@ -427,7 +451,13 @@ async def test_返回被截断时留下畸形返回那一行而不是猜(session
         assert outcome.error_code == "llm_bad_response"
         # 掉的原文要看得见（验收"哪一步掉的、掉的原文是什么"）
         assert "SELECT dt FROM ai_web_demo.order_main" in (outcome.error_message or "")
-        assert [name for name, _ in outcome.steps] == ["retrieve", "schema", "prompt", "generate"]
+        assert [name for name, _ in outcome.steps] == [
+            "retrieve",
+            "join_graph",
+            "schema",
+            "prompt",
+            "generate",
+        ]
         stored = await session.get(ChatMessage, outcome.message_id)
         assert stored is not None
         assert stored.error_code == "llm_bad_response" and stored.sql_raw is None
@@ -656,3 +686,296 @@ async def test_模型照模板写了_LIMIT_时守卫把它钳回探针(session_f
         assert stored is not None
         assert stored.sql_raw == limited
         assert stored.sql_final == outcome.sql_final
+
+
+# ---------------------------------------------------------------- 工单 014：图 → 卡片 → prompt
+
+
+def _step(from_uid: str, to_uid: str, *, column: str = "fk_id") -> JoinStep:
+    return JoinStep(
+        from_uid=from_uid,
+        from_column=column,
+        to_uid=to_uid,
+        to_column="id",
+        source_kind="extracted",
+        confidence=1.0,
+    )
+
+
+def _path(*uids: str) -> JoinPath:
+    return JoinPath(
+        uids=uids,
+        steps=tuple(_step(a, b) for a, b in itertools.pairwise(uids)),
+        weight=0.5 * (len(uids) - 1),
+    )
+
+
+def _hint(from_uid: str, to_name: str) -> RelationEdge:
+    return RelationEdge(
+        from_uid=from_uid,
+        from_column="fk_id",
+        to_uid="uid_unrecalled",
+        to_column="id",
+        source_kind="extracted",
+        confidence=1.0,
+        from_name=_FULL_NAMES.get(from_uid, from_uid),
+        to_name=to_name,
+    )
+
+
+class GraphStub:
+    """`expansion_for` / `structure_hints` 的桩，兼记 pipeline 传进来的实参。
+
+    桩的理由与 executor 一样：图的算法由 `test_join_graph.py`（手算图）和
+    `test_join_graph_rows.py`（真库形状）钉死，这里钉的是**编排**——补查哪些 uid、
+    白名单放进谁、三份输出各落到 prompt 的哪一段。真的调图要往元数据库插一批表行，
+    而那批行的形状正是那两个文件各自的责任，在这里再插一遍只会让三处要对齐同一份口径。
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.expansion = Expansion(
+            paths=kwargs.get("paths", ()),
+            ambiguous=kwargs.get("ambiguous", ()),
+            needs_cartesian=kwargs.get("needs_cartesian", ()),
+            bridge_uids=kwargs.get("bridge_uids", ()),
+            names=kwargs.get("names", {}),
+        )
+        self.hints: tuple[RelationEdge, ...] = kwargs.get("hints", ())
+        self.calls: list[dict[str, Any]] = []
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def fake_expansion(_session: Any, **kwargs: Any) -> Expansion:
+            self.calls.append({"fn": "expansion_for", **kwargs})
+            return self.expansion
+
+        async def fake_hints(_session: Any, **kwargs: Any) -> tuple[RelationEdge, ...]:
+            self.calls.append({"fn": "structure_hints", **kwargs})
+            return self.hints
+
+        monkeypatch.setattr(pipeline, "expansion_for", fake_expansion)
+        monkeypatch.setattr(pipeline, "structure_hints", fake_hints)
+
+
+def _first_prompt(route: respx.Route) -> str:
+    """第一次 LLM 往返的 user message——模型看见的那一份，不是我们以为的那一份。"""
+    body = json.loads(route.calls[0].request.content)
+    return body["messages"][1]["content"]
+
+
+@respx.mock
+async def test_桥表随路径一起补卡片并且进守卫白名单(
+    session_factory, spies: Spies, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """拍板 9 的编排那一半：桥表没被召回，只有图知道要补它，而补进来是为了让它能被引用。
+
+    三句各钉一件事：
+    - `load_schema_tables` 的实参必须带上桥表 uid，否则模型看见一条引用陌生表的路径；
+    - 守卫白名单必须放它进（`out.tables` 就是白名单），否则模型**照路径写的**合法 SQL 会被
+      `table_not_allowed` 拒掉——那等于图说"能连"、守卫说"不许"，用户看到的是无解的失败；
+    - 桥表排在候选之后：它不占 `final_tables_k` 的名额（拍板 9），只一起过 `token_budget`，
+      所以预算紧的时候先裁的是它，而不是把检索的相关度顺序改掉。
+    """
+    graph = GraphStub(
+        paths=(_path("u" * 32, "b" * 32, "c" * 32),),
+        bridge_uids=("b" * 32,),
+        names={
+            "u" * 32: "ai_web_demo.order_main",
+            "b" * 32: "ai_web_demo.t_bridge",
+            "c" * 32: "ai_web_demo.order_item",
+        },
+    )
+    graph.install(monkeypatch)
+    join_sql = (
+        "SELECT o.dt, SUM(o.amount) AS 金额 FROM ai_web_demo.order_main o "
+        "JOIN ai_web_demo.t_bridge b ON o.id = b.order_id GROUP BY o.dt"
+    )
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        route = _draft_route(sql=join_sql)
+
+        outcome = await pipeline.ask(
+            session,
+            actor=user,
+            question="每个月经过桥表的金额",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever(
+                [_found(ds.id, ds.id * 10 + 1), _found(ds.id, ds.id * 10 + 2, table_uid="c" * 32)]
+            ),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+        assert spies.card_requests == [["u" * 32, "c" * 32, "b" * 32]]
+        assert outcome.tables == [
+            "ai_web_demo.order_main",
+            "ai_web_demo.order_item",
+            "ai_web_demo.t_bridge",
+        ]
+        # 真守卫 + 真 chart_advisor：白名单没放进去的话这里就是 sql_guard_rejected
+        assert outcome.guard_result == {"ok": True, "violations": []}, outcome.error_message
+        assert outcome.executed is True
+        assert (
+            "- ai_web_demo.order_main.fk_id → ai_web_demo.t_bridge.id，"
+            "ai_web_demo.t_bridge.fk_id → ai_web_demo.order_item.id" in _first_prompt(route)
+        )
+        # 两张都是候选，路径在场 → 那句"只按单表回答"不该出现
+        assert "只按单表回答" not in _first_prompt(route)
+
+
+@respx.mock
+async def test_桥表补不出卡片时整条路径撤下而不是留半条(
+    session_factory, spies: Spies, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """拍板 9 的**另一半**：桥表进了补查清单但没进 prompt（缺卡/被预算裁掉）时，整条路径撤。
+
+    留半条等于要求模型去 JOIN 一张它没看见卡片的表——它会照着不存在的列名编，而那种 SQL
+    守卫拦不住（表名合法、列名不在白名单粒度内），最后以"源库报错"的形式回到用户面前。
+
+    这里用"缺卡"而不是"预算裁切"来造这个前提：同一处存活判定（`requires` 里的 uid 少一个就整行
+    不渲染），而预算那条路要依赖 `estimate_tokens` 的数值，把用例的期望值绑到估算式上。
+    被裁掉那一路本身钉在 `tests/unit/test_prompt_builder.py`。
+
+    已知缝（口径见 `pipeline._join_notes` docstring）：这种撤下**不会**补一句降级说明，
+    所以最后一条断言钉的是"没有那句'只按单表回答'"——它是现状，不是理想行为。
+    """
+    graph = GraphStub(
+        paths=(_path("u" * 32, "b" * 32, "c" * 32),),
+        bridge_uids=("b" * 32,),
+        names={
+            "u" * 32: "ai_web_demo.order_main",
+            "b" * 32: "ai_web_demo.t_bridge",
+            "c" * 32: "ai_web_demo.order_item",
+        },
+    )
+    graph.install(monkeypatch)
+    spies.missing_cards = {"b" * 32}
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        route = _draft_route(sql=DRAFT_SQL)
+
+        outcome = await pipeline.ask(
+            session,
+            actor=user,
+            question="每个月经过桥表的金额",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever(
+                [_found(ds.id, ds.id * 10 + 1), _found(ds.id, ds.id * 10 + 2, table_uid="c" * 32)]
+            ),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+    # 图确实要求补了它（不这么钉，下面那句"没出现"就可能只是"根本没去查"）
+    assert spies.card_requests == [["u" * 32, "c" * 32, "b" * 32]]
+    prompt = _first_prompt(route)
+    assert "ai_web_demo.t_bridge" not in prompt
+    assert "t_bridge.id" not in prompt
+    # `out.join_lines` 是裁切**之前**的清单：留痕要能回答"图本来给了什么"
+    assert outcome.join_lines == [
+        "- ai_web_demo.order_main.fk_id → ai_web_demo.t_bridge.id，"
+        "ai_web_demo.t_bridge.fk_id → ai_web_demo.order_item.id"
+    ]
+    assert "只按单表回答" not in prompt
+
+
+@respx.mock
+async def test_图的两个配置参数是接上去的而不是靠默认值(
+    session_factory, spies: Spies, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """与 `token_budget` 同一条硬接线义务：`hops`/`max_degree` 漏传不会报错，只会静默用默认值。
+
+    值故意设成与 `Settings` 默认值（2 / 8）不同的数——用默认值断言等于断"它等于它"。
+    """
+    monkeypatch.setenv("AIWEB_RETRIEVAL__JOIN_HOPS", "3")
+    monkeypatch.setenv("AIWEB_RETRIEVAL__MAX_JOIN_DEGREE", "5")
+    get_settings.cache_clear()
+    graph = GraphStub()
+    graph.install(monkeypatch)
+    try:
+        async with session_factory() as session:
+            user, ds = await _seed_user_and_source(session)
+            _draft_route(sql=DRAFT_SQL)
+            await pipeline.ask(
+                session,
+                actor=user,
+                question="2024 年每个月的订单总金额是多少",
+                datasource_ids=[ds.id],
+                retriever=FakeRetriever([_found(ds.id, ds.id * 10 + 1)]),
+                llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+            )
+    finally:
+        get_settings.cache_clear()
+
+    by_fn = {c["fn"]: c for c in graph.calls}
+    assert by_fn["expansion_for"]["hops"] == 3
+    assert by_fn["expansion_for"]["max_degree"] == 5
+    # 结构提示那一路两样都不接：它不数跳（那是扩展的事），也不数度（`_bridge_banned` 只在
+    # `expand` 里查，见 `join_graph.build_graph` 的"门槛不烧进缓存"）。传给它就是一个死参数，
+    # 而死参数迟早会被读成"这一路也会筛表度"。
+    assert "hops" not in by_fn["structure_hints"]
+    assert "max_degree" not in by_fn["structure_hints"]
+
+
+@respx.mock
+async def test_只有一张候选表时不说降级_但结构提示照列(
+    session_factory, spies: Spies, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """图只出事实（"连不上"），措辞归编排——所以那一句"按单表回答"落在这一层，不在 `join_graph`。
+
+    两侧各钉一半：
+    - 单候选表**不该**听到那句降级：一张表的问数根本没有"跨表"这回事，写了只会让模型去 clarify。
+    - 那条**单边结构提示**照旧在场：010 的口径是按起点筛不按终点筛，对端没被召回也列，
+      而【可 JOIN】的标题已经声明"某张表没出现在【候选表】里时只是结构提示，不要写进 SQL"。
+    - `needs_cartesian` 是逐对的事实，**不**逐对写进话术：三张连不上的表就是三行 prompt 噪声，
+      而"只能引用给定的表"那一句系统约束已经覆盖了全部三种。
+    """
+    graph = GraphStub(
+        needs_cartesian=(("u" * 32, "c" * 32),),
+        hints=(_hint("u" * 32, "ai_web_demo.t_unrecalled"),),
+    )
+    graph.install(monkeypatch)
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        route = _draft_route(sql=DRAFT_SQL)
+
+        outcome = await pipeline.ask(
+            session,
+            actor=user,
+            question="每个月的金额",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever([_found(ds.id, ds.id * 10 + 1)]),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+        user_msg = _first_prompt(route)
+        assert outcome.join_notes == []
+        assert "【关联说明】" not in user_msg
+        assert "- ai_web_demo.order_main.fk_id → ai_web_demo.t_unrecalled.id" in user_msg
+
+
+@respx.mock
+async def test_两张候选表之间没有路径时才说降级(
+    session_factory, spies: Spies, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """两条候选、零路径 → 那一句必须出现（上一条钉的是"一条候选时不该出现"，方向相反）。"""
+    graph = GraphStub(ambiguous=(("u" * 32, "c" * 32),))
+    graph.install(monkeypatch)
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        route = _draft_route(sql=DRAFT_SQL)
+
+        await pipeline.ask(
+            session,
+            actor=user,
+            question="每个月的金额",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever(
+                [_found(ds.id, ds.id * 10 + 1), _found(ds.id, ds.id * 10 + 2, table_uid="c" * 32)]
+            ),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+        user_msg = _first_prompt(route)
+        assert "【关联说明】" in user_msg
+        assert "只按单表回答" in user_msg
+        # 歧义对是按**表全名**说的：uid 对用户没有意义，而模型也只认表名
+        assert "ai_web_demo.order_main 与 ai_web_demo.order_item 之间" in user_msg
+        assert "u" * 32 not in user_msg

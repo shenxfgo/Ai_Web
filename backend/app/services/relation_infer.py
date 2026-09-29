@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from app.extractor.base import InferredRelation, RawColumn, RawForeignKey
+from app.extractor.base import ExtractWarning, InferredRelation, RawColumn, RawForeignKey
 
 # §5.3 的加权公式（工单 010 拍板取代 007 的常数打分）。
 _BASE = 0.35
@@ -160,3 +160,43 @@ def infer_relations(
                     )
                 )
     return edges
+
+
+def high_degree_fields(columns: Sequence[RawColumn], *, max_degree: int) -> list[ExtractWarning]:
+    """§5.3 末"候选度 > 8"的**写侧一半**：只告警，一条边都不丢（工单 014 拍板）。
+
+    为什么不是"丢弃"：`infer_relations` 的减法规则保证了每条推断边的目标端必是单列主键，
+    而主键按定义带唯一约束——文档那句"需另一端有唯一约束，否则丢弃"的"否则"永远走不到。
+    真要丢就得放宽减法规则（让泛列连到任一唯一索引列），那是文档没要求的连接能力。
+
+    计数口径与建图口径对齐：**按库分组**数**表**数（不是列数），因为推断边与 JOIN 图都不跨库；
+    否则会出现"告警说这列太泛、图里却照常用它扩展"的两套说法。
+    """
+    tables_by_field: dict[tuple[str, str], set[str]] = {}
+    for column in columns:
+        if not column.column_name.endswith(_ID_SUFFIXES):
+            continue  # 只有会进入推断的后缀列才是"候选"，`remark` 再泛也不构成 JOIN 噪声
+        tables_by_field.setdefault((column.schema_name, column.column_name), set()).add(
+            column.table_name
+        )
+    flagged = sorted(
+        (
+            (schema, name, len(tables))
+            for (schema, name), tables in tables_by_field.items()
+            if len(tables) > max_degree
+        ),
+        # 一个库可能有多条泛列，最泛的排前面——告警会整批端给用户，顺序就是阅读顺序。
+        key=lambda row: (row[0], -row[2], row[1]),
+    )
+    return [
+        ExtractWarning(
+            code="join_field_too_generic",
+            detail=(
+                f"`{schema}.{name}` 出现在 {degree} 张表（门槛 {max_degree}）："
+                "泛列，但它生成的推断边照旧全部落库、照旧进【可 JOIN】清单；读侧的抑制按**表**"
+                "的无向度数算（`join_graph` 的表度门槛），与这里的字段度是两个不同的量，"
+                "所以这条只是人工排查线索，不表示本列已被自动降级。"
+            ),
+        )
+        for schema, name, degree in flagged
+    ]

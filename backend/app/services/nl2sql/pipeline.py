@@ -10,7 +10,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
@@ -25,7 +25,19 @@ from app.services import datasource_service, sql_guard
 from app.services.chart_advisor import advise_chart
 from app.services.llm_client import LlmBadResponse, LlmClient
 from app.services.nl2sql.executor import execute_readonly, resolve_row_limit
-from app.services.nl2sql.prompt_builder import build_conclusion_prompt, build_prompt
+from app.services.nl2sql.join_graph import (
+    Expansion,
+    JoinStep,
+    RelationEdge,
+    expansion_for,
+    structure_hints,
+)
+from app.services.nl2sql.prompt_builder import (
+    JoinLine,
+    SchemaTable,
+    build_conclusion_prompt,
+    build_prompt,
+)
 from app.services.nl2sql.retriever import Retriever, load_schema_tables
 from app.services.sql_guard import QualifiedTable, SqlGuardError
 from app.settings import get_settings
@@ -122,6 +134,12 @@ class AskOutcome:
     retrieved: list[dict[str, Any]] = field(default_factory=list)
     datasource_id: int | None = None
     tables: list[str] = field(default_factory=list)
+    #: ③ 这一步的产物，记的是**裁切前**的那一份（存活判定在 `build_prompt` 内部做，
+    #: 被裁的是哪张表由那里的 `logger.info` 接住）。这一格里路径行与结构提示行混在一起，
+    #: 所以"非空"不等于"有可执行路径"——它回答的是"图到底给了什么"，
+    #: 而"为什么 prompt 里没有它"要到日志里对那张被裁的表。
+    join_lines: list[str] = field(default_factory=list)
+    join_notes: list[str] = field(default_factory=list)
     sql_raw: str | None = None
     sql_final: str | None = None
     guard_result: dict[str, Any] | None = None
@@ -217,10 +235,25 @@ async def ask(
         chat.datasource_id = ds.id
         out.datasource_id = ds.id
 
+        # ④ 之前先问一次图：候选表两两之间的可执行路径、歧义对和连不上的对（§5.3，工单 014）。
+        # 顺序是"图 → 补卡片"而不是反过来：桥表没被检索召回，只有图知道要补哪几张，
+        # 而补进来的卡片要一起过 `token_budget`（拍板 9：不占 `final_tables_k` 名额，占预算）。
+        candidate_uids = [r.table_uid for r in same_source]
+        expansion = await expansion_for(
+            session,
+            table_uids=candidate_uids,
+            hops=settings.retrieval.join_hops,
+            max_degree=settings.retrieval.max_join_degree,
+        )
+        hints = await structure_hints(session, table_uids=candidate_uids)
+        watch.lap("join_graph")
+
         tables = await load_schema_tables(
-            session, actor=actor, table_uids=[r.table_uid for r in same_source]
+            session, actor=actor, table_uids=[*candidate_uids, *expansion.bridge_uids]
         )
         watch.lap("schema")
+        # 桥表的名字也要进守卫白名单：它是路径上真实存在的一张表，模型照路径写出来的 SQL
+        # 引用它正当。守卫那一层不认识图，它看到的就只是"这次问数给了哪些表"。
         out.tables = [t.full_name for t in tables]
         if not tables:
             # 检索报了 uid、这里却一张卡都补不出来：只可能是同步在两步之间把表 prune 掉了。
@@ -230,9 +263,15 @@ async def ask(
         # 不写成 `ds.row_limit or settings.query.row_limit`：`or` 兜不住手插行的负数，而负数会
         # 一路进 `split_truncated` 渲染成 `rows[:-n]`——真结果从尾部被吃掉且不报截断。
         row_limit = resolve_row_limit(ds)
+        join_lines = _join_lines(expansion, hints)
+        join_notes = _join_notes(expansion, tables)
+        out.join_lines = [line.text for line in join_lines]
+        out.join_notes = list(join_notes)
         messages = build_prompt(
             question=question,
             tables=tables,
+            joins=join_lines,
+            notes=join_notes,
             terms=(),
             examples=(),
             row_limit=row_limit,
@@ -358,6 +397,101 @@ async def ask(
 
 
 NO_SCHEMA_HINT = "没有匹配到任何表：请补录表注释 / 检查授权 / 触发一次同步"
+
+# 降级与澄清的话术（architecture §5.3 末两条 + 拍板 10：图只出事实，句子住在这里）。
+# 刻意**不逐对枚举** `needs_cartesian`：一次召回 5 张表就是 10 行"连不上"，那是把图的全部
+# 失败清单当 prompt 正文灌进去。图说的"连不上"在这里只兑换成一句"按单表回答"——
+# 模型真需要知道的是"这次不能跨表"，而不是哪一对之间没有边。
+_SINGLE_TABLE_NOTE = (
+    "本次给定的表之间没有可执行的跨表关联路径（图侧结论：连桥表也算不上，可能是桥表卡片缺失）："
+    "只按单表回答，不要把两组表写进同一条 FROM；"
+    "问题确实必须跨表时，在 clarify 里说明缺哪一条关联（例如补录外键或关系后重问）。"
+)
+
+
+def _ambiguous_note(left: str, right: str) -> str:
+    return (
+        f"{left} 与 {right} 之间有两条同样短、同样可靠的路径，"
+        f"选哪一条是业务口径不是技术问题：请在 clarify 里请用户澄清，不要自己挑一条。"
+    )
+
+
+def _tag(kind: str, confidence: float | None) -> str:
+    """推断边的标签，字面沿用 010（`[推断,置信 0.85]`）——它是 golden 里的字。"""
+    return f" [推断,置信 {confidence}]" if kind == "inferred" else ""
+
+
+def _cond(left: str, right: str, *, source_kind: str, confidence: float | None) -> str:
+    """一条等值条件的字面：`外键侧.列 → 主键侧.列 [推断,置信 x]`。
+
+    路径里的每一跳和直连结构提示行**必须是同一个形状**，因为一跳路径与它的单边提示文本相同，
+    `_join_lines` 就靠这一点去重。分隔符用 `→` 而不是 `=`：010 的 golden 里就是这个字，
+    而它同时避开了守卫对 `=` 的解析噪声。
+    """
+    return f"{left} → {right}{_tag(source_kind, confidence)}"
+
+
+def _on_text(step: JoinStep, names: Mapping[str, str]) -> str:
+    """一跳的等值条件，**按边上存的方向**写（外键侧在前）——遍历从哪头来不参与渲染。"""
+    return _cond(
+        f"{names[step.from_uid]}.{step.from_column}",
+        f"{names[step.to_uid]}.{step.to_column}",
+        source_kind=step.source_kind,
+        confidence=step.confidence,
+    )
+
+
+def _edge_text(edge: RelationEdge) -> str:
+    """单边结构提示行。名字直接来自边（对端表没有卡片，也没有 uid→名字的映射可查）。"""
+    return _cond(
+        f"{edge.from_name}.{edge.from_column}",
+        f"{edge.to_name}.{edge.to_column}",
+        source_kind=edge.source_kind,
+        confidence=edge.confidence,
+    )
+
+
+def _join_lines(expansion: Expansion, hints: Sequence[RelationEdge]) -> list[JoinLine]:
+    """图的两份输出 → 【可 JOIN】的行。路径在前、结构提示在后，同文本只留前者。
+
+    `requires` 的两种形状是这一片的全部机关：
+    - 一条路径**每一张表**都要有卡片（桥表被预算裁掉 → 整条路径撤，拍板 9）；
+    - 一条单边结构提示只要**起点**有卡片（对端本来就可以没被召回，010 的口径）。
+    一跳路径与它的单边提示文本相同，先去的路径行带着更严的 `requires` 活下来——
+    这不是巧合：两张都是候选表时，"这一跳可执行"就意味着两张都得在场。
+    """
+    lines: list[JoinLine] = []
+    seen: set[str] = set()
+    for path in expansion.paths:
+        text = "- " + "，".join(_on_text(step, expansion.names) for step in path.steps)
+        if text not in seen:
+            seen.add(text)
+            lines.append(JoinLine(requires=path.uids, text=text))
+    for edge in hints:
+        text = "- " + _edge_text(edge)
+        if text not in seen:
+            seen.add(text)
+            lines.append(JoinLine(requires=(edge.from_uid,), text=text))
+    return lines
+
+
+def _join_notes(expansion: Expansion, tables: Sequence[SchemaTable]) -> list[str]:
+    """歧义逐对说一句，全无可执行路径时补一句降级——两句都是给模型的话，不是给人的报告。
+
+    判据用候选全集而不看预算裁切，这里留了一个已知的窄缝：路径本来存在、却因为桥表的卡片
+    被 `token_budget` 裁掉而整条从【可 JOIN】消失时，这一句"按单表回答"不会补上，而标题那句
+    "只能引用给定的表"仍然兜得住（模型没有路径可写，就只能单表或 clarify）。
+    不为此把 notes 也做成带 `requires` 的对象：那道存活判定已经在 `build_prompt` 里，
+    同一件事判两遍只会多一处要对齐的口径，而裁切现场本来就 logger.info 记了被裁的表。
+    """
+    notes: list[str] = []
+    names = {table.uid: table.full_name for table in tables}
+    for left, right in expansion.ambiguous:
+        if left in names and right in names:
+            notes.append(_ambiguous_note(names[left], names[right]))
+    if not expansion.paths and len(names) >= 2:
+        notes.append(_SINGLE_TABLE_NOTE)
+    return notes
 
 
 def _total_ms(watch: _Stopwatch) -> int:

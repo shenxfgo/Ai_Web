@@ -126,3 +126,23 @@ def test_绝对路径原样保留(monkeypatch: pytest.MonkeyPatch) -> None:
     """给了绝对路径就照用——运维把结果盘挪到大容量卷上是正当需求，不是越界。"""
     monkeypatch.setenv("AIWEB_RESULT__DIR", str(_EXPECTED_REPO_ROOT / "somewhere"))
     assert Settings(_env_file=None).result.dir == _EXPECTED_REPO_ROOT / "somewhere"
+
+
+def test_join_图的两个门槛各有缺省(monkeypatch: pytest.MonkeyPatch) -> None:
+    """工单 014：`hops=2` 出自 roadmap 分组 9，`8` 出自 architecture §5.3 的"候选度 > 8"。
+
+    期望值来自文档而不是代码：`JOIN_HOPS` 在清单上写了很久却一直没有读取点，
+    跟着 `Settings` 的默认值断言就等于断"它等于它自己"。
+    """
+    monkeypatch.delenv("AIWEB_RETRIEVAL__JOIN_HOPS", raising=False)
+    monkeypatch.delenv("AIWEB_RETRIEVAL__MAX_JOIN_DEGREE", raising=False)
+    retrieval = Settings(_env_file=None).retrieval
+    assert retrieval.join_hops == 2
+    assert retrieval.max_join_degree == 8
+
+
+def test_join_门槛可以被环境覆盖(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AIWEB_RETRIEVAL__JOIN_HOPS", "3")
+    monkeypatch.setenv("AIWEB_RETRIEVAL__MAX_JOIN_DEGREE", "20")
+    retrieval = Settings(_env_file=None).retrieval
+    assert (retrieval.join_hops, retrieval.max_join_degree) == (3, 20)

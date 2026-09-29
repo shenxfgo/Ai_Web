@@ -14,7 +14,7 @@ import pytest
 
 from app.services.nl2sql.prompt_builder import (
     Example,
-    RelationEdge,
+    JoinLine,
     SchemaTable,
     Term,
     _example_line,
@@ -29,26 +29,25 @@ from app.services.token_estimate import estimate_tokens
 def _table(
     full_name: str = "ai_web_demo.order_main",
     *,
+    uid: str | None = None,
     segments: tuple[str, ...] = ("【表】order_main",),
-    relations: tuple[RelationEdge, ...] = (),
 ) -> SchemaTable:
-    return SchemaTable(full_name=full_name, segments=segments, relations=relations)
+    return SchemaTable(uid=uid or full_name, full_name=full_name, segments=segments)
 
 
-def _rel(
-    *,
-    to_table: str = "ai_web_demo.customer",
-    from_column: str = "customer_id",
-    kind: str = "extracted",
-    confidence: float | None = None,
-) -> RelationEdge:
-    return RelationEdge(
-        from_column=from_column,
-        to_table_full=to_table,
-        to_column="id",
-        kind=kind,
-        confidence=confidence,
-    )
+def _join(*requires: str, text: str = "") -> JoinLine:
+    """一条【可 JOIN】的行：`requires` 是它引用到的表 uid，`text` 是渲染好的那一行。
+
+    默认文本只给一个可辨认的形状（`- uid.col，uid.col`），凡是断言字面的用例都显式传 `text`：
+    builder 只该判"这行引用了谁还在不在"，把 pipeline 的渲染器拉进来就成了自证。
+    """
+    default = "- " + "，".join(f"{uid}.col" for uid in requires)
+    return JoinLine(requires=requires, text=text or default)
+
+
+# 两跳路径的渲染文本，形状出自 pipeline 的 `_join_lines`（这里当输入常量用，不调渲染器）。
+ORDER_TO_CUSTOMER = "- ai_web_demo.order_main.customer_id → ai_web_demo.customer.id"
+CUSTOMER_TO_BRIDGE = "ai_web_demo.customer.tenant_id → ai_web_demo.t_bridge.id"
 
 
 def test_system_里两条硬约束原句在场() -> None:
@@ -61,14 +60,16 @@ def test_system_里两条硬约束原句在场() -> None:
 
 
 def test_段落顺序按架构_4_1() -> None:
-    """schema → JOIN → 术语 → 示例 → 问题 → 输出格式（architecture §4.1 ④）。
+    """schema → JOIN → 关联说明 → 术语 → 示例 → 问题 → 输出格式（architecture §4.1 ④）。
 
     顺序是结构断言而不是快照：模型对"约束离问题更近"这件事敏感，段落一挪位置就可能
     不复现，而快照 diff 里看不出"只是挪了位置"。
     """
     messages = build_prompt(
         question="每个客户的订单数",
-        tables=(_table(relations=(_rel(),)),),
+        tables=(_table(),),
+        joins=(_join("ai_web_demo.order_main", text=ORDER_TO_CUSTOMER),),
+        notes=("本次候选表之间没有可执行的跨表关联路径。",),
         terms=(Term(term="GMV", definition="已支付订单金额合计", synonyms=("成交额",)),),
         examples=(Example(question="上月订单量", sql="SELECT 1 LIMIT 1"),),
     )
@@ -76,6 +77,7 @@ def test_段落顺序按架构_4_1() -> None:
     markers = [
         "【候选表】",
         "【可 JOIN】",
+        "【关联说明】",
         "【术语口径】",
         "【参考示例】",
         "【问题】",
@@ -85,48 +87,46 @@ def test_段落顺序按架构_4_1() -> None:
     assert positions == sorted(positions), markers
 
 
-def test_推断边的读侧门槛是_0_8() -> None:
-    """§5.3："只有 ≥0.8 才进 prompt，且带 `[推断,置信 x]` 标签"。
+# 【可 JOIN】一行的两种形状（pipeline 的渲染器给出，这里当输入用）
+ORDER_TO_CUSTOMER = "- ai_web_demo.order_main.customer_id → ai_web_demo.customer.id"
 
-    写侧（`relation_infer`）今天最低给 0.85，但 007 时代按常数 `0.7` 落库的行还在库里——
-    这道门槛现在筛的是历史行。真外键（extracted）与人工确认（manual）不打折、不过门槛。
 
-    门槛的管辖区是**【可 JOIN】这份可执行边清单**（拍板：§5.3 的"不进 prompt"是这个意思）：
-    同一张低置信边仍会作为**结构描述**出现在卡片全文的【可关联】行里
-    （008 的渲染器不看 confidence），那里带的 `[推断,置信 0.7]` 字样正是诊断线索。
+def test_本模块不重筛边的门槛_一处判定一处只搬运() -> None:
+    """inferred ≥0.8 的门槛 014 起住在 `join_graph`（单测钉），这里不再判第二遍。
+
+    这条用例钉的是"为什么少了那道筛子"：如果哪天有人在 builder 里补回一次 confidence 判定，
+    就会出现两套"为什么这条 JOIN 没了"——而低置信边按 010 的口径本来还要作为卡片【可关联】
+    行的结构描述留在 prompt 里，筛两遍会把那条诊断线索一起筛掉。
     """
-    below = build_prompt(
-        question="q",
-        tables=(_table(relations=(_rel(kind="inferred", confidence=0.7),)),),
+    low_confidence = JoinLine(
+        requires=("ai_web_demo.order_main",),
+        text="- ai_web_demo.order_main.user_id → ai_web_demo.customer.id [推断,置信 0.7]",
     )
-    assert "【可 JOIN】" not in below[1]["content"]
-
-    above = build_prompt(
-        question="q",
-        tables=(_table(relations=(_rel(kind="inferred", confidence=0.85),)),),
-    )[1]["content"]
-    assert (
-        "- ai_web_demo.order_main.customer_id → ai_web_demo.customer.id [推断,置信 0.85]" in above
-    )
-    extracted = build_prompt(question="q", tables=(_table(relations=(_rel(),)),))[1]["content"]
-    assert "【可 JOIN】" in extracted
-    assert "置信" not in extracted  # 真外键不带推断标签
+    user = build_prompt(question="q", tables=(_table(),), joins=(low_confidence,))[1]["content"]
+    assert "[推断,置信 0.7]" in user
 
 
-def test_目标表被预算裁掉后边仍在可_join_段_但标题已声明不可引用() -> None:
-    """门槛与裁切只管"这张表的卡片在不在"，不管"边的目标在不在"（§4.1 ④ as-built）。
+def test_起点在场对端被裁_结构提示行仍留_路径行整条撤() -> None:
+    """两种行的 `requires` 不同，被预算裁掉时的结局也就不同（拍板 9 与 010 的按起点筛）。
 
-    刻意不按目标表筛边：外键指向谁本身是结构事实，悄悄删掉会让"为什么这条 JOIN 没了"无从查起。
-    代价是【可 JOIN】的标题不能说"这些表都可以用"——它改口成"目标表没出现在【候选表】里就是
-    结构提示，不要写进 SQL"，让这句声明和 system 的"只能引用给定的表"对齐。
+    - **结构提示**（单边）只带起点：外键指向谁本身是结构事实，悄悄删掉会让"为什么这条 JOIN
+      没了"无从查起。代价是【可 JOIN】的标题不能说"这些表都可以用"——它改口成"某张表没出现在
+      【候选表】里时只是结构提示，不要写进 SQL"，与 system 的"只能引用给定的表"对齐。
+    - **多跳路径**带着桥表：桥表的卡片被裁，经过它的路径就整体消失——留半条等于要求模型
+      JOIN 一张没给卡片的表，而那正是守卫必拒的 SQL。
     """
-    a = _table(segments=(_words(50),), relations=(_rel(to_table="ai_web_demo.t_cut"),))
-    b = _table("ai_web_demo.t_cut", segments=("独有标记 " + _words(50),))
-    user = build_prompt(question="q", tables=(a, b), token_budget=100)[1]["content"]
+    a = _table(segments=(_words(50),))
+    bridge = _table("ai_web_demo.t_bridge", segments=("独有标记 " + _words(50),))
+    hint = _join(a.uid, text="- ai_web_demo.order_main.customer_id → ai_web_demo.t_cut.id")
+    path = _join(a.uid, bridge.uid, text=f"{ORDER_TO_CUSTOMER}，{CUSTOMER_TO_BRIDGE}")
+    user = build_prompt(question="q", tables=(a, bridge), joins=(hint, path), token_budget=100)[1][
+        "content"
+    ]
 
-    assert "独有标记" not in user  # t_cut 的卡片确实被裁掉了
-    assert "ai_web_demo.t_cut.id" in user  # 指向它的边还写着
+    assert "独有标记" not in user  # 桥表的卡片确实被裁掉了
+    assert "ai_web_demo.t_cut.id" in user  # 指向未召回表的单边提示还写着
     assert "不要写进 SQL" in user  # 而标题已经把这句话说明白了
+    assert CUSTOMER_TO_BRIDGE not in user  # 经过桥表的那条路径整条没了
 
 
 def test_卡片全文原样进_prompt_所以枚举取值在场() -> None:
@@ -227,6 +227,7 @@ GOLDEN = (
 
 _GOLDEN_TABLES = (
     SchemaTable(
+        uid="uid_order",
         full_name="ai_web_demo.order_main",
         segments=(
             "【表】ai_web_demo.order_main\n"
@@ -234,13 +235,14 @@ _GOLDEN_TABLES = (
             "- id int NOT NULL 主键: 订单ID\n"
             "- customer_id int NOT NULL: 客户ID",
         ),
-        relations=(_rel(),),
     ),
     SchemaTable(
+        uid="uid_customer",
         full_name="ai_web_demo.customer",
         segments=("【表】ai_web_demo.customer\n【字段】共 1 个：\n- id int NOT NULL 主键: 客户ID",),
     ),
 )
+_GOLDEN_JOINS = (_join("uid_order", "uid_customer", text=ORDER_TO_CUSTOMER),)
 
 
 def test_golden_整段_user_message() -> None:
@@ -254,6 +256,7 @@ def test_golden_整段_user_message() -> None:
     user = build_prompt(
         question="每个客户最近 30 天的 GMV",
         tables=_GOLDEN_TABLES,
+        joins=_GOLDEN_JOINS,
         terms=(Term(term="GMV", definition="已支付订单的金额合计", synonyms=("成交额", "交易额")),),
         examples=(Example(question="上月成交额", sql="SELECT 1 LIMIT 10"),),
         row_limit=1000,

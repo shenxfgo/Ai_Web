@@ -59,7 +59,8 @@ from app.services.datasource_service import (
     table_scope_filter,
 )
 from app.services.kb_service import sync_cards
-from app.services.relation_infer import infer_relations
+from app.services.nl2sql import join_graph
+from app.services.relation_infer import high_degree_fields, infer_relations
 from app.settings import get_settings
 
 # 没启用 sqlalchemy 的 mypy 插件时，`DeclarativeBase.__table__` 被标成 `FromClause`，
@@ -750,6 +751,11 @@ async def _write_catalog(
 
     for warn in manifest.warnings:
         warnings.append({"code": warn.code, "detail": warn.detail})
+    # §5.3 末"候选度 > 8"的写侧一半：只记警告，上面的边已经写完、一条都不回退（工单 014 拍板）。
+    for warn in high_degree_fields(
+        manifest.columns, max_degree=get_settings().retrieval.max_join_degree
+    ):
+        warnings.append({"code": warn.code, "detail": warn.detail})
     await session.commit()
     return database_id, part
 
@@ -767,12 +773,20 @@ async def run_sync(
        一行留在 'running' 就等于把这条源永久锁死——此后每次同步都 409，只能手工进库删行。
     2. **`counters` 只报确实提交完的行数**：失败的 catalog 走 rollback，一行都没落，
        它的分账就不许并进总账（所以 `_write_catalog` 把 `part` 交回来由这里合并）。
+    3. **本轮真提交过的每个库都要清一次 JOIN 图缓存**（工单 014 拍板 2），也在这条 finally 里。
+       放 finally 而不是 try 末尾是因为"一个 catalog 一个事务"：后面的库失败时，前面已经提交的
+       那些库的 `meta_relation` 已经变了，缓存在那次失败之后照样是脏的。
+
+    不变量 3 与另外两条同住的理由也一样朴素：三条都是"抛出去的那条路径上也要成立"的事。
     """
     started = monotonic()
     tally = _Tally()
     warnings: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     status = "success"
+    # 在 try 之前声明：终局那一次清缓存要看得见它，而 `_open_job` 之后、循环之前的任何一步
+    # （解密、probe、discover）都可能直接抛出去，那时这个名字必须已经绑到一个空列表上。
+    completed_database_ids: list[int] = []
     job_id, synced_before = await _open_job(session, ds.id, actor.id)
 
     extractor: Extractor | None = None
@@ -797,7 +811,6 @@ async def run_sync(
 
         scope_sql, scope_params = table_scope_filter(ds, column="t.table_name")
         max_tables = get_settings().extract.max_tables
-        completed_database_ids: list[int] = []
         for catalog in catalogs:
             try:
                 manifest = await extractor.collect(
@@ -892,6 +905,10 @@ async def run_sync(
         # 构造方言之前的失败（密钥坏、501）没有 extractor 可关，但终局状态照样要写。
         if extractor is not None:
             await extractor.close()
+        # 不变量 3：本轮提交过的每个库各清一次，键精确到 `(源, 库)` 而不是整源——
+        # 一次只同步一个源的作业，把别的源的图一起清掉是白工（它们没人动过）。
+        for database_id in completed_database_ids:
+            join_graph.invalidate(ds.id, database_id)
         # 收尾写在 finally 里而不是 try 的末尾：上面三条 raise 路径都必须有终局状态。
         duration_ms = round((monotonic() - started) * 1000)
         await _set_phase(

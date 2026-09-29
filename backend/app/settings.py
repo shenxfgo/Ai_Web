@@ -164,6 +164,13 @@ class RetrievalGroup(BaseModel):
     enable_rewrite: bool = False
     few_shot_examples: int = 3
     few_shot_token_budget: int = 1500
+    # JOIN 桥表扩展深度。**数的是桥表张数而不是边数**
+    # （口径见 architecture §5.3 的 as-built(P2-0014)）：
+    # 按边数截的话 hops=2 只能穿 1 张桥表，§5.3 承诺的"拉进 B/C"就装不出来。
+    join_hops: int = 2
+    # §5.3 的"候选度 > 8"。一个键同时管两侧：写侧的同名字段度（只告警不丢边）
+    # 与图侧的表度（只禁当桥不禁当端点）。roadmap 分组 9 原本没有这一键，键名由工单 014 拍板。
+    max_join_degree: int = 8
 
 
 class QueryGroup(BaseModel):

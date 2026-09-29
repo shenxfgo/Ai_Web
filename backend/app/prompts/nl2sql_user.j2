@@ -5,9 +5,15 @@
 {% endfor -%}
 {% endfor -%}
 {% if joins -%}
-【可 JOIN】以下边从上面这些表出发；边的目标表若没出现在【候选表】里，它只是结构提示，不要写进 SQL：
+【可 JOIN】每行是一组可执行的关联条件（同一张查询里的 JOIN，可能经过桥表跨多跳）；某张表没出现在【候选表】里时，它只是结构提示，不要写进 SQL：
 {% for j in joins -%}
-- {{ j.from_table }}.{{ j.from_column }} → {{ j.to_table_full }}.{{ j.to_column }}{{ ' [推断,置信 ' ~ j.confidence ~ ']' if j.inferred }}
+{{ j.text }}
+{% endfor -%}
+{% endif -%}
+{% if notes -%}
+【关联说明】
+{% for n in notes -%}
+- {{ n }}
 {% endfor -%}
 {% endif -%}
 {% if terms -%}
@@ -27,6 +33,4 @@ SQL：{{ ex.sql }}
 
 【输出格式】只输出一个 JSON 对象，不要包在代码围栏里，不要附解释文字：
 `{"sql": "<一条 SELECT，必须带 LIMIT {{ row_limit }}>", "explanation": "<一句话说明口径>", "clarify": "<无法回答时缺什么，能回答时为空字符串>"}`
-{% if not joins -%}
-本次候选表之间没有已确认的关联边：跨表需求要靠【问题】里给出的表名另问，或在 `clarify` 里说明。
-{% endif -%}
+{# 空渲染的一行，作用是保住上一行的行末换行：`keep_trailing_newline=False` 会吃掉模板源文件末尾的换行，而 golden 是逐字比对。 #}

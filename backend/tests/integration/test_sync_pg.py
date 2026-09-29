@@ -78,7 +78,7 @@ def _table(schema: str, name: str) -> RawTable:
     )
 
 
-def _column(schema: str, table: str, name: str) -> RawColumn:
+def _column(schema: str, table: str, name: str, *, pk: bool = False) -> RawColumn:
     return RawColumn(
         catalog_name="",
         schema_name=schema,
@@ -95,7 +95,7 @@ def _column(schema: str, table: str, name: str) -> RawColumn:
         num_precision=None,
         num_scale=None,
         enum_values=None,
-        is_primary_key=False,
+        is_primary_key=pk,
     )
 
 
@@ -132,15 +132,21 @@ def _fk(schema: str, table: str, column: str, to_table: str) -> RawForeignKey:
 
 
 def _manifest(
-    catalog: str, tables: Sequence[str], foreign_keys: Sequence[RawForeignKey] = ()
+    catalog: str,
+    tables: Sequence[str],
+    foreign_keys: Sequence[RawForeignKey] = (),
+    *,
+    id_is_pk: bool = False,
+    extra_column: str | None = None,
 ) -> SourceManifest:
+    names = ["id", "name"] + ([extra_column] if extra_column else [])
     return SourceManifest(
         kind="mysql",
         server_version="5.7.17",
         collected_at=dt.datetime.now(dt.UTC),
         catalogs=[_catalog(catalog)],
         tables=[_table(catalog, t) for t in tables],
-        columns=[_column(catalog, t, c) for t in tables for c in ("id", "name")],
+        columns=[_column(catalog, t, c, pk=id_is_pk and c == "id") for t in tables for c in names],
         indexes=[_index(catalog, t) for t in tables],
         foreign_keys=list(foreign_keys),
     )
@@ -160,11 +166,15 @@ class StubExtractor:
         tables: Mapping[str, Sequence[str]] | None = None,
         fks: Mapping[str, Sequence[RawForeignKey]] | None = None,
         fail_on: str | None = None,
+        id_is_pk: bool = False,
+        extra_column: str | None = None,
     ) -> None:
         self._catalogs = list(catalogs)
         self._tables = dict(tables or {})
         self._fks = dict(fks or {})
         self._fail_on = fail_on
+        self._id_is_pk = id_is_pk
+        self._extra_column = extra_column
         self.calls: list[str] = []
         self.closed = 0
 
@@ -204,7 +214,13 @@ class StubExtractor:
                     "remedies": list(SCOPE_REMEDIES),
                 },
             )
-        return _manifest(name, tables, self._fks.get(name, ()))
+        return _manifest(
+            name,
+            tables,
+            self._fks.get(name, ()),
+            id_is_pk=self._id_is_pk,
+            extra_column=self._extra_column,
+        )
 
     async def close(self) -> None:
         self.closed += 1
@@ -550,3 +566,34 @@ async def test_还没连上源库就失败也要给_job_写终局(
         ds=ds_id,
     )
     assert stuck == 0, "每条 job 都要有终局，否则部分唯一索引下次一定撞锁"
+
+
+async def test_泛列只出告警不丢边(
+    client: AsyncClient,
+    login: Login,
+    stub: Callable[..., StubExtractor],
+) -> None:
+    """§5.3 末"候选度 > 8"在写侧只做告警（工单 014 拍板）——两条断言各钉一半。
+
+    告警要真的穿过编排落到同步响应里（否则用户在界面上看不见"这库同名列太泛"）；
+    边要一条不少（"需另一端有唯一约束，否则丢弃"那半句在现行减法规则下不可达，
+    谁把它实现成过滤，用户看到的就是静默少边、跨表问答无声降级成单表）。
+    """
+    acct = await login(username="owner-generic-col", role="member")
+    ds_id = await _register(client, acct)
+    # 9 张事实表 + 1 张 org 维度表，每张都带一个 org_id → 候选度 10 > 8。
+    stub(
+        tables={"shop": (*tuple(f"t{i}" for i in range(9)), "org")},
+        id_is_pk=True,
+        extra_column="org_id",
+    )
+
+    resp = await _sync(client, acct, ds_id)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    generic = [w for w in body["warnings"] if w["code"] == "join_field_too_generic"]
+    assert len(generic) == 1, body["warnings"]
+    assert "`shop.org_id` 出现在 10 张表" in generic[0]["detail"], generic
+
+    # org 自己那条是自环，被减法规则收走（008 之前就钉过），所以是 9 而不是 10。
+    assert body["counters"]["relations_inferred"] == 9, body["counters"]

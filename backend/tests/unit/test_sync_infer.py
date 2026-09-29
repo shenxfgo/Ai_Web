@@ -17,10 +17,12 @@ from app.extractor.base import RawColumn, RawForeignKey
 from app.services import relation_infer as ri
 
 
-def _col(table: str, name: str, *, dtype: str = "int", pk: bool = False) -> RawColumn:
+def _col(
+    table: str, name: str, *, dtype: str = "int", pk: bool = False, schema: str = "ai_web_demo"
+) -> RawColumn:
     return RawColumn(
         catalog_name="",
-        schema_name="ai_web_demo",
+        schema_name=schema,
         table_name=table,
         column_name=name,
         ordinal_position=1,
@@ -149,3 +151,84 @@ def test_整数族之间算兼容_varchar_与_int_不算() -> None:
         (),
     )
     assert _shape(edges) == [("order_item", "product_id", "product", "id")]
+
+
+# ---- §5.3 末"候选度 > 8"的写侧一半（工单 014 拍板：只告警、不丢边）----
+
+
+def _org_id_columns(count: int, *, schema: str = "ai_web_demo") -> list[RawColumn]:
+    """造 `count` 张各带一个 `org_id` 的表，外加一张带单列主键的 `org` 供推断指向。"""
+    tables = [_col(f"t{i}", "org_id") for i in range(count)]
+    return [*tables, _col("org", "id", pk=True)]
+
+
+def test_同名列跨过的表数超过门槛时出一告警() -> None:
+    """§5.3 的"候选度"数的是**表**数，不是列数；9 > 8 才报，8 张正好不报。
+
+    门槛 8 来自 architecture §5.3 原文（roadmap 分组 9 的 `MAX_JOIN_DEGREE` 是它的落点），
+    不是从实现里读的——跟着 `Settings` 默认值断等于断"它等于它自己"。
+    """
+    warns = ri.high_degree_fields(_org_id_columns(9), max_degree=8)
+    assert [w.code for w in warns] == ["join_field_too_generic"]
+    detail = warns[0].detail
+    assert detail.startswith("`ai_web_demo.org_id` 出现在 9 张表（门槛 8）")
+    # 后半句是这句告警的全部价值：读侧的表度抑制与这里的字段度是两个量，不写清楚的话
+    # 运维会以为这条列已经被降级，而实际上它的推断边照旧进【可 JOIN】清单。
+    assert "不表示本列已被自动降级" in detail
+
+
+def test_恰好等于门槛时不告警() -> None:
+    assert ri.high_degree_fields(_org_id_columns(8), max_degree=8) == []
+
+
+def test_告警不丢边() -> None:
+    """拍板的原话是"只告警、不丢边"：同一批列上 `infer_relations` 的产出必须一条不少。
+
+    这条断言是这片的全部风险所在——把告警写成过滤，用户看到的是"边莫名少了"，
+    而少边不报错，只在跨表问答时静默降级成单表。
+    """
+    columns = _org_id_columns(40)
+    before = _shape(ri.infer_relations(columns, ()))
+    ri.high_degree_fields(columns, max_degree=8)
+    assert _shape(ri.infer_relations(columns, ())) == before
+    assert len(before) == 40  # 40 张表各自连到 org.id，一条都没被抑制
+
+
+def test_非推断列不参与计数() -> None:
+    """`remark` 出现在 40 张表里也不该告警：§5.3 这句拦的是推断的组合爆炸，不是"这列很常见"。
+
+    只有后缀属 `_id/_no/_code` 的列会进入推断，因此只有它们的同名跨度值得报。
+    """
+    columns = [_col(f"t{i}", "remark") for i in range(40)]
+    assert ri.high_degree_fields(columns, max_degree=8) == []
+
+
+def test_计数按库分组_跨库不累加() -> None:
+    """一个数据源可以抽多个库，而推断与建图都不跨库（工单 014 的"不做"节）。
+
+    所以 `org_id` 在两个库里各 5 张表 ≠ 候选度 10：告警的口径必须和建图的口径一致，
+    否则会出现"告警说太泛、图里却照常用"的两套说法。
+    """
+    columns = [
+        *_org_id_columns(5),
+        *_org_id_columns(5, schema="other_db"),
+    ]
+    assert ri.high_degree_fields(columns, max_degree=8) == []
+    assert (
+        ri.high_degree_fields(
+            [*_org_id_columns(6), *_org_id_columns(6, schema="other_db")], max_degree=8
+        )
+        == []
+    )  # 各 6，仍不报
+
+
+def test_一张表里同名列只算一次() -> None:
+    """度是"出现在多少张表"，不是"出现多少次"。
+
+    真外键与推断列同名、或一列被抽了两行（上游分批）时，同表重复不许把度抬上去。
+    """
+    columns = [_col("t", "org_id"), _col("t", "org_id"), _col("org", "id", pk=True)]
+    for i in range(7):
+        columns.append(_col(f"u{i}", "org_id"))
+    # 真去重后是 8 张（t + u0..u6），恰好压线；按行数数会是 9 张，就越线了。
+    assert ri.high_degree_fields(columns, max_degree=8) == []
