@@ -22,6 +22,7 @@ from app.core.errors import (
     NotImplementedSource,
     QueryTimeout,
     ReadonlyCapabilityMissing,
+    ResultFileUnavailable,
 )
 from app.core.logging import get_logger
 from app.models.datasource import DataSource
@@ -118,6 +119,35 @@ def result_csv_path(result_dir: Path, run_id: str) -> Path:
     if not _RUN_ID.fullmatch(run_id):
         raise ValueError(f"非法的 result run_id：{run_id!r}")
     return Path(result_dir).resolve() / f"{run_id}.csv"
+
+
+def resolve_result_file(result_dir: Path, run_id: str) -> Path:
+    """下载侧的 realpath 校验（safety §7 的另一半，工单 013）：把一个 id 翻成目录内一个真实文件。
+
+    三道门塌成**同一档**错误（`ResultFileUnavailable`，对外同一句话），因为分了档就是 oracle：
+    ① 形状——复用写入侧那一个 `result_csv_path`，两边不许各写一份名字语法，否则会出现
+      "生成的名字过不了下载的门"或反过来。它抛的 `ValueError` 在这里必须被翻掉：
+      客户端传来的字符串不该让端点吐 500。
+    ② realpath 落回目录内——`..` 与符号链接逃逸都挡在这一层。`result_dir` 自己是指向别处的
+      链接**不算**逃逸：root 跟着一起 resolve，那是运维把结果盘挪走的正当做法。
+    ③ 确实是个文件——目录、FIFO 这类"名字对但不是结果集"也算拿不到。
+
+    原因只进日志不进响应体：日志是给自己查"为什么被拒"用的，响应体是给外人试探用的。
+    """
+    root = Path(result_dir).resolve()
+    try:
+        candidate = result_csv_path(root, run_id)
+    except ValueError as exc:
+        _logger.warning("结果文件下载被拒 reason=名字不合法 run_id=%r", run_id[:80])
+        raise ResultFileUnavailable("结果文件不可用") from exc
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        _logger.warning("结果文件下载被拒 reason=realpath 逃出目录 run_id=%r", run_id[:80])
+        raise ResultFileUnavailable("结果文件不可用")
+    if not resolved.is_file():
+        _logger.warning("结果文件下载被拒 reason=文件不在 run_id=%r", run_id[:80])
+        raise ResultFileUnavailable("结果文件不可用")
+    return resolved
 
 
 def split_truncated(rows: list[Any], *, row_limit: int) -> tuple[list[Any], bool]:

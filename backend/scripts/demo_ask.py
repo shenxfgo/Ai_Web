@@ -45,6 +45,26 @@ from app.services.nl2sql import pipeline  # noqa: E402
 from app.services.nl2sql.retriever import LikeRetriever  # noqa: E402
 from app.settings import get_settings  # noqa: E402
 
+# 工单 013 验收 ①：拒答不能只把错误码端上来，还得接住人——"没查到"三个字不是下一步动作。
+# 措辞按**这颗示踪弹今天真能走的路**写：P2 没有界面，文档里那句"点此同步"在这一层必须换成
+# 007 已经存在的同步端点，否则打出来的"下一步"本身就是一条走不通的路。
+_NEXT_STEPS: dict[str, str] = {
+    "no_schema_found": (
+        "① 给要问的表补中文表注释/列注释（源库 COMMENT，或 knowledge/ 覆盖层） "
+        "② 确认这个数据源对该用户可见（GET /api/datasources） "
+        "③ 触发一次同步：POST /api/sync/jobs（登录拿 token 后调用）"
+    ),
+    "sql_guard_rejected": (
+        "这条 SQL 没有执行，也没有落任何结果文件。模型原文留在 chat_messages.sql_raw；"
+        "把问句换成只读的取数说法再问一次。"
+    ),
+    "llm_bad_response": (
+        "模型这次没按契约返回，原文片段见上一行。再问一次；反复出现就换更强的模型"
+        "（AIWEB_LLM__MODEL）。"
+    ),
+}
+_DEFAULT_NEXT = "查 chat_messages 这一行的 error_code / error_message 两格。"
+
 
 def _print_outcome(out: pipeline.AskOutcome) -> None:
     """把 ②→⑨ 每一步的产物原样端出来：跑通与否都要看得见（验收 3）。"""
@@ -83,6 +103,7 @@ def _print_outcome(out: pipeline.AskOutcome) -> None:
     if out.error_code:
         print(f"[终局] error_code={out.error_code} executed={out.executed}")
         print(f"       {out.error_message}")
+        print(f"       下一步：{_NEXT_STEPS.get(out.error_code, _DEFAULT_NEXT)}")
     if out.steps:
         parts = " → ".join(f"{name} {ms}ms" for name, ms in out.steps)
         print(f"[耗时] {parts} = 合计 {sum(ms for _, ms in out.steps)}ms")

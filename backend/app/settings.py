@@ -7,13 +7,27 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote_plus
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_JWT_SECRET = "dev-insecure-jwt-secret"
 
 # asyncpg 的 ssl 参数认这套（与 libpq 同名），别的名会在 connect 时才炸
 _PG_SSL_MODES = frozenset({"", "disable", "allow", "prefer", "require", "verify-ca", "verify-full"})
+
+# `backend/app/settings.py` 往上三层是仓库根。
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _under_repo_root(value: Path) -> Path:
+    """目录类配置的绝对路径基准，唯一在这一处判定（safety §7 的拍板）。
+
+    不这么做的话 `data/results` 的落点取决于进程从哪个目录启动：012 的示踪弹在 `backend/` 下跑，
+    csv 就落进了 `backend/data/results/`，而体检脚本按仓库根检查的是另一个目录——"目录可写"和
+    "文件写在哪"变成两句话，下载侧的 realpath 校验更是在查一个根本没被写入过的目录。
+    绝对路径原样保留：把结果盘挪到大容量卷上是正当需求。
+    """
+    return value if value.is_absolute() else (REPO_ROOT / value).resolve()
 
 
 class AppGroup(BaseModel):
@@ -162,16 +176,33 @@ class QueryGroup(BaseModel):
 
 
 class ResultGroup(BaseModel):
+    # 缺省值也要过 validator：pydantic 默认不校验 default，而 `Path("data/results")` 这个
+    # 缺省恰恰是 012 那两次落在 `backend/data/` 的元凶——不校验它，收了基准也白收。
+    model_config = ConfigDict(validate_default=True)
+
     dir: Path = Path("data/results")
     retention_days: int = 30
     preview_rows: int = 200
     max_cell_chars: int = 1000
     max_payload_mb: int = 2
 
+    @field_validator("dir")
+    @classmethod
+    def _dir_is_absolute(cls, value: Path) -> Path:
+        return _under_repo_root(value)
+
 
 class KbDocsGroup(BaseModel):
+    # 同 ResultGroup：`knowledge/` 的读写也走 §7 那条"目录根来自配置"的约束，基准只判一次。
+    model_config = ConfigDict(validate_default=True)
+
     dir: Path = Path("knowledge")
     auto_import: bool = True
+
+    @field_validator("dir")
+    @classmethod
+    def _dir_is_absolute(cls, value: Path) -> Path:
+        return _under_repo_root(value)
 
 
 class LoggingGroup(BaseModel):

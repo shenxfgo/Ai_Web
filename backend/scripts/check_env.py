@@ -265,8 +265,16 @@ def check_secrets(settings: Settings, checks: list[Check]) -> None:
 
 
 def check_dirs(settings: Settings, checks: list[Check]) -> None:
-    for label, path in (("result.dir", settings.result.dir), ("kb_docs.dir", settings.kb_docs.dir)):
-        resolved = path if path.is_absolute() else BACKEND_ROOT.parent / path
+    """可写性检查直接用 Settings 给出的绝对路径。
+
+    基准不在这里判：012 之前这里是 `BACKEND_ROOT.parent / path`，而执行器拿的是原样的相对
+    `Path`（跟着 cwd 走），于是"体检说可写"和"文件落在哪"是两个目录（safety §7 的 as-built）。
+    现在两处读同一个已解析的值，报出来的路径就是真会写进去的那个。
+    """
+    for label, resolved in (
+        ("result.dir", settings.result.dir),
+        ("kb_docs.dir", settings.kb_docs.dir),
+    ):
         try:
             resolved.mkdir(parents=True, exist_ok=True)
             probe = resolved / ".aiweb_write_probe"

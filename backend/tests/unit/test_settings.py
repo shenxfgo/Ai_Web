@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -94,3 +96,33 @@ def test_card_template_version_is_int_defaulting_to_1(monkeypatch: pytest.Monkey
     assert Settings(_env_file=None).extract.card_template_version == 1
     monkeypatch.setenv("AIWEB_EXTRACT__CARD_TEMPLATE_VERSION", "2")
     assert Settings(_env_file=None).extract.card_template_version == 2
+
+
+# 仓库根**独立**地从测试文件自己的位置算出来，不复用 app.settings 里那个常量：
+# 拿被测代码的常量去验被测代码的常量，基准算错了也照样绿（safety §7 的口径要能反证）。
+_EXPECTED_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_目录类配置读出来就是绝对路径(monkeypatch: pytest.MonkeyPatch) -> None:
+    """safety §7 as-built(013)：基准在装配点收口一次，之后没有人再猜 cwd。
+
+    012 的现场证据是示踪弹从 `backend/` 启动，两张 csv 落进了 `backend/data/results/`，
+    而体检脚本按仓库根检查的是另一个目录——"能写"和"写在哪"当时是两句话。
+    """
+    monkeypatch.delenv("AIWEB_RESULT__DIR", raising=False)
+    monkeypatch.delenv("AIWEB_KB_DOCS__DIR", raising=False)
+    settings = Settings(_env_file=None)
+    assert settings.result.dir == _EXPECTED_REPO_ROOT / "data" / "results"
+    assert settings.kb_docs.dir == _EXPECTED_REPO_ROOT / "knowledge"
+    assert settings.result.dir.is_absolute() and settings.kb_docs.dir.is_absolute()
+
+
+def test_相对路径按仓库根解析而与启动目录无关(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AIWEB_RESULT__DIR", "data/other")
+    assert Settings(_env_file=None).result.dir == _EXPECTED_REPO_ROOT / "data" / "other"
+
+
+def test_绝对路径原样保留(monkeypatch: pytest.MonkeyPatch) -> None:
+    """给了绝对路径就照用——运维把结果盘挪到大容量卷上是正当需求，不是越界。"""
+    monkeypatch.setenv("AIWEB_RESULT__DIR", str(_EXPECTED_REPO_ROOT / "somewhere"))
+    assert Settings(_env_file=None).result.dir == _EXPECTED_REPO_ROOT / "somewhere"

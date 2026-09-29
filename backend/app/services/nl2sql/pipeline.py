@@ -357,7 +357,7 @@ async def ask(
     return out
 
 
-NO_SCHEMA_HINT = "没有匹配到任何表：请补录表注释 / 检查授权 / 点此同步"
+NO_SCHEMA_HINT = "没有匹配到任何表：请补录表注释 / 检查授权 / 触发一次同步"
 
 
 def _total_ms(watch: _Stopwatch) -> int:

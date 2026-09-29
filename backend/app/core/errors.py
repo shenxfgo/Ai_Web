@@ -110,6 +110,20 @@ class ReadonlyCapabilityMissing(AppError):
     status_code = status.HTTP_403_FORBIDDEN
 
 
+class ResultFileUnavailable(AppError):
+    """下载侧拿不到结果文件时**唯一**的那一档（工单 013，safety §7）。
+
+    "文件不存在""名字越界""realpath 逃到目录外"必须落成同一个 code 和同一句话：分了档就等于
+    给探测者一个可数的 oracle——"这个名字在这台机上存在过"是从 404 换成 403 就能问出来的。
+    404 而不是 403，正是 §7 那句"不区分'不存在'与'无权限'"的字面要求：403 本身就在宣称
+    "东西在这儿，只是不给你"。归属判定（这条结果是不是这个用户的）归 P8 的端点，但它查出
+    "不是你的"时也必须落到**这一档**，不许换成 `Forbidden`——那等于用状态码把"文件存在"漏出去。
+    """
+
+    code = "result_file_unavailable"
+    status_code = status.HTTP_404_NOT_FOUND
+
+
 # §6 的三条出路。放在错误类旁边而不是抛出点：编排层（sync_service）与测试桩都要引用同一份，
 # 于是"编排层把 detail 换成别的词"会当场红，而不是前端拿到任意三句话照样绿。
 # 第三条 §6 原文是"admin 用 ?force=true 覆盖上限"——那个开关 P3 才有，现在写上去就是撒谎，

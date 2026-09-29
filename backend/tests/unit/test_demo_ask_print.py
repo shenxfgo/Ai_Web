@@ -99,10 +99,125 @@ def test_早退时把_error_code_与那句下一步打在终局行(capsys: pytes
             conclusion=None,
             steps=[("retrieve", 3)],
             error_code="no_schema_found",
-            error_message="没有匹配到任何表：请补录表注释 / 检查授权 / 点此同步",
+            error_message="没有匹配到任何表：请补录表注释 / 检查授权 / 触发一次同步",
         )
     )
     text = capsys.readouterr().out
     assert "error_code=no_schema_found" in text
     assert "补录表注释" in text
     assert "未到此步" in text  # 守卫没跑到，不能打 PASS/REJECT 假装跑过
+
+
+_EARLY_EXITS = {
+    "no_schema_found": "没有匹配到任何表：请补录表注释 / 检查授权 / 触发一次同步",
+    "sql_guard_rejected": "[top_level_not_select] 只允许 SELECT",
+    "llm_bad_response": "模型返回无法解析：模型返回的 JSON 被截断（大括号不闭合），不做补全",
+}
+
+
+@pytest.mark.parametrize("code", sorted(_EARLY_EXITS))
+def test_每一种拒答都跟一行下一步动作(capsys: pytest.CaptureFixture[str], code: str) -> None:
+    """工单 013 验收 ①：`demo_ask.py` 把拒绝原因翻成人能读的**下一步动作**。
+
+    "没查到"这三个字不是动作。这一格钉的是终局行之后必须还有一行"那我现在该做什么"，
+    而且三档各说各的——同一句万能安慰对三种故障里的两种都是错的指引。
+    """
+    demo = load_script("demo_ask_print", DEMO_ASK)
+    demo._print_outcome(
+        _outcome(
+            sql_raw="DROP TABLE orders" if code == "sql_guard_rejected" else None,
+            sql_final=None,
+            guard_result=(
+                {
+                    "ok": False,
+                    "violations": [
+                        {
+                            "code": "top_level_not_select",
+                            "field": "statement",
+                            "message": "只允许 SELECT",
+                        }
+                    ],
+                }
+                if code == "sql_guard_rejected"
+                else None
+            ),
+            executed=False,
+            columns=[],
+            rows=[],
+            row_count=0,
+            run_id=None,
+            result_file=None,
+            chart_spec=None,
+            conclusion=None,
+            steps=[("retrieve", 3)],
+            error_code=code,
+            error_message=_EARLY_EXITS[code],
+        )
+    )
+    text = capsys.readouterr().out
+    next_line = next((line for line in text.splitlines() if "下一步" in line), None)
+    assert next_line is not None, text
+    assert len(next_line) > len("       下一步：")
+
+
+def test_守卫拒绝那一步的下一步说清了没执行也没落文件(capsys: pytest.CaptureFixture[str]) -> None:
+    """验收 ②的接口层那一半：用户最怕的是"是不是已经删了"，第一句就要把这件事回答掉。"""
+    demo = load_script("demo_ask_print", DEMO_ASK)
+    demo._print_outcome(
+        _outcome(
+            sql_raw="DROP TABLE orders",
+            sql_final=None,
+            guard_result={
+                "ok": False,
+                "violations": [
+                    {
+                        "code": "top_level_not_select",
+                        "field": "statement",
+                        "message": "只允许 SELECT",
+                    }
+                ],
+            },
+            executed=False,
+            columns=[],
+            rows=[],
+            row_count=0,
+            run_id=None,
+            result_file=None,
+            chart_spec=None,
+            conclusion=None,
+            steps=[("retrieve", 3), ("schema", 1), ("prompt", 2), ("generate", 800), ("guard", 1)],
+            error_code="sql_guard_rejected",
+            error_message=_EARLY_EXITS["sql_guard_rejected"],
+        )
+    )
+    text = capsys.readouterr().out
+    assert "没有执行" in text
+    assert "结果文件" in text
+    assert "chat_messages.sql_raw" in text  # 模型原文去哪查，得说格子而不是"日志里看看"
+
+
+def test_无匹配表那一步给的是今天真能走的三条动作(capsys: pytest.CaptureFixture[str]) -> None:
+    demo = load_script("demo_ask_print", DEMO_ASK)
+    demo._print_outcome(
+        _outcome(
+            sql_raw=None,
+            sql_final=None,
+            guard_result=None,
+            executed=False,
+            columns=[],
+            rows=[],
+            row_count=0,
+            run_id=None,
+            result_file=None,
+            chart_spec=None,
+            conclusion=None,
+            steps=[("retrieve", 3)],
+            error_code="no_schema_found",
+            error_message=_EARLY_EXITS["no_schema_found"],
+        )
+    )
+    text = capsys.readouterr().out
+    # "点此同步"是界面话，CLI 这一层必须换成今天存在的入口（007 交付的同步端点）
+    assert "/api/sync/jobs" in text
+    assert "注释" in text
+    assert "可见" in text

@@ -1,9 +1,10 @@
-"""`scripts/check_env.py` 的密钥判定：默认 JWT 密钥按环境分档。
+"""`scripts/check_env.py` 的密钥判定与目录判定。
 
 判定本身早就写好了，这里补的是"它真的按环境分档"这件事的证据：prod 用默认密钥必须是
-fail（非 0 退出码），local 只是 warn（否则谁都起不来）。
+fail（非 0 退出码），local 只是 warn（否则谁都起不来）。目录那一条是 013 加的：体检报出的
+落点必须与执行器真会写的落点是同一个（safety §7 的"同一个基准"）。
 
-期望值口径：`docs/roadmap.md` 分组 5（JWT secret ≥32B → fatal）。
+期望值口径：`docs/roadmap.md` 分组 5（JWT secret ≥32B → fatal）、`docs/nl2sql-safety.md` §7。
 """
 
 from __future__ import annotations
@@ -65,3 +66,26 @@ def test_维度为0时报的是配置而不是扩展() -> None:
     assert got["embedding.dimension"].status == "fail"
     assert "AIWEB_EMBEDDING__DIMENSION" in got["embedding.dimension"].hint
     assert "pg.ext.vector" not in got
+
+
+def test_目录体检报的就是执行器会写的那个目录(tmp_path: Path) -> None:
+    """safety §7 的"同一个基准"收口后，体检侧不许再自己拼一次根。
+
+    012 之前这里写的是 `BACKEND_ROOT.parent / path`，执行器用的是原样的相对 `Path`（跟 cwd 走），
+    于是两处报出来的目录可以互相错开而两边都显示 ok——那一格的用途正好被掏空。
+    现在两边都只读 Settings 里那个已解析的绝对值，所以断言的是**同一个值**而不是两个式子。
+    """
+    settings = Settings(
+        _env_file=None,
+        result={"dir": str(tmp_path / "res")},
+        kb_docs={"dir": str(tmp_path / "kb")},
+    )
+    checks: list[Any] = []
+    CHECK_ENV.check_dirs(settings, checks)
+    got = {c.name: c for c in checks}
+    assert [got["result.dir"].status, got["kb_docs.dir"].status] == ["ok", "ok"]
+    assert got["result.dir"].message == str(settings.result.dir)
+    assert got["kb_docs.dir"].message == str(settings.kb_docs.dir)
+    # 探针文件写完即删，目录留着：ok 的证据是"这个目录真能建文件"
+    assert (tmp_path / "res").is_dir() and (tmp_path / "kb").is_dir()
+    assert not (tmp_path / "res" / ".aiweb_write_probe").exists()

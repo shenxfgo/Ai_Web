@@ -84,6 +84,14 @@ async def test_检索为空时早退并留下一行(session_factory, results_dir
     assert outcome.sql_raw is None and outcome.sql_final is None
     assert not route.called  # 早退发生在第一次 LLM 往返之前
     assert not results_dir.exists() or list(results_dir.glob("*.csv")) == []
+    # 工单 013 验收 ③：拒答不能只说"没有"，必须给出三条当下就能做的动作。
+    # 断言打在 outcome 上而不是打在常量上——常量对了但编排把它换了位置，用户看到的照样是空话。
+    assert all(word in outcome.error_message for word in ("补录表注释", "检查授权", "同步")), (
+        outcome.error_message
+    )
+    # 服务端消息只写**动作名**，不写界面话（architecture §4.1 的 as-built(P2-013) 那条分层）。
+    # "点此同步"在 P2 指不到任何东西，而这一行是要落进 chat_messages.error_message 给后人看的。
+    assert "点此" not in outcome.error_message, outcome.error_message
     # 每步耗时在场：早退也要说清"卡在哪一步"
     assert [name for name, _ in outcome.steps] == ["retrieve"]
     assert outcome.message_id is not None
@@ -327,6 +335,45 @@ async def test_守卫拒绝时一次都不进执行器(session_factory, spies: S
         # sql_raw 仍然留下：拒了也要能查"模型到底写了什么"
         assert stored.sql_raw == "SELECT * FROM ai_web_demo.secret_stuff"
     assert not results_dir.exists() or list(results_dir.glob("*.csv")) == []
+
+
+@respx.mock
+async def test_模型硬产出_DROP_时守卫拦下且一次都不进执行器(
+    session_factory, spies: Spies, results_dir: Path
+) -> None:
+    """工单 013 验收 ② 的字面要求：桩里**故意**放 `DROP TABLE orders`。
+
+    与上一条 `table_not_allowed` 分开是因为它们撞的是两道不同的门：那一条是"表不在白名单"，
+    这一条是"语句根本不是 SELECT"（`top_level_not_select`，语料 §8.1 第一档）。
+    只测前者就等于默认"模型只会挑错表"，而 roadmap P2 验收 5 问的是删表。
+    """
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        route = _draft_route(sql="DROP TABLE orders")
+
+        outcome = await pipeline.ask(
+            session,
+            actor=user,
+            question="把 orders 表删了",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever([_found(ds.id, ds.id * 10 + 1)]),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+        assert spies.executor_calls == []
+        assert route.call_count == 1
+        assert outcome.error_code == "sql_guard_rejected"
+        assert outcome.executed is False
+        # sql_final 必须是 None：没有"重写后放行的版本"这种东西，DROP 不会被改写成 SELECT 放过去
+        assert outcome.sql_final is None
+        assert outcome.guard_result is not None
+        assert outcome.guard_result["violations"][0]["code"] == "top_level_not_select"
+        stored = await session.get(ChatMessage, outcome.message_id)
+        assert stored is not None
+        assert stored.sql_raw == "DROP TABLE orders"  # 拒了也要留下模型原文当现场
+        assert stored.executed is False
+    # 验收 ⑤：拒答不写 CSV、也不留半截文件（目录压根不该被动过）
+    assert not results_dir.exists() or list(results_dir.glob("*")) == []
 
 
 @respx.mock

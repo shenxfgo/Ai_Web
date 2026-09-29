@@ -114,7 +114,7 @@ async def test_早退的那一类也必须留行(session_factory) -> None:
             retrieved=[],
             executed=False,
             error_code="no_schema_found",
-            error_message="没有匹配到任何表：请补录表注释 / 检查授权 / 点此同步",
+            error_message="没有匹配到任何表：请补录表注释 / 检查授权 / 触发一次同步",
         )
         session.add(message)
         await session.commit()
