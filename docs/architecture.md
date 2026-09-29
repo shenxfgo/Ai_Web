@@ -204,6 +204,13 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 **失败即早退（fail-fast）**：检索为空 → **不生成 SQL**，直接返回 `NO_SCHEMA_FOUND`，
 并给"请补录表注释 / 检查权限 / 点此同步"的具体下一步。宁可拒答，不要让模型对着空 schema 编 SQL。
 
+> **as-built(P2-013)**：下一步的**措辞分层**了，因为"点此"这个动作在 P2 根本不存在。
+> 服务端 message（`NO_SCHEMA_HINT`，落 `chat_messages.error_message`）只写**动作名**——
+> "请补录表注释 / 检查授权 / 触发一次同步"；具体走哪条路交给**调用方那一层**：
+> CLI（`scripts/demo_ask.py::_NEXT_STEPS`）给的是今天真能执行的三条（同步是
+> `POST /api/sync/jobs`，007 已交付），P8 的前端才把它渲染成"点此同步"的按钮（§7 与 ui-design.md）。
+> 理由：把界面话写进服务端消息，在没有界面的这一档就成了一句指不到任何东西的空话。
+
 > **as-built(P2-010)**：④ 这一步落地为纯函数 `services/nl2sql/prompt_builder.build_prompt()`
 > （模板 `app/prompts/nl2sql_system.j2` / `nl2sql_user.j2`），四条口径是原来文档没有、施工时必须拍的：
 > ① **输出契约**：user 消息末尾要求模型只回一个 JSON 对象
@@ -252,8 +259,10 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > **as-built(P2-013)**：011 那句"接口层未接线"的下半边已接。下载侧的公共入口是
 > `executor.resolve_result_file(result_dir, run_id)`——纯函数，三道门（名字不合法 / realpath 逃出目录 /
 > 不是文件）塌成**同一档** `ResultFileUnavailable`（404 + 同一句话，原因只进日志）。它仍不是 HTTP
-> 端点：013 拍板"只做纯函数 + 单测，端点归 P8"，与 012 那次"012 不开端点"是同一个道理。细节与
-> 未证明的一格（符号链接在 Windows 需特权，用例自跳）见 safety §7 的 as-built(P2-013)。
+> 端点：013 拍板"只做纯函数 + 单测，端点归 P8"，与 012 那次"012 不开端点"是同一个道理。细节见
+> safety §7 的 as-built(P2-013)——realpath 逃逸那一门在本机**有真用例**（`os.symlink` 要特权，
+> 但 junction 不要，而守卫判的是 `resolve()` 后的落点、与链接类型无关），仍缺的只是"指向文件的
+> 符号链接"这一具体构造。
 > **012 的接线义务清单**（缺一条就有一格验收假过）：
 > ① `sql_final` 必须来自 `sql_guard.check(max_rows=row_limit)` 的返回值——绕过守卫直调会退化成
 > "整结果集进内存"，因为 ② 的内存上限靠守卫那条顶层 LIMIT 兜底（不变式：`<= row_limit+1`）；

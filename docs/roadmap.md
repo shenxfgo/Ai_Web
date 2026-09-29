@@ -109,7 +109,9 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
    > `sql_final is None`、违规 code `top_level_not_select`、落库行 `sql_raw` 保留模型原文、
    > 且 `data/results` 目录为空（**没执行就不会有文件**）。
    > 拒答文案那半边（验收要"接住人"不只端错误码）钉在 `test_demo_ask_print.py` 的三条下一步用例，
-   > 措辞按 P2 今天真能走的路写（同步是 `POST /api/sync/jobs`，不是界面按钮）。
+   > 措辞按 P2 今天真能走的路写：服务端消息只给**动作名**（原来的"点此同步"是界面话，已删，
+   > 并有用例断 `"点此" not in error_message`），具体入口交给调用方那一层——CLI 给 007 已交付的
+   > `POST /api/sync/jobs`。分层理由见 architecture §4.1 的 as-built(P2-013)。
    > 见 safety §7、architecture §4.1 的 ④ 与 §3.3。
 6. `uv run pytest tests/guard -q` 全绿；
 7. P2 允许没有 chat endpoint，只做 `pipeline` 单测 + CLI（此项在 P8 才验收）。

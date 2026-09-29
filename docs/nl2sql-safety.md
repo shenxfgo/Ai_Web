@@ -402,10 +402,12 @@ SET LOCAL application_name = 'aiweb-nl2sql';
   - 下载侧防护 as-built(P2-013)：`resolve_result_file(result_dir, run_id)`（`app/services/nl2sql/executor.py`）
     是 §7 的另一半，三道门塌成**同一档** `ResultFileUnavailable`（`code=result_file_unavailable`，404）：
     ① 形状——**复用写入侧那一个 `result_csv_path`**，两边不许各写一份名字语法，它的 `ValueError` 在这里
-    被翻掉（客户端传来的字符串不该让端点吐 500）；② realpath 落回目录内——`..` 与符号链接逃逸挡在这层；
+    被翻掉（客户端传来的字符串不该让端点吐 500）；② realpath 落回目录内——`..` 与链接逃逸挡在这层；
     ③ 确实是个文件——目录、被清理作业收走的也算拿不到。三档的 `code`/`message`/`status_code` 逐字相同
-    （`test_三种失败的对外说法逐字相同`），原因**只进服务端日志**不进响应体。
-    目录级链接**不算**逃逸：`result_dir` 自己指向别处时 root 跟着一起 resolve，那是运维挪盘的正当做法。
+    （`test_三种失败的对外说法逐字相同`，四个入参**逐字对上三道门**，门②由 junction 构造），原因
+    **只进服务端日志**不进响应体。
+    目录级链接**不算**逃逸：`result_dir` 自己指向别处时 root 跟着一起 resolve，那是运维挪盘的正当做法
+    （`test_结果目录自己是指向别处的链接时照常放行` 钉反面）。
     **端点本体归 P8**，接线义务已写进 architecture §4.1（含"不是这个用户的文件也回这一档 404，
     不许换成 403"——403 本身就在宣称"文件存在"）。
   - `execute_readonly` 一次调用生成一个 `run_id`，落在 `ExecutionResult.run_id` 与 `.result_file` 两个字段，
@@ -473,10 +475,18 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 > ② `.gitignore` 的两条都留着：`data/*` 锚定仓库根、正好管住新落点；`backend/data/` 是 012 补的，
 > 旧落点那几张历史 csv 仍在忽略范围内（**不迁移、不删除**——它们是 012 的现场证据，清理归
 > `RETENTION_DAYS` 那个作业，而它本身还没有实现点）。
-> ③ **仍未证明的一格**：符号链接逃逸那条用例（`test_目录里的符号链接指向外面时拒绝`）在本机
-> Windows 非管理员、未开开发者模式下 `os.symlink` 报 winerror 1314，**自跳**。闸里的
-> "3 skipped" 有这一格。跳过不等于通过：要在能建符号链接的环境（POSIX / 开了开发者模式的 Windows）
-> 补跑一次才算这一条真验过。
+> ③ **符号链接逃逸这一门是真跑的，不是自跳**（双轴审查后补，2026-09-29）。原本以为本机
+> （Windows 非管理员、未开开发者模式）建不出指向外面的链接——`os.symlink` 确实报 winerror 1314——
+> 但 **junction 不需要特权**（`_winapi.CreateJunction`），而守卫判的是 `resolve()` 之后的**落点**，
+> 与链接类型无关。于是 `test_目录里的链接指向外面时拒绝` 用 junction 造出同一条逃逸路径，
+> 并用服务端日志的 `reason=realpath 逃出目录` 证明**走的确实是门②**（junction 的落点是目录，
+> 只看异常种类的话，门②与门③会给出完全相同的 `ResultFileUnavailable`，换掉判定顺序用例照绿）；
+> `test_结果目录自己是指向别处的链接时照常放行` 钉的是反面——目录级链接不算逃逸。
+> 用例先试 `os.symlink`、失败才退 junction，两者都建不出来才 skip，skip 只可能意味着
+> "这台机器造不出这个文件系统对象"，不会把真实失败吞成跳过。**仍未证明的只剩一格**：
+> 指向**文件**的符号链接（不是目录 junction）这一具体形态在本机复现不出来；它过的是同一句
+> `resolve()`，所以缺的是构造手段、不是代码分支。闸从"629 passed / 3 skipped"变成
+> **631 passed / 2 skipped**，剩下的两格是守卫变异语料的空靶（与本工单无关）。
 
 ---
 
