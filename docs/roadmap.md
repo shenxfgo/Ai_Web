@@ -103,7 +103,9 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 两条硬约束，否则 guard 拒绝率极高、白测一天；⑤ `parse` 与 `.sql()` 两处的 `read`/`dialect` 参数要一致。
 
 > **as-built(P2-012)**：④ 那句"必须带 LIMIT"有一根 012 才看见的倒刺——守卫的截断探针 `+1`
-> **只在语句本来没有 LIMIT 时注入**，于是模型越听话，`truncated` 越恒假（⑥ 那一档见 safety §9.2 ⑧）。
+> **只在语句本来没有 LIMIT 时注入**，于是模型越听话，`truncated` 越恒假（⑥ 那一档见 safety §9.2 ⑧，
+> **同日拍板改成"缺则补、超则钳"，撞上限那一支的倒刺已拔掉**；模型自己写小于上限的 `LIMIT` 那一支
+> 仍无探针、`truncated` 恒假，是有意的语义（safety §1.2 ⑦ 末）。
 > 教训不是"约束写错了"，是**"桩给的草稿要照模板写"**：012 的桩用例手写的那句没带 LIMIT，
 > 所以 `LIMIT 1001` 断言全绿，而真 LLM 每次都带。验收 4 强制真端点跑一次，抓出来的正是这种
 > "桩测绿在一条真链路上不存在的路径上"。
@@ -407,6 +409,9 @@ AIWEB_GUARD__FORCE_LIMIT=true
 AIWEB_GUARD__DANGLING_EXTRA_RULES=     # 逗号分隔追加黑名单函数（与代码内置取并集）
 AIWEB_QUERY__MAX_ROWS=1000             # 返回给前端 + 喂结论模型的行数上限
 AIWEB_QUERY__HARD_LIMIT=5000           # LIMIT(+1) 注入的值上限
+# 上面这三键（FORCE_LIMIT / DANGLING_EXTRA_RULES / HARD_LIMIT）已被 nl2sql-safety §4.2、§4.3 的
+# as-built 判为**不建**：强制 LIMIT 无条件、"拒绝一切 Unknown 函数"已是超集、注入值就是
+# resolve_row_limit(ds)+1。此处保留只是分组清单的历史原貌，实现以 safety 为准。
 AIWEB_QUERY__TIMEOUT_MS=8000           # 默认；数据源级可覆盖
 AIWEB_QUERY__MAX_TIMEOUT_MS=30000      # 全局天花板，UI 不许超过
 AIWEB_QUERY__CELL_MAX_CHARS=2000       # 超长文本列截断，防结论 prompt 爆

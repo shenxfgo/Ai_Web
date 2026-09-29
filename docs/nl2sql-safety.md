@@ -117,11 +117,35 @@ for t in ast.find_all(exp.Table):
 
 **⑦ 强制 LIMIT**
 
-无顶层 `exp.Limit` 时，注入 `max_rows + 1`（`+1` 用于探测截断）。
-包装写法 `exp.select('*').from_(ast.subquery('__aiweb_q')).limit(max_rows+1)` 在 MySQL 5.7 上
-会被优化器丢掉子查询里的 ORDER BY，**实测更稳的做法是直接 `ast.limit(max_rows+1)` 加在最外层**，
-不包一层（代码里保留这条取舍注释）。
-`AIWEB_GUARD__FORCE_LIMIT=true`、`AIWEB_QUERY__HARD_LIMIT` 决定注入值上限。
+**as-built(2026-09-29 拍板后)**：顶层 LIMIT 走"钳位 + 探针"，不是"缺了才补"。模型写的行数 `n` 只有是
+**一个确定的非负整数且 `n < max_rows`** 时才原样保留（"前 5 名"不该被抬到上限），其余一律重写成
+`max_rows + 1`，覆盖三种情形：① 没有顶层 LIMIT；② `n >= max_rows`——**含模型照 ④ 的 prompt 模板写
+`LIMIT {{ row_limit }}` 这一真链路常态**；③ 行数**证明不了**：`LIMIT ALL`（pg 语法，mysql 方言下落成
+标识符，重生成出来源库不认）、`LIMIT 1 + 1`（表达式）、`LIMIT 1e3`（数字字面量但 `int()` 认不出）、
+`LIMIT -1`（sqlglot 落成 `Neg`）。注意 `LIMIT -1` 归这一档的理由**不是**"MySQL 里 -1 等于不限"
+——那是 SQLite 的口径，MySQL 给负数 row_count 会报 1210；我们只是读不出确定的非负行数。
+钳位顺带把这条本来必然失败的语句变成一条能跑的截断查询。
+
+不变式（比"注入值等于 `max_rows+1`"更弱、也更要紧的一条）：**守卫输出的顶层 LIMIT 恒 `<= max_rows+1`**。
+011 的缓冲取回内存上限压在它身上。钳位只管**顶层**：臂内/CTE/派生表里的 `LIMIT 5000` 不钳，
+MySQL 的顶层 LIMIT 约束整条语句的返回行数，客户端缓冲因此仍有界，但源库侧物化多少行我们管不着
+（那是性能问题，不是 §4.1 的内存前提）。
+
+钳位只动 count 不动 offset（`LIMIT 4990, 5000` → `LIMIT 1001 OFFSET 4990`），改了 offset 就不是
+"少给几行"而是换了一页数据。包装写法 `exp.select('*').from_(ast.subquery('__aiweb_q')).limit(max_rows+1)`
+在 MySQL 5.7 上会被优化器丢掉子查询里的 ORDER BY，**实测更稳的做法是直接 `ast.limit(max_rows+1)`
+加在最外层**，不包一层（代码里保留这条取舍注释）。
+
+> **真链路实录（2026-09-29）**：问"把订单明细表的所有行都列出来"（演示库 `order_item` 8.8 万行、
+> 该源 `row_limit=1000`），`chat_messages` 留痕是
+> `sql_raw = SELECT order_id, qty FROM ai_web_demo.order_item LIMIT 1000` →
+> `sql_final = … LIMIT 1001`，`result_stats = {row_count: 1000, truncated: true}`。
+> 模型写的行数**正好等于**上限，正是闭环前探针消失的那一支；⑨ 的结论文案也因此第一次说得出
+> "已被行数上限截断"。
+> **这条闭环的边界要说清**：模型自己写 `LIMIT n`（`n < max_rows`）那一支**仍然没有探针**，
+> `truncated` 恒假——这是有意的语义（行数上限没碰到，"被截断"就不成立），不是残留的洞。
+> 原写的 `AIWEB_GUARD__FORCE_LIMIT` / `AIWEB_QUERY__HARD_LIMIT` 两个键**不建**（见 §4.2 与 §4.3
+> 的 as-built，注入值就是 `resolve_row_limit(ds) + 1`）。
 
 **⑧ 重新生成（不是原样执行 LLM 文本）**
 
@@ -138,10 +162,16 @@ sql_final = stmt.sql(dialect=dialect, comments=False, pretty=False)
 守卫**执行的是重生成的 SQL**，并断言：
 
 ```python
-assert out.sql.endswith("LIMIT 1001") or "LIMIT" in out.sql.upper()
+assert 顶层 LIMIT 存在 and 顶层 LIMIT <= max_rows + 1      # §1.2 ⑦ 钳位后的真不变式
 assert ";" not in out.sql and "/*" not in out.sql          # 重生成后的硬不变式
 assert guard.parse(out.sql, error_level=RAISE)             # 幂等：可再解析
 ```
+
+> **as-built(2026-09-29)**：第一条原来是 `endswith("LIMIT 1001") or "LIMIT" in upper()`——那个 `or`
+> 让任何带 LIMIT 的语句都算通过，等于没断。钳位落地后它才第一次有内容：**顶层 LIMIT 恒不超过
+> `max_rows+1`**（值不一定是 `max_rows+1`，模型写了个更小的数时就是那个数）。钉子是
+> `tests/guard/test_guard_api.py::test_钳位不变式_守卫输出的顶层_LIMIT_恒不超过_max_rows_plus_1`，
+> 它对 11 种形状逐条 parse 输出、独立读一遍顶层行数（不复用 `_limit_row_count`，否则就是自证）。
 
 以及"重生成后再 parse 一次的 AST 与首次 parse 的 AST 归一化相同"——防 rewrite 漂移。
 重跑（`POST /chat/messages/{id}/rerun`）**绝不复用旧 `sql_final`**，同样走完整 guard。
@@ -237,7 +267,9 @@ SET SESSION autocommit = 1;
   > 不会把 3024 传给我们，而是先吐 2013（Lost connection）并挂一条
   > `coroutine '_finish_unbuffered_query' was never awaited` 警告；分类器拿不到 timeout code，
   > `QueryTimeout` 就翻不出来，验收 ② 直接假过。缓冲取回时 3024 到得了客户端，行为一致，
-  > 而**内存上限由守卫注入的 `LIMIT row_limit+1` 钉住**，与是否流式无关。
+  > 而**内存上限由守卫的顶层 LIMIT 钉住**（缺则补、超则钳成 `row_limit+1`，见 §1.2 ⑦），与是否流式无关。
+  > 钳位那半边是 2026-09-29 补的：当时守卫只补不钳，模型照模板写 `LIMIT 1000` 或写 `LIMIT 5000`
+  > 两种形状都能把这句话的前提抽掉（§9.2 ⑧）。
   > 代价：绕过守卫直调 `execute_readonly` 的话没有那一行兜底，会退化成"整结果集进内存"——
   > 012 接线时必须保证 `sql_final` 只能来自 `sql_guard.check(max_rows=...)` 的返回值。
   > 等 asyncmy 修好流式模式下的 3024 传播再回到本条的原口径。
@@ -313,7 +345,8 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 > 用户拍板"**只用现有键，文档对齐现实**"，
 > 于是：
 > - `HARD_LIMIT` / `MAX_TIMEOUT_MS` **不建**。注入上限就是 `row_limit + 1`，
->   由守卫的 `check(max_rows=)` 参数带进去（`sql_guard.py:397`），调用方当下只传全局 `row_limit`；
+>   由守卫的 `check(max_rows=)` 参数带进去（`sql_guard.guard()` 的 LIMIT 分支，见 §1.2 ⑦），
+>   调用方当下只传全局 `row_limit`；
 >   "数据源级 `row_limit` 覆盖"属接口层那一跳（P3），"UI 不许超过天花板"属有 UI 输入的那一档。
 > - `CELL_MAX_CHARS` **不建**，用已有的 `AIWEB_RESULT__MAX_CELL_CHARS`（`ResultGroup.max_cell_chars=1000`）。
 > - `USE_SESSION_MAX_EXEC_TIME` **不建**：011 无条件试 `SET SESSION MAX_EXECUTION_TIME`，
@@ -333,12 +366,17 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 >   同一条判定（列值 `> 0` 才覆盖全局）。为什么不写成 `ds.row_limit or settings.query.row_limit`：
 >   `or` 只兜 `None`/`0`，而这一格是手插行也能填的整数列——`-5` 会一路进 `split_truncated`
 >   渲染成 `rows[:-5]`，把**真结果**从尾部吃掉还不报截断。
-> - **`truncated` 在真链路上恒为假**（未决，见 §9.2 ⑧）。下面那句"注入 `max_rows+1`"
->   只在**语句本来没有 LIMIT** 时发生，而 ④ 的 prompt 模板正是要模型写
+> - **`truncated` 在真链路上恒为假**（012 接真 LLM 时发现）：下面那句"注入 `max_rows+1`"当时只在
+>   **语句本来没有 LIMIT** 时发生，而 ④ 的 prompt 模板正是要模型写
 >   `LIMIT {{ row_limit }}`（`nl2sql_user.j2:29`）。模型听话的那一刻守卫无事可做，
 >   探针就不存在，执行侧拿到的行数不可能超过 `row_limit`。桩测全绿是因为手写草稿没带 LIMIT。
+>   **同日拍板闭环（2026-09-29）**：钳位已落进 §1.2 ⑦，`truncated` 恢复可用；口径是
+>   "上限之下尊重模型、上限之上与不可证一律钳到 `max_rows+1`"，不是"一律改写"。
+>   **闭环只到"撞上限"这一支为止**：模型自己写 `LIMIT n`（`n < max_rows`）时仍然没有探针、
+>   `truncated` 恒假，那是有意的语义而不是残留的洞（§1.2 ⑦ 末把这条边界写死了）。
 
-- 截断探测：注入 `max_rows + 1`，取到 `max_rows+1` 行即判定 `truncated=true` 并丢弃最后一行。
+- 截断探测：注入 `max_rows + 1`（模型自带的 `LIMIT n` 里，`n` 不小于上限时同样被钳回这个值），
+  取到 `max_rows+1` 行即判定 `truncated=true` 并丢弃最后一行。
 - 单元格保护：`str` 截断；`bytes`/`Binary` → `"<binary 1.2KB>"`；
   `Decimal` → **str**（避免前端精度丢失，不能让金额变成 `0.30000000000000004`）；日期 → ISO 字符串。
   `executor` 统一 `default=str` + 按列 `type` 显式序列化，否则 naive `datetime` 进 `json.dumps` 会 500。
@@ -441,7 +479,7 @@ def test_reject(sql, rule):
 @pytest.mark.parametrize("sql", ALLOW_CASES, ids=[s[:38] for s in ALLOW_CASES])
 def test_allow(sql):
     out = guard.check(sql, allowed=DEMO_TABLES, dialect="mysql")
-    assert out.sql.endswith("LIMIT 1001") or "LIMIT" in out.sql.upper()
+    assert 顶层 LIMIT 存在 and 顶层 LIMIT <= max_rows + 1     # §1.3 as-built，原写法被 `or` 掏空
     assert ";" not in out.sql and "/*" not in out.sql          # 重生成后的硬不变式
     assert guard.parse(out.sql, error_level=RAISE)             # 幂等：可再解析
 ```
@@ -504,7 +542,10 @@ def test_allow(sql):
 10. `SELECT p.name, s.* FROM product_stats_wide s JOIN product p ON p.id=s.product_id ORDER BY s.gmv DESC LIMIT 1`（宽表自连接冒烟）
 
 放行用例还要断言：`LIMIT 5 OFFSET 10` 不被改坏（幂等，不出现双 LIMIT）、
-注入的 LIMIT 值是 `HARD_LIMIT + 1`、`table_refs` 集合恰好等于 SQL 里的表（含别名解析后）。
+注入的 LIMIT 值是 `max_rows + 1`（`max_rows` 来自 `resolve_row_limit(ds)`，`HARD_LIMIT` 那个键不建，
+见 §4.3 as-built）、`table_refs` 集合恰好等于 SQL 里的表（含别名解析后）。
+钳位（§1.2 ⑦）另有四条各站一处：`LIMIT 5000` → `LIMIT 1001`、`LIMIT 999` 原样保留、
+`LIMIT 4990, 5000` → `LIMIT 1001 OFFSET 4990`（只动 count）。
 
 ### 8.3 变异测试（一条 parametrize 自动扩到全语料）
 
@@ -562,5 +603,5 @@ def test_allow(sql):
 | ⑥ `CROSS_CATALOG` 独立规则 | 归 `table_not_allowed`（catalog 非空的白名单条目本来就不存在） |
 | ③ `Union/Except/Intersect` 递归校验臂 | 未写：sqlglot 对 `SELECT 1 UNION DROP TABLE x` 直接 ParseError，规则跑不到那一层 |
 | ⑤ `AIWEB_GUARD__DANGLING_EXTRA_RULES` 追加黑名单 | 未实现。"拒绝一切 Anonymous" 已经是超集，追加黑名单只在"想放开某个函数"时才有意义，而那不在 v1 计划里 |
-| ⑦ `HARD_LIMIT` 收敛模型自写的 `LIMIT 999999` | 未收敛：`max_rows` 的语义是"**缺 LIMIT 时补多少**"，不是"最多允许多少"（`sql_guard.py:394-397` 只在 `limit is None` 时动手）。原写的"交给第三层的行数上限截断 + `truncated` 标记"**012 核实为不成立**，见 ⑧ |
-| ⑧ `truncated` 与内存上限在真链路上双双落空（**未决，要拍板**） | 两个后果同源：守卫只补不钳。① prompt 模板要求模型写 `LIMIT {{ row_limit }}`（`nl2sql_user.j2:29`），模型一写守卫就不补 `+1` 探针，`split_truncated` 因此**恒报未截断**——"这 1000 行只是前 1000 行"这句话说不出来；② 模型写 `LIMIT 5000` 时那句**原样放行**，011 的"缓冲取回的内存上限由守卫注入的 `row_limit+1` 钉住"这个前提对它不成立。修法是钳 `min(n, max_rows+1)`（`n ≥ max_rows` 才补探针，`n < max_rows` 尊重模型自己按问题意图选的量），但那是 003 的裁决语义，**不在 012 尾巴上偷偷改**。现状已钉两处：`tests/guard/test_guard_api.py`（守卫侧两个形状）+ `tests/integration/test_pipeline_orchestration.py`（编排侧 `sql_raw == sql_final` 那一支） |
+| ⑦ `HARD_LIMIT` 收敛模型自写的 `LIMIT 999999` | **已收敛（2026-09-29 拍板并落地）**：`guard()` 的 LIMIT 分支从"缺了才补"改成"钳位 + 探针"，见 §1.2 ⑦。`HARD_LIMIT` 那个键**仍不建**——注入值就是 `resolve_row_limit(ds) + 1`，不需要第二个数 |
+| ⑧ `truncated` 与内存上限在真链路上双双落空（**已闭环**） | 两个后果同源：守卫当时只补不钳。① prompt 模板要求模型写 `LIMIT {{ row_limit }}`（`nl2sql_user.j2:29`），模型一写守卫就不补 `+1` 探针，`split_truncated` 因此**恒报未截断**——"这 1000 行只是前 1000 行"这句话说不出来；② 模型写 `LIMIT 5000` 时那句**原样放行**，011 的"缓冲取回的内存上限由守卫注入的 `row_limit+1` 钉住"这个前提对它不成立。**拍板口径**：`n` 是确定的非负整数且小于 `max_rows` 时尊重模型自己按问题意图选的量，其余（缺 LIMIT、`n >= max_rows`、不可证如 `LIMIT ALL`/`LIMIT 1 + 1`/`LIMIT 1e3`/`LIMIT -1`）一律钳成 `max_rows+1`——"证不了它小"与"没有 LIMIT"同一档，不给它多一条出路。**闭环范围要说清**：`n < max_rows` 那一支仍然没有探针、`truncated` 恒假，这是有意的（上限没碰到就谈不上截断），别当残留的洞去修。钉子随之从"钉住现状"翻成"钉住钳位"：`tests/guard/test_guard_api.py` 五条（超限钳、上限之下保留、只动 count 不动 offset、不可证四形状、`<= max_rows+1` 不变式）+ `tests/integration/test_pipeline_orchestration.py`（编排侧那支现在断 `sql_raw != sql_final` 且结尾是探针） |

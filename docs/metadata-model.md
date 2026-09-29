@@ -342,7 +342,7 @@ aiweb.chat_messages :
   retrieved jsonb NULL                          -- [{card_id,table_uid,score_vec,score_kw,fused}] ★可解释性
   prompt_tokens / completion_tokens int
   sql_raw text NULL                             -- LLM 原文
-  sql_final text NULL                           -- guard 重写后实际执行的（缺 LIMIT 时才补，见下）
+  sql_final text NULL                           -- guard 重写后实际执行的（顶层 LIMIT 缺则补、超则钳，见 safety §1.2 ⑦）
   guard_result jsonb NULL                       -- {ok,violations:[{code,field,message}]}
   executed bool / error_code text / error_message text
   result_columns jsonb / result_stats jsonb     -- {row_count,truncated,elapsed_ms,dialect,结果文件引用}

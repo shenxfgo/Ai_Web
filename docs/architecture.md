@@ -233,8 +233,10 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > as-built）。执行前的 `SHOW GRANTS` 判定**不缓存**、`readonly_enforced` 列**不作阻断依据**——这两条
 > 是 006 拍板过、011 沿用不重开。
 > ② **取数用缓冲 `execute()+fetchall()`，不是"无缓冲 cursor + fetchmany 逐 1000"**。理由是 asyncmy
-> 流式游标下 3024 会变 2013 从而废掉超时分类；内存上限由守卫注入的 `LIMIT row_limit+1` 钉住，
-> 与是否流式无关。原口径的理由仍在 safety §4.1，本片的降级作为 as-built 记录，等 asyncmy 修好再回到原口径。
+> 流式游标下 3024 会变 2013 从而废掉超时分类；内存上限由守卫输出的那条顶层 LIMIT 钉住——不变式是
+> **顶层 LIMIT 恒 `<= row_limit+1`**（缺则补、超则钳；钳位半边是 2026-09-29 拍板补上的，见 safety
+> §1.2 ⑦），与是否流式无关。
+> 原口径的理由仍在 safety §4.1，本片的降级作为 as-built 记录，等 asyncmy 修好再回到原口径。
 > ③ **错误分档三挡**：`QueryTimeout`（3024/"57014"，detail 点名 timeout_ms 配置来源）→ `ReadonlyCapabilityMissing`
 > （SHOW GRANTS 判定，403）→ **原始 `DBAPIError` 不翻译**（1792/1142 是"引擎拒 ≠ 应用拒"的证据，
 > 翻译了就分不清）。这三挡的验收分别钉在 `tests/integration/test_execute_live.py` 与
@@ -246,7 +248,7 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > 目录内、403/404 不区分）属 013。
 > **012 的接线义务清单**（缺一条就有一格验收假过）：
 > ① `sql_final` 必须来自 `sql_guard.check(max_rows=row_limit)` 的返回值——绕过守卫直调会退化成
-> "整结果集进内存"，因为 ② 的内存上限靠注入的 LIMIT 兜底；
+> "整结果集进内存"，因为 ② 的内存上限靠守卫那条顶层 LIMIT 兜底（不变式：`<= row_limit+1`）；
 > ② `row_limit`/`max_cell_chars`/`result_dir` 从 `Settings` 取值传入（`AIWEB_QUERY__ROW_LIMIT` /
 > `AIWEB_RESULT__MAX_CELL_CHARS` / `AIWEB_RESULT__DIR`），任何**请求体字段都不许**映射到这三个参数；
 > ③ `QueryTimeout`/`ReadonlyCapabilityMissing`/`NotImplementedSource` 走全局 handler 落成对应 status
@@ -288,9 +290,12 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > （这就是它为什么不是 `int`——`0` 会被读成"有一行 id=0 的记录"，而它不存在）。
 > ④ **`result_columns` 只有 `name`**：§2.7 称其为"列定义"，但行出 executor 时已过 `serialize_cell`，
 > `Decimal`/`datetime` 的源库类型在那一刻就丢了。填不进列的东西不在列里写。
-> ⑤ **模型听话地写了 `LIMIT` 的那一支，守卫不补探针**，`truncated` 因此恒假——这不是本片能改的
-> （动的是守卫裁决语义），口径与钉子见 nl2sql-safety §9.2 ⑧。验收里"`sql_final` 是重生成后的版本、
-> 与 `sql_raw` 不同"因此在真链路上**只在模型漏写 LIMIT 时成立**，两种形状各有一条用例站着。
+> ⑤ **模型听话地写了 `LIMIT` 的那一支，守卫当时不补探针**，`truncated` 因此恒假——这不是本片能改的
+> （动的是守卫裁决语义），口径与钉子见 nl2sql-safety §9.2 ⑧。**同日拍板闭环（2026-09-29）**：
+> 守卫改成"钳位 + 探针"（§1.2 ⑦），撞上限的那一支 `truncated` 恢复可用，验收里"`sql_final` 是
+> 重生成后的版本、与 `sql_raw` 不同"也不再**只在模型漏写 LIMIT 时成立**；两种形状仍各有一条用例站着。
+> **闭环只到"撞上限"为止**：模型自己写 `LIMIT n`（`n < max_rows`）时没有探针、`truncated` 恒假，
+> 那是有意的语义（上限没碰到就谈不上截断）。
 
 ### 4.2 图表选型规则（确定性，可单测）
 
