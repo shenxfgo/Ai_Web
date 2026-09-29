@@ -233,11 +233,18 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > （SHOW GRANTS 判定，403）→ **原始 `DBAPIError` 不翻译**（1792/1142 是"引擎拒 ≠ 应用拒"的证据，
 > 翻译了就分不清）。这三挡的验收分别钉在 `tests/integration/test_execute_live.py` 与
 > `tests/unit/test_executor_timeout.py` / `test_executor_grants.py`。
+> ④ **超时上限与来源键名的判定在执行器内部**（`resolve_timeout(row)`，双轴审查收口）——
+> `execute_readonly` 不收 `timeout_ms`/`timeout_source` 入参，调用方无从"传话"。细节见 safety §4.1。
 >
 > **接口层未接线**：本片的 public entry 只有 `execute_readonly`，`POST /api/chat/ask` 的 ⑦ 归属 012；
 > 结果文件的下载半边（realpath 落回目录内、403/404 不区分）属 013。
-> 现网调用 `execute_readonly` 的唯一生产路径必须保证 `sql_final` 来自 `sql_guard.check(max_rows=...)`
-> 的返回值——绕过守卫直调会退化成"整结果集进内存"，因为 ② 的内存上限靠那一行兜底。
+> **012 的接线义务清单**（缺一条就有一格验收假过）：
+> ① `sql_final` 必须来自 `sql_guard.check(max_rows=row_limit)` 的返回值——绕过守卫直调会退化成
+> "整结果集进内存"，因为 ② 的内存上限靠注入的 LIMIT 兜底；
+> ② `row_limit`/`max_cell_chars`/`result_dir` 从 `Settings` 取值传入（`AIWEB_QUERY__ROW_LIMIT` /
+> `AIWEB_RESULT__MAX_CELL_CHARS` / `AIWEB_RESULT__DIR`），任何**请求体字段都不许**映射到这三个参数；
+> ③ `QueryTimeout`/`ReadonlyCapabilityMissing`/`NotImplementedSource` 走全局 handler 落成对应 status
+> + code，引擎级 `DBAPIError` 按现有 handler 归 `database_error`（不回显驱动原文）。
 
 ### 4.2 图表选型规则（确定性，可单测）
 

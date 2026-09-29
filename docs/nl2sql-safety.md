@@ -256,6 +256,20 @@ SET SESSION autocommit = 1;
   的证据（验收 ① 靠这两档分开断言）；翻译了反而分不清拦下来的是 MySQL 还是我们。演示库上 aiweb_ro
   只有 SELECT 权限，实测 1142 先命中，(1792, 1142) 都算通过。
 
+- 超时上限与其来源键名的**判定位置** as-built(P2-011 双轴审查收口)：收在执行器内部的
+  `resolve_timeout(row)`，`execute_readonly` **不收** `timeout_ms`/`timeout_source` 入参。
+  原口径把判定推给调用方传字符串——012 一撒谎（比如永远传全局键名），验收 ② 的
+  "错误里带超时上限来自哪个配置项"就假过：detail 的键名与用户实际能改的那格对不上，
+  用户按提示改全局键但仍然超时。现实口径：`data_sources.timeout_ms` 是 NOT NULL 列
+  （server_default=15000，登记时把全局缺省落进列值），所以正常登记行**恒**走数据源档；
+  列上缺值（手插行/未 flush 的内存对象）才落 `Settings.query.timeout_ms` 并点名
+  `AIWEB_QUERY__TIMEOUT_MS`。钉它的是 `tests/unit/test_executor_resolve_timeout.py` 两条 +
+  live 慢查询用例（detail 含 `data_sources.timeout_ms` 且值等于行上的 300）。
+
+- SET 循环的错误处理 as-built(P2-011 双轴审查收口)：非降级的 SET 失败**直接 `raise`**，
+  由外层统一分档；不在循环内再调一次 `classify_source_error`——那会让非超时异常被分档两遍，
+  以后谁往分类器里加计数或日志就重复触发。1193 降级分支（warning + continue）不变。
+
 ### 4.2 PostgreSQL
 
 ```sql
@@ -319,9 +333,15 @@ SET LOCAL application_name = 'aiweb-nl2sql';
   `executor` 统一 `default=str` + 按列 `type` 显式序列化，否则 naive `datetime` 进 `json.dumps` 会 500。
 
   > **as-built(P2-011)**：`serialize_cell(value, *, max_cell_chars)` 就是这一条的**唯一入口**，
-  > 顺序是 Decimal → datetime/date → bytes → str 超长 → 原样透传（int/float/bool/None）。
+  > 顺序是 Decimal → datetime/date/time → timedelta → bytes → str 超长 → 原样透传（int/float/bool/None）。
   > `default=str` 只在 `json.dumps` 兜"未知的类型"，不进入本条主路径。
   > bytes 占位分档：`<binary 3B>`（<1KiB）与 `<binary 1.2KB>`（≥1KiB，`round(n/1024, 1)`）。
+  > **`time` 走 `isoformat()`**（TIME 列 → `"14:30:00"`）。
+  > **`timedelta` 不用 `str()`**——asyncmy 对 TIME 列与 `TIMEDIFF()` 返回 timedelta，而
+  > `str(timedelta(hours=-1))` 是 `"-1 day, 23:00:00"`（Python 规范形），与 `mysql>` 手工逐位对数
+  > （verification §3 第 10 步）对不上；`_format_timedelta` 按 MySQL TIME 字面量的
+  > `[-]H:MM:SS` 手工拆分（H 可负、可超 24，整秒归一）。钉它的是
+  > `tests/unit/test_executor_serialize.py::test_timedelta_按_mysql_time_字面量形状回` 四条手算值。
 
 - 结果 csv 落盘形态 as-built(P2-011)：
   - 编码 **`utf-8-sig`**（带 BOM），Excel 打开中文列头/单元格不乱码；写入时 `newline=""` 交给 csv 模块自己管
