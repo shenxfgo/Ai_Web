@@ -33,6 +33,7 @@ from app.extractor.base import (
     RawIndex,
     RawIndexColumn,
     RawTable,
+    ScopeCounts,
     ServerInfo,
     SourceManifest,
 )
@@ -94,14 +95,16 @@ def _catalog(name: str) -> RawCatalog:
     )
 
 
-def _table(schema: str, name: str) -> RawTable:
+def _table(schema: str, name: str, *, table_type: str = "BASE TABLE") -> RawTable:
     return RawTable(
         catalog_name="",
         schema_name=schema,
         table_name=name,
-        table_type="BASE TABLE",
+        table_type=table_type,
         comment=f"{name} 的注释",
-        engine="InnoDB",
+        # 视图在 IS 里没有引擎（真库里这一列是 NULL）：桩件跟着源库的形状，否则
+        # "视图卡片该走降级模板"这一条在测试里永远撞不到。
+        engine="InnoDB" if table_type == "BASE TABLE" else None,
         charset="utf8mb4",
         collation="utf8mb4_general_ci",
         approx_rows=10,
@@ -170,6 +173,7 @@ def _manifest(
     *,
     id_is_pk: bool = False,
     extra_column: str | None = None,
+    views: Sequence[str] = (),
 ) -> SourceManifest:
     names = ["id", "name"] + ([extra_column] if extra_column else [])
     return SourceManifest(
@@ -177,7 +181,8 @@ def _manifest(
         server_version="5.7.17",
         collected_at=dt.datetime.now(dt.UTC),
         catalogs=[_catalog(catalog)],
-        tables=[_table(catalog, t) for t in tables],
+        tables=[_table(catalog, t) for t in tables]
+        + [_table(catalog, v, table_type="VIEW") for v in views],
         columns=[_column(catalog, t, c, pk=id_is_pk and c == "id") for t in tables for c in names],
         indexes=[_index(catalog, t) for t in tables],
         foreign_keys=list(foreign_keys),
@@ -196,6 +201,7 @@ class StubExtractor:
         *,
         catalogs: Sequence[str] = ("shop",),
         tables: Mapping[str, Sequence[str]] | None = None,
+        views: Mapping[str, Sequence[str]] | None = None,
         fks: Mapping[str, Sequence[RawForeignKey]] | None = None,
         fail_on: str | None = None,
         id_is_pk: bool = False,
@@ -203,6 +209,7 @@ class StubExtractor:
     ) -> None:
         self._catalogs = list(catalogs)
         self._tables = dict(tables or {})
+        self._views = dict(views or {})
         self._fks = dict(fks or {})
         self._fail_on = fail_on
         self._id_is_pk = id_is_pk
@@ -220,6 +227,29 @@ class StubExtractor:
     async def discover(self) -> list[RawCatalog]:
         return [_catalog(name) for name in self._catalogs]
 
+    def _objects(self, name: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """这个库在桩件里"源库有的对象"：(表, 视图)。没配过的库默认一张 `orders`。"""
+        return self._tables.get(name, ("orders",)), self._views.get(name, ())
+
+    async def count_scope(
+        self,
+        catalogs: Sequence[RawCatalog],
+        *,
+        table_sql: str | None = None,
+        table_params: Mapping[str, str] | None = None,
+    ) -> ScopeCounts:
+        """分母按桩件自己知道的那点事实数，与 `collect` 同源（同一个 `_objects`）。
+
+        范围过滤（`table_sql`）不参与：真方言侧它是 SQL 的事，桩件如果在这里各算一套，
+        "分母和实际落库的对象数对不上"就永远只有真库能发现——而那正是这条要防的错。
+        """
+        base = view = 0
+        for catalog in catalogs:
+            tables, views = self._objects(catalog.schema_name)
+            base += len(tables)
+            view += len(views)
+        return ScopeCounts(total=base + view, base_table=base, view=view)
+
     async def collect(
         self,
         catalogs: Sequence[RawCatalog],
@@ -232,7 +262,7 @@ class StubExtractor:
         self.calls.append(name)
         if self._fail_on == name:
             raise RuntimeError(f"抽取 {name} 时源库断了")
-        tables = self._tables.get(name, ("orders",))
+        tables, views = self._objects(name)
         if max_tables is not None and len(tables) > max_tables:
             raise ExtractScopeTooLarge(
                 f"抽取范围里有 {len(tables)} 张表，超过上限 {max_tables}",
@@ -252,6 +282,7 @@ class StubExtractor:
             self._fks.get(name, ()),
             id_is_pk=self._id_is_pk,
             extra_column=self._extra_column,
+            views=views,
         )
 
     async def close(self) -> None:

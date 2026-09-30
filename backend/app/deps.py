@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.db import get_sessionmaker
 from app.core.errors import Unauthorized
@@ -23,12 +23,34 @@ async def get_db() -> AsyncIterator[AsyncSession]:
         yield session
 
 
-def get_job_queue(db: AsyncSession = Depends(get_db)) -> JobQueue:
-    """作业队列的装配点（ADR-0011）：返回类型写 Protocol 而不是 `PostgresJobQueue`。
+def make_job_queue(session: AsyncSession) -> JobQueue:
+    """作业队列唯一的装配点（ADR-0011）：返回类型写 Protocol 而不是 `PostgresJobQueue`。
 
-    端点只该认这条缝的形状——换介质时改动面是这一个函数，不是每个调用点。
+    端点只该认这条缝的形状——换介质时改动面是这一个函数，不是每个调用点。介质只出现在
+    `return` 那一行，所以 SSE 那种"会话不属于请求"的地方也能从这里拿到同一个缝。
     """
-    return PostgresJobQueue(db)
+    return PostgresJobQueue(session)
+
+
+def get_job_queue(db: AsyncSession = Depends(get_db)) -> JobQueue:
+    return make_job_queue(db)
+
+
+def get_job_queue_factory() -> Callable[[AsyncSession], JobQueue]:
+    """装配点的第二个入口，留给长挂的响应：SSE 的会话不属于请求，队列要现场造。"""
+    return make_job_queue
+
+
+def get_stream_sessionmaker() -> async_sessionmaker[AsyncSession]:
+    """流式响应（SSE）自己的会话**工厂**，注意返回的是工厂而不是会话。
+
+    `get_db` 那种 yield 依赖在这里会致命：FastAPI 把依赖的退出栈包在**端点函数**外面
+    （`fastapi/routing.py` 的 `async with AsyncExitStack()`），而 `StreamingResponse` 的体
+    是在那个栈关掉之后才被迭代的——那时请求级会话早就把连接还回池了。一条要挂几分钟的流
+    必须自己开会话、自己在 `finally` 里关。给用例留的口子也正好开在这一层：override
+    这个函数就能把流指到测试库。
+    """
+    return get_sessionmaker()
 
 
 # auto_error=True 时 FastAPI 自己抛的是 403，且不带我们的错误 envelope；

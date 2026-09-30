@@ -187,13 +187,29 @@ class SourceManifest:
     truncated: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class ScopeCounts:
+    """抽取范围内的对象数：SSE 那一帧的分母（§2.8 的 `total`/`base_table`/`view`）。
+
+    必须是**带 scope 过滤**的计数。`RawCatalog.visible_table_count` 顶不上这个位置：
+    它是 information_schema 的裸计数，演示库上数出来是 11（含建库脚本留下的下划线前缀
+    对象），而 2026-09-27 拍板的口径是 10（9 张 BASE TABLE + 1 张 VIEW）。
+    """
+
+    total: int = 0
+    base_table: int = 0
+    view: int = 0
+
+
 @runtime_checkable
 class Extractor(Protocol):
-    """P2 用到的方言子集。§7 的 `stream_manifest` / `sample_distinct` 属 P3，先不假装实现。
+    """P2 用到的方言子集 + 017 的范围计数。§7 的 `stream_manifest` / `sample_distinct`
+    属 P3，先不假装实现。
 
     `collect` 的抽取范围由调用方渲染成 SQL 片段传进来（006/007 共用
     `datasource_service.table_scope_filter`），方言层因此不认识 ORM 行也不认识正则口径；
-    `max_tables` 是 §6 的规模保护，超限在跑昂贵的列/索引查询之前就拒绝。
+    `max_tables` 是 §6 的规模保护，超限在跑昂贵的列/索引查询之前就拒绝；
+    `count_scope` 吃同一段范围片段，它存在的理由就是"每帧都得有分母"（§2.8）。
     """
 
     # `kind` 只要求**可读**：方言类上是 `kind: Final = "mysql"`，声明成裸属性会让
@@ -204,6 +220,14 @@ class Extractor(Protocol):
     async def probe(self) -> ServerInfo: ...
 
     async def discover(self) -> list[RawCatalog]: ...
+
+    async def count_scope(
+        self,
+        catalogs: Sequence[RawCatalog],
+        *,
+        table_sql: str | None = None,
+        table_params: Mapping[str, str] | None = None,
+    ) -> ScopeCounts: ...
 
     async def collect(
         self,

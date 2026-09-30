@@ -33,4 +33,7 @@ class SyncJobOut(BaseModel):
     counters: dict[str, int]
     warnings: list[dict[str, Any]] = Field(default_factory=list)
     errors: list[dict[str, Any]] = Field(default_factory=list)
-    duration_ms: int
+    # 由 `finished_at - started_at` 现算（两个钟都由库生成）。`sync_jobs` 里**没有** duration
+    # 这一列——§2.5 从没定过它，worker stdout 上那个 `duration_ms` 是 `SyncOutcome` 的字段，
+    # 不落库。所以这里可空：作业还没收尾时它就是 None。
+    duration_ms: int | None = None

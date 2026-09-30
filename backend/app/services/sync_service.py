@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from time import monotonic
 from typing import Any, cast
 
-from sqlalchemy import Table, bindparam, delete, func, literal_column, select, update
+from sqlalchemy import Table, bindparam, delete, func, insert, literal_column, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import SQLAlchemyError
@@ -29,6 +29,7 @@ from app.core.errors import (
     SourceUnreachable,
 )
 from app.core.security import decrypt_secret
+from app.core.sync_vocabulary import stage_of
 from app.extractor.base import (
     ConnectionSpec,
     Extractor,
@@ -50,12 +51,14 @@ from app.models.meta import (
     MetaRelation,
     MetaTable,
     SyncJob,
+    SyncJobEvent,
 )
 from app.services.datasource_service import (
     describe_source_error,
     root_cause,
     table_scope_filter,
 )
+from app.services.job_queue import SYNC_EVENT_CHANNEL
 from app.services.kb_service import sync_cards
 from app.services.nl2sql import join_graph
 from app.services.relation_infer import high_degree_fields, infer_relations
@@ -70,6 +73,7 @@ _RELATION = cast("Table", MetaRelation.__table__)
 _INDEX = cast("Table", MetaIndex.__table__)
 _INDEX_COLUMN = cast("Table", MetaIndexColumn.__table__)
 _JOB = cast("Table", SyncJob.__table__)
+_EVENT = cast("Table", SyncJobEvent.__table__)
 
 # extracted 关系的属性全部来自源库（§8.1 E），每轮重算；created_by/confidence 不在这里，
 # 前者属 manual、后者属 inferred，都不该被同步写。
@@ -588,6 +592,73 @@ class SyncOutcome:
     duration_ms: int
 
 
+@dataclass(slots=True)
+class _Progress:
+    """SSE 每帧的那五个键（§2.8 的 `counters`）：分母一次算定，分子跟着提交往上涨。
+
+    它和 `_Tally` 是两个东西，所以不合并：`_Tally` 是 `sync_jobs.counters` 那本**行级**总账
+    （列数、索引数、关系数…），这一份是"进度条走到哪了"的**对象级**账（多少个库内对象落成了）。
+    把两者并成一份的话，前端要么拿到行数列数去画百分比，要么丢掉排障要的那本明细。
+    """
+
+    total: int = 0
+    base_table: int = 0
+    view: int = 0
+    done: int = 0
+    cards: int = 0
+
+    def as_dict(self, *, done: int | None = None) -> dict[str, int]:
+        """`done` 允许传"这一帧之后"的值：事件行宣布的是**这一步落成**的对象数，
+        而总账要等它所在的那个事务提交才涨（`_write_catalog` 里就是这种情况）。"""
+        return {
+            "done": self.done if done is None else done,
+            "total": self.total,
+            "base_table": self.base_table,
+            "view": self.view,
+            "cards": self.cards,
+        }
+
+
+async def _add_event(
+    session: AsyncSession,
+    job_id: int,
+    phase: str,
+    counters: dict[str, int],
+    payload: dict[str, Any] | None = None,
+) -> None:
+    """追加一行事件并叫醒监听者：**不开新事务**，跟着调用方那次 commit 一起落。
+
+    这是全仓写 `sync_job_event` 的唯一入口（工单 017 的"唯一"两处之一，另一处是
+    `stage_of` 的翻译），粗档 `stage` 就是在这里由细值 `phase` 现算的——第二处翻译会让
+    两套词表各自漂移，而漂移在进度条上表现为"某一档永远不出现"。
+
+    `seq` 从库里现算（`max(seq)+1`）而不是在内存里递增：某个库回滚时它占掉的那个号要被
+    下一个事件复用，否则事件流留空洞，而空洞在 SSE 那边看起来就是"丢了一条进度"。
+    `UNIQUE (job_id, seq)` 是"一个作业只有一个写事件的人"的兜底——claim 保证单写，
+    索引保证真来了第二个写者时是报错而不是两行同 seq。
+
+    `pg_notify` 与插入同事务：没提交的事不许叫醒读的人（否则读到的还是上一条），
+    提交了的事不许没人被叫醒（NOTIFY 在无监听者那一刻永久丢失，所以它只当闹钟，
+    真相在事件行里 —— ADR-0010）。
+    """
+    seq = (
+        await session.execute(
+            select(func.coalesce(func.max(_EVENT.c.seq), 0) + 1).where(_EVENT.c.job_id == job_id)
+        )
+    ).scalar_one()
+    await session.execute(
+        insert(_EVENT).values(
+            job_id=job_id,
+            seq=int(seq),
+            stage=stage_of(phase),
+            phase=phase,
+            counters=counters,
+            payload=payload or {},
+        )
+    )
+    await session.execute(select(func.pg_notify(SYNC_EVENT_CHANNEL, str(job_id))))
+
+
 async def _set_phase(
     session: AsyncSession,
     job_id: int,
@@ -598,7 +669,16 @@ async def _set_phase(
     warnings: list[dict[str, Any]] | None = None,
     errors: list[dict[str, Any]] | None = None,
     finished: bool = False,
+    commit: bool = True,
+    event_counters: dict[str, int] | None = None,
+    event_payload: dict[str, Any] | None = None,
 ) -> None:
+    """`sync_jobs` 的推进（§6 的锁与心跳都靠这一处）；给了 `event_counters` 就顺带追一帧事件。
+
+    `commit=False` 只为一个场景存在：事件要和它所描述的那次元数据写入**同生共死**
+    （§2.8 的"只追加"要靠同一个事务才撤销得了）。那时 phase 的写、事件的写、meta_* 的写
+    并进同一次 commit，而 phase 仍然只有一处写、stage 仍然只有一处翻译。
+    """
     values: dict[str, Any] = {"phase": phase}
     if status is not None:
         values["status"] = status
@@ -611,7 +691,29 @@ async def _set_phase(
     if finished:
         values["finished_at"] = func.now()
     await session.execute(update(_JOB).where(_JOB.c.id == job_id).values(**values))
-    await session.commit()
+    if event_counters is not None:
+        await _add_event(session, job_id, phase, event_counters, event_payload)
+    if commit:
+        await session.commit()
+
+
+def _embed_skipped() -> dict[str, Any]:
+    """embed 那一帧的理由（§2.8 的 payload：`{skipped, code, detail}`）。
+
+    两支分开写：「这台机器没配向量端点」和「配了但 P3 不实现向量化」是两件不同的事，
+    只说一支的话，另一支的读者会拿到一句假话——而这条 detail 是前端唯一能显示的说明。
+    """
+    if get_settings().embedding.configured:
+        return {
+            "skipped": True,
+            "code": "embedding_not_implemented",
+            "detail": "P3 只建元数据与卡片，向量化归 P4",
+        }
+    return {
+        "skipped": True,
+        "code": "embedding_not_configured",
+        "detail": "embedding 三键（base_url / api_key / model）为空，向量化归 P4",
+    }
 
 
 def _why(exc: BaseException) -> str:
@@ -683,6 +785,7 @@ async def _write_catalog(
     manifest: SourceManifest,
     synced_before: dt.datetime,
     warnings: list[dict[str, Any]],
+    progress: _Progress,
 ) -> tuple[int, _Tally]:
     """§3 的三段式：库 → 表 → 列/索引 → 关系，一个 schema 一个事务（§3"每个 batch 一个事务"，
     P2 不分批，所以一个 catalog 就是一个 batch）。
@@ -753,6 +856,17 @@ async def _write_catalog(
         manifest.columns, max_degree=get_settings().retrieval.max_join_degree
     ):
         warnings.append({"code": warn.code, "detail": warn.detail})
+    # 进度事件与它宣布的那次元数据写入在同一个事务里（工单 017 的拍板）：这个库失败回滚时
+    # 这一行也一起消失，事件流里就不会出现"宣布了一个没落成的 upsert"。
+    # `done` 传的是"这一步之后"的数——总账要等这次 commit 才涨，而事件说的是这一帧。
+    await _set_phase(
+        session,
+        job_id,
+        "tables",
+        commit=False,
+        event_counters=progress.as_dict(done=progress.done + part.tables),
+        event_payload={"schema": catalog.schema_name},
+    )
     await session.commit()
     return database_id, part
 
@@ -793,7 +907,9 @@ async def run_sync(
     status = "success"
     # 在 try 之前声明：终局那一次清缓存要看得见它，而循环之前的任何一步
     # （解密、probe、discover）都可能直接抛出去，那时这个名字必须已经绑到一个空列表上。
+    # `progress` 同一条理由：收尾那一帧事件也要看得见它，没数过就是全 0，不能是 NameError。
     completed_database_ids: list[int] = []
+    progress = _Progress()
 
     extractor: Extractor | None = None
     try:
@@ -813,9 +929,21 @@ async def run_sync(
         catalogs = await extractor.discover()
         wanted = set(ds.include_schemas or [])
         catalogs = [c for c in catalogs if not wanted or c.schema_name in wanted]
-        await _set_phase(session, job_id, "discover", counters=tally.as_dict())
-
         scope_sql, scope_params = table_scope_filter(ds, column="t.table_name")
+        # 分母先于第一帧（2026-09-30 拍板）：SSE 每一帧都要能说出"x/y"，而 `collect` 的
+        # manifest 要到第一个库抽完才拿到手。这一条只发 B 那条的分组计数，昂贵的 C/D/E 一条不发。
+        counts = await extractor.count_scope(
+            catalogs, table_sql=scope_sql, table_params=scope_params
+        )
+        progress = _Progress(total=counts.total, base_table=counts.base_table, view=counts.view)
+        await _set_phase(
+            session,
+            job_id,
+            "discover",
+            counters=tally.as_dict(),
+            event_counters=progress.as_dict(),
+        )
+
         max_tables = get_settings().extract.max_tables
         for catalog in catalogs:
             try:
@@ -826,10 +954,11 @@ async def run_sync(
                     max_tables=None if force else max_tables,
                 )
                 database_id, part = await _write_catalog(
-                    session, ds, job_id, manifest, synced_before, warnings
+                    session, ds, job_id, manifest, synced_before, warnings, progress
                 )
                 completed_database_ids.append(database_id)
                 tally.merge(part)
+                progress.done += part.tables
             except ExtractScopeTooLarge:
                 raise  # 这是"拒绝开工"，不是"某一批失败"：不许记成 partial 继续下一个库
             except Exception as exc:  # 宽是故意的：见下面的注释
@@ -848,9 +977,15 @@ async def run_sync(
         # 恰恰最不该被理解成"上次同步的东西全过期了"。
         if completed_database_ids:
             # 工单 008（kb-workflow §7）：card_build 是同步作业里第二个落库 phase。
-            # 放在整段抽取之后而不是每个 catalog 内部，因为 `_set_phase` 自己会 commit——
-            # 塞进 `_write_catalog` 就等于把"一个 catalog 一个事务"（§3）当场切成两半。
-            await _set_phase(session, job_id, "card_build", counters=tally.as_dict())
+            # 放在整段抽取之后而不是每个 catalog 内部，是因为它的输入是**本轮确认完整的库的集合**
+            # （`completed_database_ids`），循环里任何一个都还没拿到这份名单。
+            await _set_phase(
+                session,
+                job_id,
+                "card_build",
+                counters=tally.as_dict(),
+                event_counters=progress.as_dict(),
+            )
             synced = await session.execute(
                 select(_TABLE.c.id).where(
                     _TABLE.c.database_id.in_(completed_database_ids),
@@ -868,6 +1003,7 @@ async def run_sync(
                 server_version=ds.server_version or "",
             )
             await session.commit()
+            progress.cards = tally.cards
 
             stale = await session.execute(
                 meta_table_mark_stale(),
@@ -878,6 +1014,17 @@ async def run_sync(
             )
             await session.commit()
             tally.tables_stale = int(stale.rowcount) if isinstance(stale, CursorResult) else 0
+            # embed 档在 P3 什么都不做（向量检索归 P4），但**这一帧照样发**：少了它，进度条会
+            # 从 card_build 直接跳到 done，"这台机器没配向量端点"这件事就永远说不出来（故事 11）。
+            # 它跟卡片那一步同进同退：一个库都没落成时没有卡片，也就没有"本来要向量化的东西"。
+            await _set_phase(
+                session,
+                job_id,
+                "embed",
+                counters=tally.as_dict(),
+                event_counters=progress.as_dict(),
+                event_payload=_embed_skipped(),
+            )
         # 只有走完全程才更新它：失败的同步不该把"最近一次同步"往前推（UI 拿它判断新鲜度）
         ds.last_sync_at = dt.datetime.now(dt.UTC)
     except (AppError, SQLAlchemyError) as exc:
@@ -914,6 +1061,7 @@ async def run_sync(
             warnings=warnings,
             errors=errors,
             finished=True,
+            event_counters=progress.as_dict(),
         )
 
     return SyncOutcome(

@@ -32,7 +32,7 @@ def _index_ddls(table_name: str) -> str:
 
 
 def test_快照表齐全_含_sync_jobs() -> None:
-    """metadata-model §2.4 的六张 + §2.5 的 sync_jobs，一张都不能少。"""
+    """metadata-model §2.4 的六张 + §2.5 的 sync_jobs + §2.8 的 sync_job_event，一张都不能少。"""
     schema = Base.metadata.schema
     expected = {
         "meta_database",
@@ -42,6 +42,7 @@ def test_快照表齐全_含_sync_jobs() -> None:
         "meta_index_column",
         "meta_relation",
         "sync_jobs",
+        "sync_job_event",
     }
     got = {
         t.split(".", 1)[1]

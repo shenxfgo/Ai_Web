@@ -230,6 +230,33 @@ async def test_discover_把_catalogs_查询的结果摊成_rawcatalog() -> None:
     )
 
 
+def _type_counts(*pairs: tuple[str, int]) -> list[dict[str, object]]:
+    """按 TABLE_TYPE 分组计数的假返回值（键名照 `build_sql_count_scope` 的别名）。"""
+    return [{"table_type": t, "n": n} for t, n in pairs]
+
+
+async def test_count_scope_按表类型数出_total_base_table_view() -> None:
+    stub = Stub([("group by t.table_type", _type_counts(("BASE TABLE", 9), ("VIEW", 1)))])
+    counts = await stub.count_scope([_catalog()])
+    assert (counts.total, counts.base_table, counts.view) == (10, 9, 1), (
+        "演示库 2026-09-27 拍板的分母就是这一组数（9 表 + 1 视图 = 10，不是 11）"
+    )
+
+
+async def test_count_scope_多库时逐库相加并且只发那一条计数() -> None:
+    """一库一条而不是合并：范围条件是按 schema 渲染的，合并就得把 `:schema` 拆成列表。"""
+    stub = Stub([("group by t.table_type", _type_counts(("BASE TABLE", 2), ("VIEW", 1)))])
+    counts = await stub.count_scope(
+        [_catalog("shop"), _catalog("crm")],
+        table_sql="(t.table_name not like :exc_0)",
+        table_params={"exc_0": r"\_%"},
+    )
+    assert (counts.total, counts.base_table, counts.view) == (6, 4, 2)
+    assert len(stub.executed) == 2, "只有计数那两条：昂贵的 C/D/E 一条都不该发"
+    assert [p["schema"] for _, p in stub.executed] == ["shop", "crm"], "每库一条、按库相加"
+    assert [p["exc_0"] for _, p in stub.executed] == [r"\_%", r"\_%"], "范围片段原样带上"
+
+
 async def test_collect_一个_schema_四条查询并把外键归并进来() -> None:
     stub = Stub(
         [

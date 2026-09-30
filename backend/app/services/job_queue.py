@@ -13,19 +13,25 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
-from typing import Protocol, cast
+from typing import Any, Final, Protocol, cast
 
 from sqlalchemy import Table, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.sql import Insert, Update
 
 from app.core.errors import SyncAlreadyRunning
+from app.core.sse import JobWake
 from app.models.meta import SyncJob
 
 # 与 sync_service 同一套理由：没启用 sqlalchemy 的 mypy 插件时 `__table__` 被标成 FromClause
 _JOB = cast("Table", SyncJob.__table__)
+
+# 叫醒通道的名字（metadata-model §2.8 ②：payload 只有 job_id，它是闹钟不是真相）。
+# 它住在**这条缝上**而不是任何一侧，因为两侧必须拼写一致：发布方是 worker 里的 `sync_service`，
+# 订阅方是 API 进程里的 SSE 端点（工单 017），写错一个字母的后果是"进度永远不动"而不是报错。
+SYNC_EVENT_CHANNEL: Final = "sync_job_event"
 
 
 def enqueue_stmt(datasource_id: int, actor_id: int) -> Insert:
@@ -85,10 +91,10 @@ class ClaimedJob:
 
 
 class JobQueue(Protocol):
-    """API 侧 `enqueue` / worker 侧 `claim`。
+    """API 侧 `enqueue` / worker 侧 `claim` / 读侧 `subscribe`。
 
-    `subscribe`（进度事件订阅）归工单 017：它要和新表 `sync_job_event` 一起才有意义，
-    在这一片挂进 Protocol 就是一个没有人实现的空方法。
+    三个方法共同构成"跨进程的交接口"这一条缝：前两个换的是**写**的方向（谁去跑作业），
+    第三个换的是**读**的方向（谁在听作业）。它们都只认 `job_id`，介质细节一律不外露。
     """
 
     async def enqueue(self, datasource_id: int, actor_id: int) -> int:
@@ -97,6 +103,14 @@ class JobQueue(Protocol):
 
     async def claim(self) -> ClaimedJob | None:
         """领走最老的一个待办作业；队列空（或都被别的 worker 抢了）返回 None。"""
+        ...
+
+    async def subscribe(self, job_id: int) -> JobWake:
+        """订阅一个作业的叫醒信号，返回句柄；用完必须 `aclose()`。
+
+        只负责"有人敲门"，事实一律回表里读（ADR-0010）：`NOTIFY` 在无监听者那一刻
+        永久丢失，把进度寄托在它上面就等于把进度寄托在网络运气上。
+        """
         ...
 
 
@@ -133,3 +147,52 @@ class PostgresJobQueue:
         return ClaimedJob(
             job_id=int(row.id), datasource_id=int(row.datasource_id), started_at=row.started_at
         )
+
+    async def subscribe(self, job_id: int) -> JobWake:
+        """新开一条**专用连接**挂 `LISTEN`，把 payload 对得上的那一声转成敲门。
+
+        为什么不复用 `self._session` 那条连接——这是本机跑出来的结论，不是猜的：会话的连接
+        只在**事务期间**归它用。读侧每轮读完都要 `rollback()`（挂着 idle-in-transaction 一条
+        几分钟的快照会让 VACUUM 收不掉死元组，而且连接参数一旦换成 REPEATABLE READ 就再也
+        读不到新行），那一 rollback 就把连接还给了池：真池子上去是"带着 LISTEN 的连接被下一个
+        借用者拿走"，NullPool（测试与 worker）上是"这条连接当场被关掉"。两种都表现为
+        进度永远不动，而且都不报错。
+
+        代价是一条流占两条连接（听的那一条 + 读的那一条）。这是有意的取舍：叫醒通道天生
+        就该是长命且独占的，而读侧必须是短事务的。
+
+        退订挂在 `wake.attach()` 里而不是返回值里：`remove_listener` 会发 `UNLISTEN`，
+        漏了它这条连接就带着一个没人收的闹钟回池。
+        """
+        # 引擎取的是 `session.bind` 而不是 `session.get_bind()`，这不是随手选的写法：
+        # `get_bind()` 在 Session 层就把引擎拆成了**同步** `Engine`（本机实测：`type()` 结果是
+        # `sqlalchemy.engine.base.Engine`），对它的 `.connect()` 会在没有 greenlet 的上下文里
+        # 发起真 IO，抛 `MissingGreenlet`。`AsyncSession.bind` 才是那个 `AsyncEngine`。
+        engine = cast("AsyncEngine", self._session.bind)
+        conn = await engine.connect()
+        wake = JobWake()
+
+        async def _unsubscribe() -> None:
+            try:
+                await raw.remove_listener(SYNC_EVENT_CHANNEL, _on_notify)
+            finally:
+                # UNLISTEN 一失败就跳过 close 的话，这条连接带着监听永远不在池里回来。
+                await conn.close()
+
+        def _on_notify(_conn: object, _pid: int, _channel: str, payload: str) -> None:
+            # 一个通道上跑着所有作业，靠 payload 认作业；认不上就当没听见。
+            # 不许在这里补读表：回调是驱动侧的同步调用，任何 await 都会把这条连接上后来的
+            # 事件排在那后面。
+            if payload == str(job_id):
+                wake.notify()
+
+        wake.attach(_unsubscribe)
+        try:
+            fairy = await conn.get_raw_connection()
+            raw: Any = fairy.driver_connection
+            await raw.add_listener(SYNC_EVENT_CHANNEL, _on_notify)
+        except Exception:
+            # 订阅没挂上就没有东西会来摘它：这一侧不关，连接直接漏出池外
+            await conn.close()
+            raise
+        return wake

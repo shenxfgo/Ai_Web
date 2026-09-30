@@ -54,6 +54,8 @@ known-first-party = ["app"]
 # 而形参必须与它同名才解析得到——F811 把这一手当成"重复定义"，而它正是这条 import 存在的理由。
 "tests/integration/test_sync_cache_pg.py" = ["F811"]
 "tests/integration/test_sync_enqueue_pg.py" = ["F811"]
+"tests/integration/test_sync_events_pg.py" = ["F811"]
+"tests/integration/test_sync_events_sse_pg.py" = ["F811"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

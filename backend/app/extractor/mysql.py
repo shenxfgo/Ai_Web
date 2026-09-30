@@ -33,6 +33,7 @@ from app.extractor.base import (
     RawIndexColumn,
     RawTable,
     Row,
+    ScopeCounts,
     ServerInfo,
     SourceManifest,
 )
@@ -66,6 +67,24 @@ def _in_list(tables: Sequence[str], column: str) -> str:
     return f"{column} IN ({', '.join(f':tbl_{i}' for i in range(len(tables)))})"
 
 
+def _tables_from(
+    schema: str, scope_sql: str | None, scope_params: Mapping[str, str]
+) -> tuple[str, dict[str, object]]:
+    """§8.1 B 的 FROM/WHERE 那一半：抽表清单与数表清单**共用这一份**。
+
+    分开的代价是看得见的：数据源配了 exclude_tables 时，两处各写一套 WHERE 就会一个报
+    9 表 1 视图、一个抽出 11 张——SSE 每帧的分母和实际落库的对象数从此对不上。
+    """
+    sql = """
+FROM information_schema.TABLES t
+WHERE t.TABLE_SCHEMA = :schema
+  AND t.TABLE_TYPE IN ('BASE TABLE','VIEW')
+""".strip()
+    if scope_sql:
+        sql += f"\n  AND {scope_sql}"
+    return sql, {"schema": schema, **scope_params}
+
+
 def build_sql_tables(
     schema: str, scope_sql: str | None, scope_params: Mapping[str, str]
 ) -> tuple[str, dict[str, object]]:
@@ -76,20 +95,42 @@ def build_sql_tables(
     注意这里是 LIKE 而不是 §8.1 原文的 REGEXP：数据源里那两列存的既不是正则
     （006 已实测，见工单偏差节），跟着 §10.2 的"别手写 COLLATE"一起改成了源原生 LIKE。
     """
+    from_where, params = _tables_from(schema, scope_sql, scope_params)
     sql = """
 SELECT t.TABLE_SCHEMA, t.TABLE_NAME,
        CASE t.TABLE_TYPE WHEN 'BASE TABLE' THEN 'BASE TABLE'
                          WHEN 'VIEW' THEN 'VIEW' ELSE t.TABLE_TYPE END AS table_type,
        t.TABLE_COMMENT, t.ENGINE, t.ROW_FORMAT, t.TABLE_COLLATION, t.TABLE_ROWS,
        t.DATA_LENGTH, t.INDEX_LENGTH, t.CREATE_TIME, t.UPDATE_TIME
-FROM information_schema.TABLES t
-WHERE t.TABLE_SCHEMA = :schema
-  AND t.TABLE_TYPE IN ('BASE TABLE','VIEW')
-""".rstrip()
-    if scope_sql:
-        sql += f"\n  AND {scope_sql}"
-    params: dict[str, object] = {"schema": schema, **scope_params}
+"""
+    return f"{sql}{from_where}", params
+
+
+def build_sql_count_scope(
+    schema: str, scope_sql: str | None, scope_params: Mapping[str, str]
+) -> tuple[str, dict[str, object]]:
+    """同一张 FROM/WHERE 只换个投影：按 TABLE_TYPE 分组数一遍。
+
+    昂贵的 C/D/E 一条都不发，所以这条能在作业开头跑得起（metadata-model §2.8 的
+    total/base_table/view 就是它的产物）。
+    """
+    from_where, params = _tables_from(schema, scope_sql, scope_params)
+    sql = f"SELECT t.TABLE_TYPE AS table_type, COUNT(*) AS n\n{from_where}\nGROUP BY t.TABLE_TYPE"
     return sql, params
+
+
+def rows_to_scope_counts(rows: Sequence[Row]) -> ScopeCounts:
+    """把 (表类型, 条数) 摊成三个分母；`n` 是 `COUNT(*)`，源库永远不会回 NULL。"""
+    base = 0
+    view = 0
+    for row in rows:
+        kind = str(row["table_type"]).upper()
+        n = _int(row["n"]) or 0
+        if kind == "BASE TABLE":
+            base += n
+        elif kind == "VIEW":
+            view += n
+    return ScopeCounts(total=base + view, base_table=base, view=view)
 
 
 def build_sql_columns(schema: str, tables: Sequence[str]) -> tuple[str, dict[str, object]]:
@@ -414,6 +455,29 @@ class MySQLExtractor:
             )
             for row in rows
         ]
+
+    async def count_scope(
+        self,
+        catalogs: Sequence[RawCatalog],
+        *,
+        table_sql: str | None = None,
+        table_params: Mapping[str, str] | None = None,
+    ) -> ScopeCounts:
+        """每个 schema 一条分组计数，凑齐 SSE 每帧的分母（§2.8 的 total/base_table/view）。
+
+        每个库一条而不是并成一条 `IN`：范围条件是按 schema 渲染的，合并会把 `:schema`
+        这个绑定参数拆成列表，而 B 那条用的是同一个写法。
+        """
+        total = base = view = 0
+        for catalog in catalogs:
+            sql, params = build_sql_count_scope(
+                catalog.schema_name, table_sql, dict(table_params or {})
+            )
+            counts = rows_to_scope_counts(await self._fetch(sql, params))
+            total += counts.total
+            base += counts.base_table
+            view += counts.view
+        return ScopeCounts(total=total, base_table=base, view=view)
 
     async def collect(
         self,

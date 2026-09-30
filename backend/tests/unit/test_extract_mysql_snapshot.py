@@ -67,6 +67,33 @@ def test_b_条把源配置的_scope_过滤拼进来而不是自己发明() -> No
     assert params["schema"] == "ai_web_demo"
 
 
+def _where_of(sql: str) -> str:
+    """WHERE 那一段（到 GROUP BY 之前，小写、压掉排版空白）：两条查询只在投影上分开。"""
+    low = " ".join(sql.lower().split())
+    body = low[low.index("where") :]
+    return (body[: body.index("group by")] if "group by" in body else body).rstrip()
+
+
+def test_范围计数的_where_与_b_条逐字相同_分母不会和抽取分叉() -> None:
+    """SSE 每帧的分母来自 `build_sql_count_scope`，它必须和抽表那条用同一段过滤。
+
+    两处各写一套 WHERE 的话，`total` 说的是"我以为有 10 个"，实际落库 11 个，
+    而进度条永远停在 9/10 或冲到 11/10——这种错在真机上不会报错，只会一直难看。
+    """
+    from app.models.datasource import DataSource
+
+    row = DataSource(include_tables=["order_%"], exclude_tables=[r"\_%"])
+    scope_sql, scope_params = ds_table_scope_filter(row, column="t.table_name")
+    extract = mx.build_sql_tables(SRC_SCHEMA, scope_sql, scope_params)
+    count = mx.build_sql_count_scope(SRC_SCHEMA, scope_sql, scope_params)
+    assert _where_of(count[0]) == _where_of(extract[0])
+    assert count[1] == extract[1], "绑定参数也要一致：少带一个 :inc_0 就等于没过滤"
+    low = " ".join(count[0].lower().split())
+    assert "group by t.table_type" in low
+    # 这一条的全部意义是便宜：昂贵的 C/D/E 一条都不能混进来
+    assert "columns" not in low and "statistics" not in low
+
+
 def test_c_条_columns_带注释_枚举定义_与生成列标记() -> None:
     """§8.1 C：`COLUMN_COMMENT`/`EXTRA`/enum 定义三条都在，缺一条卡片就瞎一块。"""
     sql, params = mx.build_sql_columns(SRC_SCHEMA, TABLES)

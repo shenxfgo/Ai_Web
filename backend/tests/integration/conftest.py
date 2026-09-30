@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pytest
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -88,6 +89,11 @@ async def session_factory(
     # 会从这行注释开始骗人。012 的 chat_sessions/chat_messages 已跟上（删序照 FK：
     # messages → sessions → data_sources，sessions 对 users 是 CASCADE，但显式删才不依赖
     # 外键方向对不对）。还没建表的 datasource_grants 在这儿排队。
+    #
+    # 017 的 `sync_job_event` **不在**这张清单上，是有意的而不是漏了：它对 `sync_jobs` 是
+    # `ON DELETE CASCADE`，而 `sync_jobs.datasource_id` 对 `data_sources` 同样是 CASCADE，
+    # 所以上面那句 `DELETE FROM data_sources` 把它们一起带走了。判断"要不要往清单里加一行"
+    # 的依据是 FK 的 ondelete，不是表名新不新。
     async with engine.begin() as conn:
         await conn.execute(text(f'DELETE FROM "{schema}".chat_messages'))
         await conn.execute(text(f'DELETE FROM "{schema}".chat_sessions'))
@@ -101,21 +107,35 @@ async def session_factory(
 
 
 @pytest.fixture
-async def client(
-    session_factory: async_sessionmaker[AsyncSession], jwt_secret: str
-) -> AsyncIterator[AsyncClient]:
-    """打真 ASGI 应用，但 `get_db` 指向测试库的引擎。
+def application(session_factory: async_sessionmaker[AsyncSession], jwt_secret: str) -> FastAPI:
+    """装配好依赖 override 的应用实例，`client` 与各片自己的夹具**共用同一个对象**。
 
-    走 `dependency_overrides` 而不是改环境变量：应用自己的连接池会连到本机 .env
-    那套 host/库上，测试就会写到真元数据库去。
+    单独成一个夹具是因为 `dependency_overrides` 是应用上的可变字典：SSE 那一片要在 `get_db`
+    之外再 override 一个会话来源（流用的不是请求级会话，见 `deps.get_stream_sessionmaker`），
+    加在同一个实例上才等于"两个夹具打的是同一个应用"，而不是各搓一个客户端去连不同的库。
     """
 
     async def override_get_db() -> AsyncIterator[AsyncSession]:
         async with session_factory() as session:
             yield session
 
-    application = create_app()
-    application.dependency_overrides[deps.get_db] = override_get_db
+    app = create_app()
+    app.dependency_overrides[deps.get_db] = override_get_db
+    return app
+
+
+@pytest.fixture
+async def client(application: FastAPI) -> AsyncIterator[AsyncClient]:
+    """打真 ASGI 应用，但 `get_db` 指向测试库的引擎。
+
+    走 `dependency_overrides` 而不是改环境变量：应用自己的连接池会连到本机 .env
+    那套 host/库上，测试就会写到真元数据库去。
+
+    注意 `ASGITransport` 是**整响应缓冲**的（它把 body 片段攒成一个 list 才返回），所以它
+    测不出"流式"——帧的顺序与内容照样能测，但"首帧早于作业结束"那种时序只能打真 HTTP
+    服务（见 `test_sync_events_live.py`）。
+    """
+
     async with AsyncClient(transport=ASGITransport(app=application), base_url="http://t") as c:
         yield c
 

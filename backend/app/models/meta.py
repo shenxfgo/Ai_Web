@@ -314,10 +314,59 @@ class SyncJob(Base):
     )
     # 与上次成功同步的指纹，命中就短路（§6 第 3 条实现约束）
     manifest_digest: Mapped[str | None] = mapped_column(Text)
+    # 工单 021 的载体：`?force=true` 覆盖规模上限。它必须在**入队时**落到这一行上——
+    # 执行体在另一个进程里读不到请求（ADR-0011），默认 false 是"没说过就覆盖"的反面。
+    force: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"), default=False
+    )
     # 僵尸回收依据：主事务未提交时靠独立连接更新它，前端进度才动得起来
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class SyncJobEvent(Base):
+    """进度事件（§2.8）：只追加、不改写，一行 = 作业状态发生过一次可对外说明的变化。
+
+    它是 P3 进度的**唯一真相**，而 `sync_jobs.progress` 只是一个百分比，两者不互相代替。
+    `seq` 在 job 内单调 +1，SSE 的游标就是它——断线重连按 `seq > cursor` 补读，一条不丢。
+    `NOTIFY` 只在同事务里发一声叫醒，payload 只有 `job_id`（ADR-0010）。
+
+    `stage` 与 `phase` 并存是有意的：粗档给 SSE 与进度条，细值给排障。两者之间的翻译
+    只住在 `sync_vocabulary.stage_of()` 里，这一格的 CHECK 就是那五档在库里的落点。
+    """
+
+    __tablename__ = "sync_job_event"
+    __table_args__ = (
+        CheckConstraint(
+            "stage IN ('extract','embed','upsert','card_build','done')",
+            name="stage_allowed",
+        ),
+        # 唯一的 (job_id, seq) 自带一棵 b-tree，正好服务 `job_id=? AND seq>? ORDER BY seq`，
+        # 所以 §2.8 那行单独的 INDEX (job_id, seq) 不再建（第二棵同键索引是纯写放大）。
+        UniqueConstraint("job_id", "seq", name="uq_sync_job_event_job_id_seq"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    # CASCADE：作业行被人删掉时事件跟着走，不留孤儿（§2.8 第 ④ 条）
+    job_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("sync_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    stage: Mapped[str] = mapped_column(Text, nullable=False)
+    # 细粒度真相（9 值词表里的那一个），排障用；不是每个事件都对应一次 phase 变化，故可空
+    phase: Mapped[str | None] = mapped_column(Text)
+    # 该事件时刻的累计账：{done, total, base_table, view, cards}（§2.8）
+    counters: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"), default=dict
+    )
+    # {table, code, detail, skipped}：卡片失败点名到哪张表、embed 档为什么被跳过
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"), default=dict
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -331,4 +380,5 @@ __all__ = [
     "MetaRelation",
     "MetaTable",
     "SyncJob",
+    "SyncJobEvent",
 ]
