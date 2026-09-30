@@ -708,7 +708,12 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 执行体是独立 worker 进程而非请求内跑完，理由与后果见 ADR-0011。**as-built(P3-016 已交付)**：202 +
 `{job_id}` 与 worker 骨架落地（`app/services/job_queue.py` 的 `enqueue`/`claim` + `scripts/run_worker.py`，
 本机另开 `dev.ps1 worker`），终局只能从 `GET /sync/jobs/{id}` 那一行读、而它还没实现（下面两行仍挂无主账），
-所以 `sync_jobs.errors[].data` 成了结构化出路到前端的唯一一跳；`force` 这一半仍无端点开关（工单 021） |
+所以 `sync_jobs.errors[].data` 成了结构化出路到前端的唯一一跳。**as-built(P3-021 已交付)**：
+`force` 这半接通——请求体收 `{"force":true}`（strict 布尔，非布尔 422），`enqueue` 落
+`sync_jobs.force`，`claim` 经 `ClaimedJob.force` 随行带回，`run_worker` 透传 `run_sync(force=)`，
+真时不传 `MAX_TABLES`（只此一档，scope 过滤与删除差分不变）。实装形状是**请求体**而
+§6 文案字面是 `?force=true`：不为此开查询参数第二条入口（两条通道并存是本项目禁止的），
+措辞统一归 025 收口；`SyncJobAccepted` 仍只回 `{job_id}` |
 | GET | `/sync/jobs` | user | `?datasource_id&status&cursor` | 列表 |
 | GET | `/sync/jobs/{id}` | 同 ds 权 | — | `{status,phase,progress,counters,warnings,errors,started_at,finished_at}` |
 | POST | `/sync/jobs/{id}/cancel` | 同 ds 权 | — | 置 `cancel_requested`，worker 批间检查。**as-built(P3 开工前拍板)：挂 [P8]** —— `sync_jobs` 至今没有 `cancel_requested` 列（metadata-model §2.5 那份列清单里没有），加列与批间检查点等 P8 前端的"停止同步"按钮一起做；`status='cancelled'` 因此继续没有写入点 |

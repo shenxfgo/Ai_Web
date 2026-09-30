@@ -126,12 +126,14 @@ class ResultFileUnavailable(AppError):
 
 # §6 的三条出路。放在错误类旁边而不是抛出点：编排层（sync_service）与测试桩都要引用同一份，
 # 于是"编排层把 detail 换成别的词"会当场红，而不是前端拿到任意三句话照样绿。
-# 第三条 §6 原文是"admin 用 ?force=true 覆盖上限"——那个开关 P3 才有，现在写上去就是撒谎，
-# 所以改成今天真能走的路（改配置）。P3 接上 ?force 时再把文案换回原文。
+# 第三条是 §6 原文（工单 021 换回：P2 那句"admin 改配置"是开关未落地时的替代话，不许撒谎）。
+# 已知别扭：实装形状是请求体 `{"force":true}`（architecture §7），而 §6 原文字面是
+# `?force=true`；三处字面（§6 表 / 本常量 / test_extract_mysql_client.py）必须逐字一致，
+# 措辞统一与否归 025 收口——这里不为好看开第二条入口（查询参数与请求体并存是禁止的）。
 SCOPE_REMEDIES: Final = (
     "配 include_tables 白名单",
     "只同步部分 schema（include_schemas）",
-    "调高 AIWEB_EXTRACT__MAX_TABLES 上限（admin 改配置）",
+    "admin 用 ?force=true 覆盖上限",
 )
 
 

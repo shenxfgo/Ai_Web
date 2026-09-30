@@ -269,10 +269,14 @@ errors   jsonb DEFAULT '[]'   -- [{code, detail}]，分类过的 AppError 再多
                                --   一跳，只留人话就只剩一个 code 能看。`detail` 一律是字符串
                                --   （给人读的那一句），机器可渲染的结构住在 `data`——读这一列的人
                                --   不必为同一个键写两种分支，所以不让 detail 兼任结构）
-force boolean NOT NULL DEFAULT false  -- as-built(P3-017)：迁移 0007 顺带建的列（工单 021 数据层
-                               -- 原话"并进迁移 0007，别为它单开一次迁移"）。**017 只建列不读它**——
-                               -- 入队收 force、`claim` 带出来、`run_sync(force=)` 的透传与端点开关
-                               -- 全部归 021，今天这一格在应用侧没有任何读写点
+force boolean NOT NULL DEFAULT false  -- as-built(P3-017 建列 / P3-021 接线)：迁移 0007 顺带建的列
+                               -- （工单 021 数据层原话"并进迁移 0007，别为它单开一次迁移"）。
+                               -- 017 只建列；021 接通了读写：端点收请求体 `{"force":true}`、
+                               -- enqueue 落这一格、claim 随行带回、run_sync(force=) 真时不传
+                               -- MAX_TABLES。默认 false 的意思是"没说就覆盖不了"，历史行不会
+                               -- 因加列变成"曾被强制覆盖过"。实装是请求体而 §6 文案字面是
+                               -- `?force=true`，这处形状差记在工单 021 交付记录，
+                               -- 措辞统一归 025 收口
 manifest_digest text NULL      -- 与上次成功的指纹，命中则短路
 heartbeat_at timestamptz       -- 用于回收僵尸 running 任务
 started_at / finished_at / created_at
@@ -549,7 +553,7 @@ DELETE FROM aiweb.meta_relation
 | 连接失败 / 认证失败 / 网络 | `probe()` 阶段直接 `failed`，`error_code` 分类（`AUTH_FAILED`/`HOST_UNREACHABLE`/`TIMEOUT`/`UNSUPPORTED_VERSION`）。**MySQL < 5.7、PG < 12 视为不支持并明确报错**（5.6 无 IS 统计、PG<12 部分函数缺） |
 | 中途某张表 IS 查询失败 | 记 `errors[]` + `counters.tables_failed++`，**继续下一批**，最终 `status='partial'` |
 | 权限不全（MySQL 只能看到被 grant 的对象） | `discover()` 里比对 `SHOW DATABASES` 结果 vs `SCHEMATA` 可见集合；差异写 `warnings[{code:'SCHEMA_PARTIALLY_VISIBLE'}]`；UI 黄条提示"该账号看不到 N 个库/表，请补 GRANT SELECT"。**绝不允许**因为"看不到"就删掉上次同步到的元数据 → 只有 `catalog` 层确认成功枚举到的 schema 才参与 stale 判定（`known_complete=True` 时才做 delete-diff） |
-| 超大库（>2000 表） | `probe()` 先 `SELECT COUNT(*)` 预估 → 超过 `AIWEB_EXTRACT__MAX_TABLES`（默认 2000）**拒绝**并返回结构化提示 + 三个出路：①配 `include_tables` 白名单 ②只同步部分 schema ③调高 `AIWEB_EXTRACT__MAX_TABLES` 上限（admin 改配置） |
+| 超大库（>2000 表） | `probe()` 先 `SELECT COUNT(*)` 预估 → 超过 `AIWEB_EXTRACT__MAX_TABLES`（默认 2000）**拒绝**并返回结构化提示 + 三个出路：①配 `include_tables` 白名单 ②只同步部分 schema ③admin 用 `?force=true` 覆盖上限 |
 | 宽表（>200 列） | 抽取照常，卡片构建走列切片，并给 warning"字段过多建议拆视图" |
 | 同步中重复点"同步" | 部分唯一索引：`CREATE UNIQUE INDEX ux_sync_running ON aiweb.sync_jobs(datasource_id) WHERE status IN ('pending','running');` → 天然互斥，冲突返回 409 `sync_already_running`（是数据库保证，不是代码 race） |
 | 进程崩溃留下僵尸 running | worker 心跳循环**每轮**扫一次：`UPDATE sync_jobs SET status='failed', errors = errors || '[{"code":"reclaimed","detail":"heartbeat 超时"}]'::jsonb WHERE status IN ('pending','running') AND heartbeat_at < now() - interval '180 seconds'`；之后用户可重新发起。**as-built(P3 开工前拍板)**：原句写的是"启动 `lifespan` 里回收"与 `error='reclaimed on startup'` 两处失实——① 列名是 `errors`（`jsonb NOT NULL DEFAULT '[]'`），没有 `error` 这一列；② worker 长驻不重启是常态，只扫一次等于僵尸行永久占住 `ux_sync_running`，正是 as-built(007) 第 1 条堵过的那类故障换了个进程而已 |

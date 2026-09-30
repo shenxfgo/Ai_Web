@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 
 class SyncJobRequest(BaseModel):
     # §7 的 body 形状只有这一个字段；工单 007 的拍板表把路径定成了 `/api/sync/jobs`
     datasource_id: int
+    # 工单 021（architecture §7 的 `{"force":false}`）：本片新增的入队字段**只有这一个**——
+    # 任何字段都不许映射到 row_limit / max_cell_chars / result_dir（P2 红线沿用）。
+    # strict 不是讲究：lax 的 pydantic 会把 "true"/"1" 收成真，而这是"admin 明说过覆盖"
+    # 的确认性动作，猜不得——含糊输入一律 422，不落 pending 行。
+    force: StrictBool = False
 
 
 class SyncJobAccepted(BaseModel):

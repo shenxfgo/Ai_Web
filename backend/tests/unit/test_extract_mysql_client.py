@@ -332,7 +332,7 @@ async def test_collect_超限在昂贵的列查询之前就拒绝并给三个出
         "remedies": [
             "配 include_tables 白名单",
             "只同步部分 schema（include_schemas）",
-            "调高 AIWEB_EXTRACT__MAX_TABLES 上限（admin 改配置）",
+            "admin 用 ?force=true 覆盖上限",
         ],
     }
     assert _is_sources(stub) == ["information_schema.tables"], "拒绝之后不该再去打 C/D/E"

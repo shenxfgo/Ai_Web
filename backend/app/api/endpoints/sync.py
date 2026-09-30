@@ -55,7 +55,9 @@ async def create_sync_job(
     请求返回时那一行还是 pending，任何计数都是编的。
     """
     row = await datasource_service.get_owned(db, actor, payload.datasource_id)
-    return SyncJobAccepted(job_id=await queue.enqueue(row.id, actor.id))
+    # force 只在这一步有落脚处：worker 是另一个进程读不到请求，"admin 当场说过覆盖上限"
+    # 必须在入队那一刻写进行里（工单 021，ADR-0011 的后果）。
+    return SyncJobAccepted(job_id=await queue.enqueue(row.id, actor.id, force=payload.force))
 
 
 def _resolve_cursor(cursor: int | None, last_event_id: str | None) -> int:

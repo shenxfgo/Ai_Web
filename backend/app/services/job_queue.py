@@ -34,15 +34,23 @@ _JOB = cast("Table", SyncJob.__table__)
 SYNC_EVENT_CHANNEL: Final = "sync_job_event"
 
 
-def enqueue_stmt(datasource_id: int, actor_id: int) -> Insert:
+def enqueue_stmt(datasource_id: int, actor_id: int, *, force: bool = False) -> Insert:
     """入队那一行的语句：只写 pending，钟（`started_at`）留给 claim 那一步。
 
     不写 `started_at` 是这条缝的关键证据：响应返回时那一列还是 NULL，
     "202 不是假的"就能在用例里断出来（工单 016 验收 1）。
+
+    `force` 显式写而不是靠列默认（工单 021）：这一格记的是"入队那一刻请求有没有说过
+    覆盖规模上限"，是这一行的事实，语句该把它带上——列默认只兜"没人说过"的情况。
     """
     return (
         pg_insert(_JOB)
-        .values(datasource_id=datasource_id, triggered_by=actor_id, status="pending")
+        .values(
+            datasource_id=datasource_id,
+            triggered_by=actor_id,
+            status="pending",
+            force=force,
+        )
         .returning(_JOB.c.id)
     )
 
@@ -77,7 +85,7 @@ def claim_stmt() -> Update:
             started_at=func.now(),
             heartbeat_at=func.now(),
         )
-        .returning(_JOB.c.id, _JOB.c.datasource_id, _JOB.c.started_at)
+        .returning(_JOB.c.id, _JOB.c.datasource_id, _JOB.c.started_at, _JOB.c.force)
     )
 
 
@@ -88,6 +96,9 @@ class ClaimedJob:
     job_id: int
     datasource_id: int
     started_at: dt.datetime
+    # 工单 021：入队那一刻落进行里的"覆盖规模上限"。它是这条缝对 force 的唯一转手——
+    # worker 读不到请求，没有这一格，端点收到的那个布尔就到不了 `run_sync`。
+    force: bool
 
 
 class JobQueue(Protocol):
@@ -97,8 +108,12 @@ class JobQueue(Protocol):
     第三个换的是**读**的方向（谁在听作业）。它们都只认 `job_id`，介质细节一律不外露。
     """
 
-    async def enqueue(self, datasource_id: int, actor_id: int) -> int:
-        """落一行待办并返回 job_id；同数据源已有未结束作业时抛 `SyncAlreadyRunning`。"""
+    async def enqueue(self, datasource_id: int, actor_id: int, *, force: bool = False) -> int:
+        """落一行待办并返回 job_id；同数据源已有未结束作业时抛 `SyncAlreadyRunning`。
+
+        `force` 是工单 021 的入队布尔（"超限了，admin 当场说过照常开工"），默认 false——
+        不带它的老调用形状（016 的两个位置参）逐字照旧。
+        """
         ...
 
     async def claim(self) -> ClaimedJob | None:
@@ -120,10 +135,10 @@ class PostgresJobQueue:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def enqueue(self, datasource_id: int, actor_id: int) -> int:
+    async def enqueue(self, datasource_id: int, actor_id: int, *, force: bool = False) -> int:
         # 单独提交：撞锁要**立刻**回 409 让请求结束，而不是等抽取跑完再说
         try:
-            result = await self._session.execute(enqueue_stmt(datasource_id, actor_id))
+            result = await self._session.execute(enqueue_stmt(datasource_id, actor_id, force=force))
             job_id = result.scalar_one()
             await self._session.commit()
         except IntegrityError as exc:
@@ -145,7 +160,10 @@ class PostgresJobQueue:
             # 不是错误，也分不出来（不必分——worker 的循环据此安静转下一轮）。
             return None
         return ClaimedJob(
-            job_id=int(row.id), datasource_id=int(row.datasource_id), started_at=row.started_at
+            job_id=int(row.id),
+            datasource_id=int(row.datasource_id),
+            started_at=row.started_at,
+            force=bool(row.force),
         )
 
     async def subscribe(self, job_id: int) -> JobWake:

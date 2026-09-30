@@ -886,7 +886,10 @@ async def run_sync(
     而 `synced_before` 就是 claim 那一刻库里生成的 `started_at`——本轮所有"这行是不是
     本轮写的"的判断都以它为钟。
 
-    `force` 是 §6 给 admin 的"知道大还是要点"的口子，P2 还没接（工单验收没有它）。
+    `force` 是 §6 给 admin 的"知道大还是要点"的口子（工单 021 已接：请求体 `{"force":true}`
+    → `sync_jobs.force` → `ClaimedJob.force` → 这里）。它**只**关掉 `MAX_TABLES` 一档——
+    scope 过滤（include/exclude）、删除差分、规模之外的行为一律不变，不是跳过所有保护的
+    万能钥匙。
 
     本函数的三条不变量（都被 `tests/integration/test_sync_pg.py` 钉着）：
 

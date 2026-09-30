@@ -58,7 +58,13 @@ async def run_once(session: AsyncSession) -> int | None:
         return claimed.job_id
     try:
         outcome = await sync_service.run_sync(
-            session, ds, job_id=claimed.job_id, synced_before=claimed.started_at
+            session,
+            ds,
+            job_id=claimed.job_id,
+            synced_before=claimed.started_at,
+            # 工单 021：入队那一刻的"覆盖规模上限"由作业行带出来——worker 进程读不到请求，
+            # 没有这一格，端点收到的 force 就死在 sync_jobs 那一列里。
+            force=claimed.force,
         )
     except Exception as exc:
         # 走到这里终局一定已经写好（`run_sync` 的不变量 1），所以不需要补救，但要把原因
