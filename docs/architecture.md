@@ -64,7 +64,14 @@ backend/
 │   ├── core/
 │   │   ├── db.py             # async engine + sessionmaker + Base（显式 schema）+ 命名约定
 │   │   ├── security.py       # JWT encode/decode、密码哈希、Fernet encrypt/decrypt
-│   │   ├── sse.py            # sse_format() / 进度通道（PG 表 + 进程内 asyncio.Queue）
+│   │   ├── sse.py            # sse_format() + 按 `seq > cursor` 追读 `sync_job_event` 的异步生成器
+│   │   │                     # + `JobWake`（as-built(P3-017)：叫醒用的是 `asyncio.Event`，置位它的
+│   │   │                     # 回调住在 `services/job_queue.subscribe`；不是这一行原写的"进程内
+│   │   │                     # asyncio.Queue"——一次 PG 能广播无数条 NOTIFY，而一个作业被叫醒十次
+│   │   │                     # 和一次要做的事完全相同，去重语义由 Event 免费提供）
+│   │   ├── sync_vocabulary.py    # phase(9 值)→stage(5 值) 的唯一翻译处（as-built(P3-017)）
+│   │   │                     # 同层住在 core 而不是 services：写侧（services）与读侧（core/sse）
+│   │   │                     # 都要用它，而 core 不许反向 import services。这一份只 import typing
 │   │   ├── errors.py         # AppError 层级 + 统一 envelope {error:{code,message,detail}}
 │   │   ├── pagination.py     # 游标/页码统一
 │   │   └── logging.py        # 结构化 JSON 日志 + request_id contextvar
@@ -73,6 +80,8 @@ backend/
 │   ├── services/
 │   │   ├── datasource_service.py   # CRUD + Fernet + test_connection
 │   │   ├── sync_service.py         # 同步编排、幂等 upsert、软删除标记
+│   │   ├── job_queue.py            # `JobQueue` Protocol + PG 实现：enqueue/claim/subscribe（as-built(P3-016/017)）
+│   │   ├── sync_vocabulary.py      # phase(9 值)→stage(5 值) 的唯一翻译处（as-built(P3-017)）
 │   │   ├── kb_service.py           # 卡片生成（纯函数）+ 建索引 + 检索
 │   │   ├── embedding_client.py     # OpenAI 兼容 /embeddings（httpx，可注入便于 mock）
 │   │   ├── llm_client.py           # OpenAI 兼容 /chat/completions（含流式）
@@ -93,7 +102,8 @@ backend/
 │   │   └── postgres.py       # 手写 pg_catalog 批量 SQL
 │   └── prompts/              # nl2sql_system.j2 / nl2sql_user.j2 / rewrite.j2 / summarize.j2 / card_template.j2
 ├── alembic/versions/         # 0001_baseline（扩展）→ 0002_users → 0003_datasource → …
-├── scripts/                  # init_demo_mysql.sql / seed_admin.py / check_env.py / demo_ask.py / reembed.py
+├── scripts/                  # init_demo_mysql.sql / init_demo_pg.sql / seed_admin.py / check_env.py / demo_ask.py
+│                             # / run_worker.py（as-built(P3-016)：作业执行体）；reembed.py 归 P4，尚未落地
 └── tests/                    # conftest.py + guard/ + unit/ + integration/ + fixtures/
 ```
 
@@ -641,8 +651,15 @@ event: error         {code, message, retryable}
 
 - 帧体严格 `event: <name>\ndata: <json>\n\n`；每 15s 发一次 `: ping\n\n` 注释帧，
   否则远端链路 idle 超时会静默断流，前端表现为"卡住"。
+  **as-built(P3-017)**：带游标的那一类帧多一行**前置** `id: <seq>`（形状 `id:…\nevent:…\ndata:…\n\n`）——
+  浏览器/`fetch` 解帧后把它存成 `Last-Event-ID`，§2.8 的 `seq > cursor` 补读才有地方接。
+  这一行原来写的"严格两行"漏了它，因为写的时候只有问数流（无游标）用到这一节。
 - 响应头：`media_type="text/event-stream"` + `Cache-Control: no-cache, no-transform`
   + `Connection: keep-alive` + `X-Accel-Buffering: no`。
+  **as-built(P3-017)**：`Connection` 这一项**没设**，是有意偏离而不是漏做——它是 hop-by-hop 头，
+  HTTP/1.1 的 keep-alive 本来就是默认，而 uvicorn/h11 会剥掉应用自己写的 `Connection`；
+  真设一次只会在现场多一条"为什么这行代码没用"。SSE 断线重连的间隔也不走 `Retry-After`
+  （那是 HTTP 头的机制），走**帧字段** `retry: <毫秒>`：流的第一个块就是它，常量为 3000。
 - **不能对 SSE 挂 gzip**。`StreamingResponse` 里抛出的异常必须在 generator 内 `try/except`
   转成 `error` 帧，否则前端只看到连接断开。
 - 前端**不用 `EventSource`**（无法带 `Authorization` 头），用 `fetch` + `ReadableStream` 手解帧。
@@ -653,6 +670,10 @@ event: error         {code, message, retryable}
 - 断连语义：MVP 下客户端断开 = 请求作废（不落 `chat_message`），`asyncio.CancelledError` 必须正确传导，
   不留 running 的执行、不泄漏连接。同步 job 不受影响（它在服务端跑，进度以 PG 表为准，
   重连 SSE 从 `Last-Event-ID` = job 当前 `progress` 续）。
+  **as-built(P3-017)**：这一行原写的 "`Last-Event-ID` = 当前 `progress`" 落不了地——`progress` 是
+  `numeric(5,2)` 的百分比，回不到"读到第几行"。游标是 `sync_job_event.seq`（§2.8 的 `UNIQUE (job_id,seq)`），
+  帧里以 `id:` 送出、重连时从 `Last-Event-ID` 头或 `?cursor=` 读回，**后者优先**（URL 是显式的，
+  头是浏览器代管的）。问数流那一半按原文不变：它没有事件表，也就没有游标。
 
 ---
 
@@ -692,7 +713,7 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | GET | `/sync/jobs/{id}` | 同 ds 权 | — | `{status,phase,progress,counters,warnings,errors,started_at,finished_at}` |
 | POST | `/sync/jobs/{id}/cancel` | 同 ds 权 | — | 置 `cancel_requested`，worker 批间检查。**as-built(P3 开工前拍板)：挂 [P8]** —— `sync_jobs` 至今没有 `cancel_requested` 列（metadata-model §2.5 那份列清单里没有），加列与批间检查点等 P8 前端的"停止同步"按钮一起做；`status='cancelled'` 因此继续没有写入点 |
 | POST | `/sync/jobs/{id}/retry` | 同 ds 权 | — | 新 job，`retry_of` 指向原。**as-built(P3 开工前拍板)：本片不做** —— `retry_of` 列同样不存在，且 P3 七条验收里没有一条要求重跑；记为无主项（见 `project-spec-holes` 那一类账） |
-| **GET** | `/sync/jobs/{id}/events` | 同 ds 权 | — | **SSE**（`text/event-stream`，`Retry-After`、`X-Accel-Buffering: no`）。用 GET+EventSource，前端简单；心跳 `: ping` 每 15s。**as-built(P3 开工前拍板)**：事件真相是 metadata-model §2.8 的 `sync_job_event`（append-only，带 `seq` 游标），PG 的 `NOTIFY` 只携带 `job_id` 当叫醒信号、不带任何事实（`NOTIFY` 在无监听者的那一刻永久丢失，所以它不配当真相，详见 ADR-0010）；客户端断开重连按 `seq > cursor` 补读，一条不丢 |
+| **GET** | `/sync/jobs/{id}/events` | 同 ds 权 | — | **SSE**（`text/event-stream`，`Retry-After`、`X-Accel-Buffering: no`）。用 GET+EventSource，前端简单；心跳 `: ping` 每 15s。**as-built(P3 开工前拍板)**：事件真相是 metadata-model §2.8 的 `sync_job_event`（append-only，带 `seq` 游标），PG 的 `NOTIFY` 只携带 `job_id` 当叫醒信号、不带任何事实（`NOTIFY` 在无监听者的那一刻永久丢失，所以它不配当真相，详见 ADR-0010）；客户端断开重连按 `seq > cursor` 补读，一条不丢。**as-built(P3-017 已交付)**：路径就是 `GET /api/sync/jobs/{job_id}/events`，鉴权与 `POST /api/sync/jobs` 同一把尺（owner/admin，不是本表的 "sync 权"，理由同上面那行）。块顺序 = `retry: 3000` → 若干 `event: progress`（带 `id: <seq>`）→ 一个 `event: done`（**无 `id`**，负载是 `GET /sync/jobs/{id}` 那一行的字段集 + 算出来的 `duration_ms`）；异常走 `event: error {code,message}`（§6.2 那条"生成器里的异常必须转成帧"。**as-built(P3-017 双轴审查后)**：`AppError` 之外的那一类（元数据库断线、收尾那一瞬作业行被 CASCADE 删掉）也转同一帧，`code=internal_error`，而驱动原文只进服务日志不进帧——同 `errors.py` 里 SQLAlchemyError 处理器一条理由：原文带连接串）。进度帧的负载是**摊平**的：`{stage, phase, done, total, base_table, view, cards, payload}`——本表与 spec 故事 7 点的那五个键在顶层，多出的三个是 §2.8 那两列（`phase` 排障、`counters.cards`、`payload`）原样带出，展开的位置只有 `core/sse.progress_frame()` 一处。`?cursor=<seq>` 与 `Last-Event-ID` 头二选一时**查询参数优先**。心跳与重连的机制见 §6.2 的 as-built |
 | GET | `/metadata/databases` | read 权 | `?datasource_id` | 列表 + stale 计数 |
 | GET | `/metadata/tables` | read 权 | `?datasource_id&database&q&type&hidden&cursor&sort` | `[{table_uid,id,schema,name,table_type,comment_zh,comment_raw,column_count,approx_rows,is_stale,has_card}]` |
 | GET | `/metadata/tables/{table_uid}` | read 权 | — | 表详情（列/索引/关系/卡片文本/最近同步） |

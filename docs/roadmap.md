@@ -166,6 +166,19 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   （那边是 9 值细粒度词表，`extract`/`upsert` 写进去会被 PG 直接拒）。判定改按双层词表：
 >   SSE 上出现的是粗粒度 `stage`，库里存的是细粒度 `phase`，映射只住在一个纯函数里。
 >   `total` 与"排除下划线前缀对象"的计数口径不变（仍是 10）。
+>   **as-built(P3-017)：本条已交付**，真跑实录（工单 017 交付记录）是 `retry: 3000` 打头 →
+>   五帧 `event: progress`（`stage` 依次 extract / upsert / card_build / embed / done，`id` 就是库里
+>   那五行 `seq`，逐条对得上）→ 一帧 `event: done` 收尾；首帧 `total=10, base_table=9, view=1, done=0`，
+>   **不是** `SHOW FULL TABLES` 数出来的 11。断线重连按 `?cursor=` 与 `Last-Event-ID` 两条路各钉一次，
+>   两边都从 seq=3 起、一条不丢也不重。验收 5 那条"映射唯一"的实测口径是**翻译点唯一**而不是
+>   "字面唯一"（`upsert`/`extract` 这类词在 SQL 语句名里避不开）：全仓 `stage_of` 只有一个调用点
+>   （`sync_service.py:653`，写事件的那一处），五个粗档字面作为**词表**只出现在三处——迁移 0007
+>   的 stage CHECK、它的 ORM 镜像 `models/meta.py:345`、`core/sync_vocabulary.py` 的 `_PHASE_TO_STAGE`。
+>   另有三处同字面但**不同义**，都不算第二处翻译：`sync_jobs.phase` 那 9 值 CHECK 本来就含
+>   `card_build`/`embed`/`done`（细值）、`run_sync` 里传给 `_set_phase` 的也是细值、`core/sse.py` 的
+>   `EVENT_DONE = "done"` 是 **SSE 帧名**（与 §6.1 问数流的最后一帧同名，终局档的判定走
+>   `sync_vocabulary.is_terminal_stage`，读侧没有再抄一个字面）。测试里出现的五个字面是从文档抄下来的
+>   **期望值**，不是翻译点。
 > - **验收 3**：409 的代码路径在 P2 已经通了（`_open_job` 撞 `ux_sync_running` → `Conflict`），
 >   P3 要补的是"API 只入队"之后这条还成不成立——入队写的是 `pending`，而索引管
 >   `status IN ('pending','running')`，所以互斥面反而变大（排队中的作业也挡住新作业）。

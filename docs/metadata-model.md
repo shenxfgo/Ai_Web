@@ -253,6 +253,10 @@ errors   jsonb DEFAULT '[]'   -- [{code, detail}]，分类过的 AppError 再多
                                --   一跳，只留人话就只剩一个 code 能看。`detail` 一律是字符串
                                --   （给人读的那一句），机器可渲染的结构住在 `data`——读这一列的人
                                --   不必为同一个键写两种分支，所以不让 detail 兼任结构）
+force boolean NOT NULL DEFAULT false  -- as-built(P3-017)：迁移 0007 顺带建的列（工单 021 数据层
+                               -- 原话"并进迁移 0007，别为它单开一次迁移"）。**017 只建列不读它**——
+                               -- 入队收 force、`claim` 带出来、`run_sync(force=)` 的透传与端点开关
+                               -- 全部归 021，今天这一格在应用侧没有任何读写点
 manifest_digest text NULL      -- 与上次成功的指纹，命中则短路
 heartbeat_at timestamptz       -- 用于回收僵尸 running 任务
 started_at / finished_at / created_at
@@ -407,7 +411,7 @@ counters jsonb NOT NULL DEFAULT '{}'     -- 该事件时刻的累计账（done/t
 payload  jsonb NOT NULL DEFAULT '{}'     -- {table:'db.t', code:'card_build_failed', detail:…, skipped:bool}
 created_at timestamptz NOT NULL DEFAULT now()
 UNIQUE (job_id, seq)
-INDEX (job_id, seq)
+INDEX (job_id, seq)             -- as-built(P3-017)：不单独建，见下方 ⑤
 ```
 
 只追加、不改写：一行代表"作业状态发生过一次可对外说明的变化"。它是 P3 进度的**唯一真相**，
@@ -423,6 +427,21 @@ INDEX (job_id, seq)
 >    这张表是全仓唯一一张确定会随时间线性增长的表，而"保留 30 天"这句配置承诺此前没有任何读取点。
 >    结果 csv **不在本表的管辖范围**，也不在回收范围内（删文件不可逆，且 P2 的现场证据就在里面）。
 > ④ `ON DELETE CASCADE` 到 `sync_jobs`：作业行被人删掉时事件跟着走，不留孤儿。
+>
+> **as-built(P3-017 已交付)**：
+> ⑤ 上面那行 `INDEX (job_id, seq)` **没有单独建**，是刻意的：`UNIQUE (job_id, seq)` 本身就是一棵
+>    按这两个字段排序的 b-tree，而读侧唯一那条查询正是 `WHERE job_id=:j AND seq>:c ORDER BY seq`
+>    （`core/sse.read_events`）。再补一条同键索引只多一份写放大，换不到任何一次不同的扫描。
+> ⑥ **一帧一档，`counters` 说的是"那一刻"**：本轮写事件的调用点是五处——`discover`（→extract）、
+>    每个库的 `tables`（→upsert，与那次元数据写入**同一个事务**，见 §6 as-built(P3 开工前拍板) 第 5 条）、
+>    `card_build`、`embed`、`done`。所以 `card_build` 那一帧的 `cards` 是 **0**：它发在
+>    `sync_cards()` 之前，那一刻一张卡都还没落成，卡片数从 `embed` 帧起才是实际条数。
+>    拿最终卡片数去断 `card_build` 帧会把这条口径记反（`test_sync_events_live.py` 钉的就是 `[0,0,0,12,12]`）。
+> ⑦ `seq` 由写侧在**同一事务**里取 `max(seq)+1`（`sync_service._add_event`），`UNIQUE` 只是兜住
+>    并发的那一层。不需要序列号分配器：同一个作业同一时刻只有一个 worker 在写它（§6 的 claim）。
+> ⑧ `NOTIFY` 与事件行**同事务**发出。PG 的事务型 `NOTIFY` 到 COMMIT 才投递，所以"被叫醒"天然蕴含
+>    "那一行已可见"；写进同一个事务是为了让回滚的那一帧连带把叫醒一起撤掉——否则会出现
+>    "流被叫醒、读到的还是旧游标"的空转。读侧本来靠游标补读能自愈，但没有理由留着这个窗口。
 
 ## 3. 人工列与同步列的分离（幂等重跑的关键）
 
@@ -572,6 +591,10 @@ DELETE FROM aiweb.meta_relation
 >    `architecture.md` §7 端点表里 `POST /datasources/{id}/sync` 那一行的路径按此作废。
 > 2. **阶段词表是两套，且映射只能住在一个地方**。`sync_jobs.phase` 继续写 9 值细粒度（迁移不动，
 >    CHECK 不改）；对外（SSE）用粗粒度 `stage ∈ {extract, embed, upsert, done}`。
+>    **as-built(P3-017)**：这里当场拍的是四个值，落地是**五个**——多了 `card_build`。判据不是偏好：
+>    roadmap P3 验收 2 与工单 017 的"已定口径"两处都写着 `card_build`，而 §2.8 的 CHECK 是它的库内落点
+>    （已随迁移 0007 建好）；少了这一档，进度条从"元数据写完了"直接跳到"在做向量"，
+>    卡片这一段（本机最慢的一步）对外就是黑的。多出来的这一格只改词表，不改映射规则本身。
 >    roadmap P3 验收 2 那句 `phase=extract/embed/upsert` 里的 `extract`/`upsert` **不在** CHECK 里，
 >    按本条收口：worker 写库用细值，写事件用粗值，两者之间唯一的映射是一个纯函数。
 > 3. **进度真相在 `sync_job_event`，不在 `progress` 列**。新表见 §2.8。`NOTIFY` 只携带 `job_id`
@@ -627,6 +650,31 @@ DELETE FROM aiweb.meta_relation
 >    会话由调用方给、也由调用方关——018 的心跳要在**另一条连接**上刷，届时看的就是谁握着会话。
 >    作业级异常收在 `run_once` 而不是 `loop()`：收在 loop 里，用例跑的那条路就少了一层
 >    真进程有的保护，而 `run_sync` 的不变量恰恰是"终局写完之后把原因原样抛出去"。
+>
+> **as-built(P3-017 施工后)**（2026-09-30，工单 017；帧语义见 §2.8 的同名标注，这里只记写侧）
+>
+> 1. 上面第 4 条挂的那笔账到此闭环：`JobQueue` Protocol 现在是 `enqueue` / `claim` / **`subscribe`**
+>    三个成员，`subscribe(job_id)` 返回一个 `JobWake`。句柄这个类型住在 `core/sse.py`，置位它的
+>    回调住在 `services/job_queue.py`——依赖方向仍然是 services → core，换掉队列介质时不动读侧。
+>    同一条理由管着另一件东西：`phase`→`stage` 的那份词表读侧也要用（流的终局判定），
+>    所以它住在 `core/sync_vocabulary.py` 而**不是** `services/`——core 反向 import services
+>    会让这一行写的方向当场失效。
+> 2. **`LISTEN` 必须挂在一条专用连接上**，借用会话自己那条会静默失效：读循环每轮都要
+>    `rollback()`（它凭什么一直读到新事件？就是靠重开快照），而归还掉的连接在池化下会被交给
+>    下一个借用者（那位没订过阅）、在 NullPool 下被直接关闭。两种结局都是"进度永远不动"，
+>    且一条都不报错。付的代价是每条 SSE 流占两条连接，写在本片交付记录里。
+> 3. 引擎要从 `session.bind` 取，**不是 `session.get_bind()`**：后者在 `Session` 层就把引擎拆成了
+>    同步 `Engine`（本机 `type()` 实测），对它的 `.connect()` 在没有 greenlet 的上下文里发起真 IO，
+>    抛 `MissingGreenlet`。这一条是被这个异常逼出来的，不是风格选择。
+> 4. **写事件只有一个入口**（`sync_service._add_event`），而它只被 `_set_phase(event_counters=…)`
+>    调用——不是另开一处，这正是工单 017 "涉及层"要求的那个形状。`_set_phase` 因此多了 `commit=False`：
+>    那一档的 phase 写、事件写、`meta_*` 写并进同一次 commit（上面"已定口径"的 D1），于是"库失败回滚 →
+>    那一帧跟着消失"由事务保证，而不是由代码顺序保证。
+> 5. **分母先于第一帧**（D2）：`Extractor.count_scope()` 跑在 `discover` **之后**、第一帧之前
+>    （它要吃 `discover` 回来并经过 include_schemas 过滤的那批 catalog，不然连该数哪几个库都不知道），
+>    所以每一帧都说得出 `x/y`。它只发分组计数那一条 SQL，昂贵的 IS/列/索引一条都不发。演示库上
+>    `total=10` 而 `SHOW FULL TABLES` 数出 11，差的正是下划线前缀那几个建库脚本内部对象——
+>    分母口径与 §2.5 那本行级总账（`_Tally`）是两本账，故意不合并（`_Progress` 的理由写在源码里）。
 
 ## 7. `SourceDialect` 抽象与中间结构
 

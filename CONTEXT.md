@@ -83,8 +83,9 @@ API 只负责入队，所以"点了同步"和"同步在跑"是两个进程的事
 _避免_: 后台任务, 守护进程
 
 **队列接口 (JobQueue)**:
-`enqueue / subscribe / worker` 三个动作的接缝，P3 的实现是元数据库本身。
-存在的理由不是预留 Redis，而是 API 与 worker 之间必须有一个可替换的交接口。
+API 与 worker 之间那个可替换的交接口。拍板时说的是 `enqueue / subscribe / worker` 三个动作，
+落地的三个成员是 `enqueue / claim / subscribe`——"worker" 是进程而不是接口动作，
+真正在接口上的是它取作业的那一下 `claim`。
 
 **进度事件 (sync_job_event)**:
 作业每发生一次状态变更就 append 一行，是进度的唯一真相；`NOTIFY` 只负责叫醒，不带事实。
@@ -92,9 +93,11 @@ _避免_: 后台任务, 守护进程
 _避免_: 日志（日志是人看的，事件是给端点读的）
 
 **阶段 (phase) 与档 (stage)**:
-两套词表，各管一头。`phase` 是细粒度真相（9 值，写进 `sync_jobs`）；`stage` 是粗粒度对外契约
-（extract / embed / upsert / done，进 SSE）。两者之间的映射唯一住在**一个**纯函数里，
-任何第二处重复这个映射的地方都是 bug。
+两套词表，各管一头。`phase` 是细粒度真相（9 值，写进 `sync_jobs`，只由那一处 phase 写入点落）；
+`stage` 是粗粒度对外契约（extract / upsert / card_build / embed / done 五档，进 SSE，
+每档一帧）。两者之间的映射唯一住在**一个**纯函数里，任何第二处重复这个映射的地方都是 bug。
+_避免_: 把 `done` 的两种身份混谈——它是**档**（终局那一帧的 stage）也是**帧名**（流的最后一帧），
+判"这轮结没结束"用的是终局档，不是帧名。
 
 **僵尸回收**:
 worker 在心跳循环里把心跳超时的未结束作业改判为 `failed`，避免它永久占住唯一索引。
