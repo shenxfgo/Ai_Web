@@ -101,10 +101,15 @@ P2 交付的同步是**请求内跑完**的：`POST /api/sync/jobs` 同步调用
 
 ### E. PG 数据源与类型归一化
 
-20. 用户以超管跑一次 `backend/.setup/init_demo_pg.sql` 之后（建 `ai_web_demo_pg` + 10 张带中文注释的表 +
+20. 用户以超管跑一次 `scripts/demo_pg.ps1`（`make demo-db-pg`，内部执行 `backend/scripts/init_demo_pg.sql`）
+    之后（建 `ai_web_demo_pg` + 9 张业务表/1 视图，其中 8 张带中文表注释 +
     只读账号 `demo_pg_ro`），登记成 PG 数据源并同步，能真跑通"discover → 分批读 → 落库 → 建卡片"。
 21. PG 抽取器按 `metadata-model §8` 已写好的五条 SQL 原文实现（`pg_attribute` ⋈ `pg_description`、
-    `pg_index` 的 `indkey::int[]` 与 `unnest ... WITH ORDINALITY` 保序、`pg_constraint`）。
+    `pg_index` 的 `unnest(i.indkey) WITH ORDINALITY` 保序、`pg_constraint`）。
+    **开工第一件真跑事项**：§8:869 那句"`indkey::int[]` 用来保序"里的显式数组转换从未在 live 上证过
+    （§8 的 SQL 原文 :845 用的是不带转换的 `unnest(i.indkey)`）。015 的自检因此改用
+    `pg_index.indexprs IS NOT NULL` 判表达式索引；若 024 真跑时证明 `::int[]` 可行，回写 §8 那句话，
+    不行就把 §8 的表述改成与 :845 一致。
 22. 类型归一化落在**抽取层**：`data_type` 写归一值、`raw_data_type` 写方言原文。
     `tests/unit/test_pg_type_normalize.py` 覆盖 roadmap 验收 6 点名的
     `_text` / `_int4` / `_numeric` / `_timestamptz` / `_varchar` / `[]` / `_jsonb`。

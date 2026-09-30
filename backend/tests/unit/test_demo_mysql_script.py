@@ -45,20 +45,23 @@ def _table_body(sql: str, table: str) -> str:
 def _doc_expectations() -> dict[str, int | None]:
     """解析 verification.md §1 的表格：对象名 -> 期望行数（视图没有行数，给 None）。
 
-    只取 §1 那一张表——文档后面还有几表格子格式相同但讲的是代码标识符。
+    按**表头那一行**定位、顺着 `|` 吃到头，不整节扫。015 在 §1 里加了 §1.5 的 PG 枚举表
+    （同名对象、行数不同），整节扫的那一版把两张表并成一张，MySQL 侧的行数期望被 PG 的数
+    覆盖掉——"只取 §1 那一张表"这句话必须写成代码，不能靠自觉。
     """
-    section = re.search(
-        r"^## 1\. .*?(?=^## )", VERIFICATION_DOC.read_text(encoding="utf-8"), re.S | re.M
-    )
-    assert section, "verification.md 里没有 §1，口径来源被搬走了"
+    doc = VERIFICATION_DOC.read_text(encoding="utf-8")
+    header = "| 表 | 行数 | 表注释（中文） | 关键考点 |"
+    assert header in doc, "verification.md 里没有 §1 的对象表表头，口径来源被搬走了"
+    lines = doc[doc.index(header) :].splitlines()
     rows: dict[str, int | None] = {}
-    for line in section.group(0).splitlines():
+    for line in lines[2:]:  # 跳过表头与 |---| 分隔行
+        if not line.startswith("|"):
+            break
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) < 2:
             continue
         name = re.fullmatch(r"`([a-z_][a-z0-9_]*)`.*", cells[0])
-        if not name:
-            continue
+        assert name, f"§1 的对象表有一行首格不是反引号对象名：{cells[0]!r}"
         # 取单元格开头的数字串：文档里同一格里还会跟"（>50k 例外…）"和"行 × 68 列"这类别的
         # 话。上一版用 isdigit() 判定，product_stats_wide 那格因此解析成 None，
         # 于是它的行数从来没被拿来跟文档比过——静默降级成"表名在就行"。

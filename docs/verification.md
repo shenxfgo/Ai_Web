@@ -134,6 +134,178 @@
 > 不填就是 10/1（库里真实可见数）。007 同步侧要么沿用"范围由源配置负责"这一语义，
 > 要么把下划线排除升级为内建规则——两处口径必须一致，否则 SSE 的 `total` 和探测报的数会打架。
 
+### 1.5 PG 演示源 `ai_web_demo_pg`（本机 PostgreSQL 18，schema `demo`）
+
+P3 验收 6「PG 数据源跑通同步」的原料。**它是被抽取的源库**，与元数据库 `aiweb` / 测试库
+`aiweb_test` 无关——建库 SQL 里不出现那两个库名。外层复验会向 `aiweb` 发**一条**
+`SELECT count(*) FROM aiweb.users`（期待它被权限挡下），不改任何东西、不发 DDL，
+其余语句全部落在 `ai_web_demo_pg` 内。
+
+脚本：`backend/scripts/init_demo_mysql.sql` 的同构兄弟 `backend/scripts/init_demo_pg.sql`
+（进版本库，只含占位符 `__AIWEB_PG_RO_PASSWORD__`），外层 `scripts/demo_pg.ps1` / `make demo-db-pg`。
+对象构成与 §1 完全对齐：**9 张业务表 + 1 个视图**，外加内部标记表 `_aiweb_demo_marker`
+（下划线前缀，同时是"排除规则在 PG 侧也生效"的活体考点）与 `other_app.secret_table`
+（不在 `demo` 里，不影响计数）。四个数同样是 **10 / 9 / 1 / 11**。
+
+| 表（schema `demo`） | 行数 | 列数 | 关键考点（MySQL 版没有的那一半） |
+|---|---|---|---|
+| `customer` | 200 | 7 | **`serial` 主键**（§9 映射清单点名：真身是 `pg_attrdef` 里的 `nextval(...)`，与 identity 要分得开）、`phone` 唯一索引、`register_at timestamptz` |
+| `category` | 40 | 3 | 自引用**真外键** `fk_category_parent`（MySQL 版只有列名关系），JOIN 图自环在两边都可测 |
+| `product` | 500 | 8 | **`tags text[]`**、**`attrs jsonb`**、**表达式索引** `ix_product_name_lower ((lower(name)))`（`pg_index.indkey` 里那一位是 0 → §8.2 D 的 `column_name` NULL 分支）、**部分索引** `ix_product_on_sale ... WHERE status='on_sale'`（`indpred` 非空） |
+| `order_main` | 2,000 | 9 | **`GENERATED ALWAYS AS IDENTITY`**（§9 点名的另一样）、`updated_at` 可空、复合索引 `(customer_id, created_at)`、`status` 六值枚举口径同 MySQL |
+| `order_item` | 5,000 | 6 | 双 FK（→`order_main`/`product`）、`is_gift boolean`（MySQL 侧是 `tinyint(1)`，归一化两方言都要落） |
+| `payment_record` | 1,500 | 6 | identity 主键、`trade_no` 唯一、`paid_at timestamptz`（跨表问数主角，口径同 MySQL） |
+| `user_activity_log` | 3,000 | 10 | **不建外键**（靠命名推断 JOIN，验证 `FORCE_FK_INFER`）；三种数组都挂这张表：`hit_ids int4[]`、`scores numeric(10,2)[]`、`occurred_at timestamptz[]`，另有 `extra jsonb` |
+| `product_stats_wide` | 500 | **25** | 宽表裁切考点（MySQL 版 68 列，这边 25 列够测 token 预算）；**`top_keywords varchar(64)[]`** 是归一化最难的一格——数组必须保住 `atttypmod`，否则 `(64)` 这个修饰符就丢了 |
+| `t_no_comment` | 50 | 4 | **无表注释 + 无列注释 + 无主键**三条降级分支合到一个对象上（刻意合并，免得对象总数漂到 11 打乱 `total` 口径） |
+| `v_daily_sales`（视图） | 随时间轴分布而变，只核对非空 | 4 | **不写注释**：视图列注释缺失的卡片降级，与 §1 的 `v_daily_sales` 同一考点 |
+
+守卫语料里的表名在两个演示源里一一对应，所以同一条问数可以在 MySQL 源与 PG 源之间对拍
+抽取、归一化和卡片渲染的差异。
+
+#### 1.5.1 与 MySQL 版的四处口径差异（不是 bug，是方言本性）
+
+1. **没有跨库引用表的写法**。§1.2 第 4 步的"用只读账号读 `mysql.user` 必须被拒"在 PG 侧没有等价语法
+   （PG 不支持一条 SQL 里引用别的库的表）。
+   等价用例是**换库再读**：复验时以 `demo_pg_ro` 连进 `aiweb`，发
+   `SELECT count(*) FROM aiweb.users`，期待它失败且失败原因里出现 `permission denied`。
+   这里特意**不接受**"没提供口令 / 认证失败"当作通过——那种失败对一个本来有权限的账号同样成立，
+   是假绿；所以 passfile 里 `demo_pg_ro` 那行的库名写成 `*` 而不是钉死 `ai_web_demo_pg`。
+   另一个不显然的点：PG 的**库级 `CONNECT` 默认就给了 `PUBLIC`**，所以"连不上 `aiweb`"根本不能当证据
+   （真连不上多半是 `pg_hba` 或口令问题，与授权无关）。能证的只有**对象级读权限**，
+   因此断言落在"读 `aiweb.users` 被拒"上，而不是"连 `aiweb` 被拒"上。
+2. **没有 `SHOW FULL TABLES`**。对象枚举走 `pg_class` × `pg_namespace`，`relkind` 里 `r`/`v`
+   两支就够（本夹具不用分区表/物化视图，但自检的 `relkind IN ('r','p','m','f','v')` 已把
+   四条表类分支都写上，将来加分区表不用改口径）。
+3. **权限按 schema 而非按库**。`GRANT SELECT ON ALL TABLES IN SCHEMA demo` + `USAGE ON SCHEMA demo`
+   两条都要，缺 `USAGE` 时读表报的是 schema 级拒绝，容易误判成"表没授到"。
+   序列**不授**（只读账号不该有 `nextval`）。
+4. **`_aiweb_demo_marker` 是"这个 schema 是我们建的"的凭证**，作用同 MySQL 的库级 marker；
+   PG 的 marker 挂在 schema 上，因为库由外层 `CREATE DATABASE` 建、schema 由 SQL 建，
+   两者失败点不同。半途失败留下的"库在、marker 在、数据不全"要靠手工
+   `DROP DATABASE ai_web_demo_pg` 重来，外层脚本第二次跑只会报"已建过，跳过"。
+
+#### 1.5.2 数据生成要点（与 §1.1 的差异）
+
+- 造行用 `generate_series(1, N)`，**不用 `random()`**：派生值全部由下标做同余，
+  所以两次执行的行数/金额/枚举分布逐字一致，端到端手测才核得掉数字。
+  口令与时间轴是仅有的两处例外（时间轴上界锚在 `now()`，保证"近 30 天"类问数永远非空）。
+- 表/列注释用 `COMMENT ON`，全部中文；文件 **UTF-8 无 BOM**（BOM 会跑到第一条语句前面，psql 当场语法错），
+  脚本首段 `SET client_encoding = 'UTF8'`，外层再设 `PGCLIENTENCODING=UTF8`。
+  **库本身的编码由外层显式建定**：`CREATE DATABASE ai_web_demo_pg WITH ENCODING 'UTF8' TEMPLATE template0`，
+  脚本开头另有一道 `pg_encoding_to_char(encoding) <> 'UTF8'` 即中止的守卫（给手工 `psql -f` 留的）。
+  这两条防的是同一件事：集群若不是 UTF8，中文注释会安静地写成乱码，而要等到 024 真跑抽取才暴露，
+  那时夹具已经不可信了。
+- 幂等靠 `CREATE ... IF NOT EXISTS` + 带主键的 `INSERT ... ON CONFLICT DO NOTHING`；
+  `t_no_comment` 没主键，改用 `WHERE NOT EXISTS`；视图用 `CREATE OR REPLACE`。
+  外键与角色是"存在就跳过"的 `DO` 守卫，因为 PG 没有 `ADD CONSTRAINT IF NOT EXISTS`。
+- `serial` 建完数据后要把序列推到 `max(id)`（走 `DO/PERFORM` 而不是裸 `SELECT setval(...)`——
+  后者往 stdout 吐一行数字，会混进外层的 PASS/FAIL 裁决计数里）。
+- **不做的事**：不建存储过程、不建分区表、不给 `other_app` 授任何权限、不动 `aiweb`/`aiweb_test`。
+
+#### 1.5.3 安全执行流程
+
+1. **口令通道**（与 §1.2 的 `--defaults-extra-file` 同一路由）：用户手工填
+   `backend/.setup/pg_login.env`（`PGHOST`/`PGPORT`/`PGUSER`/`PGPASSWORD` 四行，目录已 gitignore）。
+   外层读出后写一份**临时 passfile**（`backend/.setup/pg_probe.pass`，格式
+   `host:port:db:user:password`，冒号与反斜杠转义，UTF-8 无 BOM），只把路径交给环境的
+   `PGPASSFILE`，`PGPASSWORD` 从头到尾不设，`psql` 永远带 `--no-password`（匹配不上就失败，
+   不挂在交互式提示上）。临时文件与替换后的 rendered SQL 都在 `finally` 里删除。
+   passfile 落盘后立即断开 ACL 继承、只授当前用户（Windows 上 EDB 那套 libpq **不检查** passfile
+   权限，POSIX 的 0600 在这里不存在，只靠 gitignore 不够）；`demo_pg_ro.env` 同样处理。
+2. **只建不删**：脚本不含 `DROP DATABASE` / `DROP SCHEMA ... CASCADE`；库已存在且认得 marker 时
+   只复验只读，认不出 marker 时**中止**（不接管别人的 schema）。库不存在、但集群里还留着
+   `demo_pg_ro` 角色而 `demo_pg_ro.env` 也不在时同样**中止**——角色是集群级对象，建库脚本对
+   已存在的角色是"跳过创建、沿用旧口令"，此时新生成的口令不会生效，让它跑下去只会抛一个
+   看不出根因的认证失败。
+3. **口令写盘晚于建库成功**：失败时不留一份没人认领的凭证。日志落 `logs/demo_pg_apply.log`，
+   任何一条 `psql` 输出在回显或落盘前都先过一遍脱敏（建库语句报错时 psql 会把
+   `CREATE ROLE ... PASSWORD '<明文>'` 抄进 stderr）。
+4. **只读账号 `demo_pg_ro`**：口令由脚本生成（只用字母数字，避免 passfile 分隔符与 SQL 引号两套转义），
+   落 `backend/.setup/demo_pg_ro.env`。授权只有 `CONNECT`(本库) + `USAGE`(schema demo) +
+   `SELECT`(该 schema 全部表) + `ALTER DEFAULT PRIVILEGES`；序列不授；`other_app` 不授。
+5. **收尾复验四条**（"已建过"分支也要重跑，否则中途失败过一次就再没验证过第二遍）：
+   `SELECT demo.order_main` 通（2000 行）、读 `other_app.secret_table` 以 `permission denied` 失败、
+   `INSERT demo.t_no_comment` 以 `permission denied` 失败、以 `demo_pg_ro` 连进 `aiweb` 读
+   `aiweb.users` 以 `permission denied` 失败。
+   三条"期待失败"的用例都**只认 `permission denied`**——换成别的错误（包括"没提供口令"）
+   说明授权其实漏了，或者用例根本没碰到那道门。
+
+#### 1.5.4 建库脚本自检清单（34 行 PASS，期望值全部手算）
+
+`init_demo_pg.sql` 末尾的裁决查询逐条打印 `PASS`/`FAIL`，外层按"有 FAIL 即中止、PASS 少于 34 行
+即视为日志被截断"两道闸判绿（§1 那条 27 行下限的同一手）。这 34 行分三段，就是本节与实跑输出的对账清单：
+
+```
+PASS  business_objects=10              ← 排除下划线对象后的全计数（= 同步的 total）
+PASS  base_tables=9
+PASS  views=1
+PASS  all_objects_with_marker=11       ← 不能拿它当 total（含内部标记表）
+PASS  commented_objects=8              ← 8 张业务表有表注释
+PASS  uncommented_objects=2            ← t_no_comment 与 v_daily_sales 走降级
+PASS  type:text=…                      ← 两方言共有
+PASS  type:jsonb=…                     ← product.attrs / *_log.extra / wide.channel_split / t_no_comment.meta
+PASS  type:text[]=1                    ← product.tags
+PASS  type:int4[]=1                    ← user_activity_log.hit_ids
+PASS  type:numeric[]=1                 ← scores（带精度的数组）
+PASS  type:timestamptz[]=1             ← occurred_at
+PASS  type:varchar64[]=1               ← top_keywords
+PASS  varchar_array_keeps_modifier=1   ← atttypmod 没丢，否则归一化无从断言
+PASS  generated_always_identity=2      ← order_main.id、payment_record.id
+PASS  serial_column=1                  ← customer.id（pg_attrdef 里的 nextval，与 identity 分开数）
+PASS  expression_index=1               ← ix_product_name_lower（判据是 indexprs 非空；indkey 是 int2vector，
+                                          `indkey::int[]` 那个转换没在 live 上证过，所以自检不用它 —— 见工单 024 第一件事）
+PASS  partial_index=1                  ← ix_product_on_sale（indpred 非空）
+PASS  fk_constraints=6                 ← user_activity_log 那两个列名不该有 FK
+```
+
+行数段（9 张表逐张断精确行数 + 视图只断非空，共 10 行）。**这一段必须是断言而不是打印**：
+只核对结构不核对数据，"表建齐了但一行没插"也能凑够上面那 19 行 PASS，而那正是 002 在 MySQL
+侧踩过的同一类假绿。视图不断精确值，是因为它按天聚合、行数随 `now()` 漂移，手算不出来。
+
+> 这 34 行由 `backend/tests/unit/test_demo_pg_script.py` 在**不连 PG** 的情况下与本文对账
+> （`make check` 每次跑）：三件事钉死——这里列的每一行在脚本里都有对应的断言、行数段与枚举段那 15 行
+> 的**期望值**与上面那张对象表逐字一致、外层 `demo_pg.ps1` 的行数下限等于这里列的行数。
+> 结构段那 19 行的**具体数值**（10/9/1/11/8/2 这些）比不了：脚本里它们是 `'PASS  base_tables=' || 实际值`
+> 的拼接形，期望值写在 `WHERE` 子句的 CTE 列名上，与文档这里的标签名不同源——那 19 个数的最终裁决
+> 仍在 `make demo-db-pg` 的真跑输出里。
+
+```
+PASS  rows:customer=200                ← 以下 9 行逐表对齐 §1.5 枚举表的行数列
+PASS  rows:category=40
+PASS  rows:product=500
+PASS  rows:order_main=2000
+PASS  rows:order_item=5000
+PASS  rows:payment_record=1500
+PASS  rows:user_activity_log=3000
+PASS  rows:product_stats_wide=500
+PASS  rows:t_no_comment=50
+PASS  rows:v_daily_sales>0             ← 只断非空（时间轴锚在 now()，精确值不可手算）
+```
+
+枚举值段（5 行）：造数用下标同余 `(ARRAY[...])[(n % k) + 1]`，`k` 写错时数据看着仍然"很满"
+但少一个值，卡片与 `SAMPLE_DISTINCT` 的考点静默消失——MySQL 侧曾因 `draft` 恒 0 漏过真 bug，
+24 行结构 PASS 一条没拦。期望值就是 `init_demo_pg.sql` 里那五个 `ARRAY[...]` 字面的长度。
+
+```
+PASS  enum:order_main.status=6         ← pending/paid/shipped/completed/cancelled/refunding
+PASS  enum:product.status=3            ← on_sale/off_shelf/draft
+PASS  enum:payment_record.channel=4    ← alipay/wechat/card/offline
+PASS  enum:customer.gender=3           ← M/F/U
+PASS  enum:customer.level=4            ← normal/silver/gold/platinum
+```
+
+#### 1.5.5 登记数据源时的连接参数（工单 024 直接照此抄）
+
+| 字段 | 值 |
+|---|---|
+| host / port | `127.0.0.1` / `5432` |
+| 数据库 | `ai_web_demo_pg` |
+| schema | `demo`（`include_schemas: ["demo"]`） |
+| 排除 | `exclude_tables: ["\\_%"]` —— 同 §1.2 末注的 as-built(006)：这条规则住在**源配置**里，不填就变 10/1 |
+| 账号 | `demo_pg_ro`，口令来源 `backend/.setup/demo_pg_ro.env` 的 `PGPASSWORD=`（不进对话、不进 git） |
+| 期望探测结果 | `table_count=9`、`view_count=1` |
+
 ## 2. 测试分层
 
 ### 2.1 单元测试重点（纯函数，不碰 DB / 不碰网络）

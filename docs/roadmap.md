@@ -175,9 +175,14 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   向量回填整块归 P4。"其余 6 张已落库"能成立的前提是卡片改成**逐表提交**；
 >   元数据侧仍是每库一事务（007 现状不动），所以元数据真抛错时是整库回滚。
 >   三张失败表由测试专用的注入钩子造，走真 HTTP → 真入队 → 真跑。
-> - **验收 6**：需要一个**能被登记的 PG 源库**，由 `backend/.setup/init_demo_pg.sql` 建
->   （`ai_web_demo_pg` + 10 张带中文注释的表，把 `text/_int4/_numeric/_timestamptz/_varchar/text[]/jsonb`
->   全铺上 + `demo_pg_ro` 只读账号），用户以超管 psql 跑一次，形状与 002 的 MySQL 建库同构。
+> - **验收 6**：需要一个**能被登记的 PG 源库**，由 `backend/scripts/init_demo_pg.sql`
+>   + 外层 `scripts/demo_pg.ps1`（`make demo-db-pg`）建
+>   （`ai_web_demo_pg` / schema `demo`：**9 张业务表 + 1 视图**，其中 8 张表带中文表注释、
+>   `t_no_comment` 与 `v_daily_sales` 故意不带（降级分支），把 `text/_int4/_numeric/_timestamptz/_varchar/text[]/jsonb`
+>   全铺上 + 一处 `serial` + 两处 `generated always` + 表达式索引/部分索引各一处 +
+>   `demo_pg_ro` 只读账号），用户以超管跑一次，形状与 002 的 MySQL 建库同构，
+>   四个口径数同样对成 **10/9/1/11**。枚举表、每表考点、口令通道与 34 行自检清单见
+>   [verification.md §1.5](./verification.md)。
 >   类型归一化按 metadata-model §9 落，`test_pg_type_normalize.py` 这个名字按本条建。
 >   **注意**：`MIN_PG_VERSION` / `MIN_MYSQL_VERSION` 的 probe 版本闸门**本片不接**（连同
 >   `SCHEMA_PARTIALLY_VISIBLE` + `known_complete` 门控、`manifest_digest` 短路一起转 P6/P10）——
