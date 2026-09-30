@@ -242,3 +242,6 @@ backend/data/
 frontend/ui-*.png
 # 拆出来的工单是过程稿，落地即消化；要长期留存就搬进 docs/
 .scratch/
+# 并行工单的隔离 worktree：整棵代码树的一份复制，绝不进版本库
+# （其中的 .env 与 backend/.setup/ 已被上面两条规则各自盖住，这条挡的是剩余全部复制件）
+.qoder/worktrees/
