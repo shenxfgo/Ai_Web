@@ -12,6 +12,8 @@
 - 工单 007 验收 1–6（本文件与之一一对应，函数名里就写着是哪一条）
 - `docs/verification.md` §1：9 张 BASE TABLE + 1 张 VIEW，`product_stats_wide` 68 列全带中文注释
 - `docs/metadata-model.md` §3/§4/§5：三段式写入语义、`extracted` vs `inferred`、软删除
+- 最后一张用例（工单 023 验收 5）：`docs/metadata-model.md` §9 的归一清单 +
+  `backend/scripts/init_demo_mysql.sql` 里逐字写着的列类型
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.extractor.mysql import MySQLExtractor
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_pg import _sync
+from tests.unit.test_type_domain import assert_in_value_domain
 
 pytestmark = [pytest.mark.pg, pytest.mark.live]
 
@@ -478,3 +481,65 @@ async def test_验收6_抽取路径只发_select(
     assert not hits, hits
     # 只读账号真跑通了：上面那 10 个对象的元数据就是这条断言的证据
     assert (await _counts(session_factory, run.ds_id))["meta_table"] == TABLES + VIEWS
+
+
+async def test_工单023_data_type_落库后全是归一值_方言原文仍留在_raw(
+    client: AsyncClient,
+    login: Login,
+    monkeypatch: pytest.MonkeyPatch,
+    account: DbAccount,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """工单 023 验收 5：真跑一次演示库同步之后，`meta_column.data_type` 的取值全落在归一值域内。
+
+    期望值口径：列名与方言原料来自 `backend/scripts/init_demo_mysql.sql`（建库脚本，独立真相源），
+    归一结论来自 `docs/metadata-model.md` §9 的清单与 as-built(023) 的两条拍板
+    （`tinyint(1)→bool`、任意精度小数两方言都归 `numeric`）。视图 `v_daily_sales` 的聚合列
+    精度是引擎自己算出来的（`SUM(DECIMAL(12,2))` 的标度不在建库脚本里），所以那一类只断
+    "落在值域内 + 不含空格"，不断具体数字。
+    """
+    run = await _sync_once(client, login, monkeypatch, account)
+    assert run.body["status"] == "success", json.dumps(run.body, ensure_ascii=False)
+
+    cols = await _rows(
+        session_factory,
+        "select t.table_name as t, c.column_name as c, c.data_type, c.raw_data_type"
+        ' from "{s}".meta_column c join "{s}".meta_table t on t.id = c.table_id'
+        " where t.datasource_id = :ds",
+        ds=run.ds_id,
+    )
+    assert cols, "一列都没读到，这条断言在空跑"
+    for row in cols:
+        # 归一值域 = 规范基名 (+ 可选括号 + 可选 [])：出现 `int(11) unsigned` 这类带修饰的
+        # 原文，就是抽取层没接上（§9 的口径是 data_type 存归一值、raw_data_type 存原文）。
+        assert_in_value_domain(str(row["data_type"]))
+    spaced = [
+        f"{row['t']}.{row['c']}={row['data_type']!r}"
+        for row in cols
+        if " " in str(row["data_type"])
+    ]
+    assert not spaced, f"data_type 里出现了带修饰的方言原文：{spaced[:3]}"
+
+    by_column = {f"{row['t']}.{row['c']}": row for row in cols}
+    expected: dict[str, tuple[str, str]] = {
+        # 两条拍板的现场证据：tinyint(1) 塌成 bool、decimal 一族写成 numeric
+        "order_item.is_gift": ("bool", "tinyint(1)"),
+        "order_main.amount": ("numeric(12,2)", "decimal(12,2)"),
+        "order_item.unit_price": ("numeric(10,2)", "decimal(10,2)"),
+        # 显示宽度不是语义：5.7 写出的 tinyint(4) 归一后是裸基名
+        "category.level": ("tinyint", "tinyint(4)"),
+        # 本来就规范的字面：归一不该动它们
+        "customer.phone": ("char(11)", "char(11)"),
+        "payment_record.trade_no": ("varchar(40)", "varchar(40)"),
+        "user_activity_log.extra": ("json", "json"),
+        # enum 塌成基名，取值清单住在 enum_values，原文照旧完整留在 raw
+        "order_main.status": (
+            "enum",
+            "enum('pending','paid','shipped','completed','cancelled','refunding')",
+        ),
+    }
+    got = {
+        name: (str(by_column[name]["data_type"]), str(by_column[name]["raw_data_type"]))
+        for name in expected
+    }
+    assert got == expected, json.dumps(got, ensure_ascii=False)

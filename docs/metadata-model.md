@@ -201,7 +201,7 @@ UNIQUE (datasource_id, catalog_name, schema_name, table_name)
 
 ```
 id / table_id FK CASCADE / ordinal_position int / column_name
-data_type text            -- 归一化后：'int','bigint','varchar(64)','decimal(18,2)','datetime',...
+data_type text            -- 归一化后：'int','bigint','varchar(64)','numeric(10,2)','datetime',...
 raw_data_type text        -- 方言原文 longtext / character varying / enum('a','b')
 nullable bool / default_value text / is_generated bool
 comment_raw text / comment_zh text / business_desc text
@@ -973,6 +973,10 @@ LEFT JOIN pg_stat_user_indexes s ON s.indexrelid=ic.oid
 WHERE pn.nspname = ANY(%s) AND tc.relname = ANY(%s)
 ORDER BY tc.relname, ic.relname, x.ord;
 -- attnum=0 表示表达式索引列 → column_name 为 NULL，从 pg_get_indexdef 里回捞表达式
+-- as-built(P3-023)：上面那句 `t.typname AS data_type` 到落库前不再是终值——`data_type` 存归一值，
+-- 原料要取 `raw_data_type`（`format_type` 的人话名，带精度与 `[]`）过 `postgres_types.normalize()`；
+-- `typname` 既没有长度（`varchar` 而不是 `character varying(64)`）、数组又是下划线形态，
+-- 拿它当归一结果会抹掉 §9 要求保留的括号。接线归工单 024（PG 抽取器本体），本片只交付那个纯函数。
 
 -- E. foreign keys（pg_constraint）
 SELECT sn.nspname, rc.relname AS table_name, con.conname,
@@ -1003,14 +1007,47 @@ PG `format_type` → 内部 `data_type`：`character varying(64)→varchar(64)`�
 单测要覆盖的归一映射：
 
 - PG：`_text[]` / `numeric(10,2)` / `varchar(64)` / `timestamptz` / `jsonb` / `serial` / `generated always`
-- MySQL：`decimal unsigned zerofill` / `enum('a','b')` / `set` / `tinyint(1)`（→bool 与否）/ `datetime(3)` /
-  生成列 / `utf8mb4_0900_ai_ci`（8.0 的排序规则出现在输入时的容错）
+- MySQL：`decimal unsigned zerofill`（→ `numeric(10,0)`，见下方 as-built(023) 的塌板结论）/
+  `enum('a','b')` / `set` / `tinyint(1)`（→ `bool`，已拍板，结论与三条理由见本节末 as-built(023)）/
+  `datetime(3)` / 生成列 / `utf8mb4_0900_ai_ci`（8.0 的排序规则出现在输入时的容错）
 
-> **as-built(0007)：§9 的归一化整体还没实现**，007 只保证两列都留着：
-> `data_type` = IS 的 `DATA_TYPE` 原文、`raw_data_type` = `COLUMN_TYPE` 原文（含 unsigned/zerofill/长度）。
-> `postgres_types.py::normalize()` 尚未有落点（PG 抽取整条没做）；MySQL 侧的
-> `tinyint(1)→bool`、`decimal unsigned zerofill` 修饰也没人归一——上表那些映射现在只有
-> "raw 还在、将来归一有原料"这层保证。归一放抽取层还是卡片层没定，动工前先补决策。
+> **as-built(0007) 已被 as-built(023) 取代**：0007 时归一还没落，两列都只存原文。工单 023 把
+> 归一化接到了**抽取层（写侧）**——这是本轮拍板的落点（不再放卡片层，避免"多处重复归一"）。
+
+> **as-built(P3-023)：§9 的归一化已在抽取层落地，`data_type` 从此是归一值、`raw_data_type` 仍是
+> 方言原文。** 具体：
+> - 归一放**抽取层（写侧）**。MySQL 接线在 `extractor/mysql.py::rows_to_columns()`——
+>   `data_type = mysql_types.normalize(COLUMN_TYPE)`、`raw_data_type = COLUMN_TYPE`（原文照存，
+>   `unsigned`/`zerofill`/显示宽度这些修饰只有原文看得见，"raw 还在"那层保证没破）。
+>   `DATA_TYPE` 那一格从此不再是 `data_type` 的来源：归一只看 `COLUMN_TYPE`（它才带宽度与修饰）。
+> - 落点两个，对称命名：`app/extractor/postgres_types.py::normalize()`（§9 指名；PG 抽取器本体是
+>   工单 024 的活，本片只交付这个纯函数 + 用例，不接 PG 的 SQL）与
+>   `app/extractor/mysql_types.py::normalize()`。两者都只做方言原料的**解析**，映射与规范字面
+>   全收在 `app/extractor/type_normalize.py` 这**一处**（`VALUE_DOMAIN` 值域 + `PG_SYNONYMS` /
+>   `MYSQL_SYNONYMS` 两张表 + `compose`）——全仓不许出现第二份映射字面，两方言的 `data_type`
+>   值域由测试侧那张**同一张断言表** `tests/unit/test_type_domain.py` 钉住（那张表自己也是一条用例，
+>   文件名以 `test_` 开头是为了让它被收集执行）。
+> - **`tinyint(1) → bool` 已拍板**。三条理由：① 归一的目的是跨方言可比，PG 的 `boolean` 归一后
+>   就是 `bool`，MySQL 若保留 `tinyint(1)` 会造出"同一语义两种字面"；② `raw_data_type` 继续存
+>   方言原文，`tinyint(1)` 没丢；③ 两方言共用同一结论是工单已定口径。据此本节那条"（→bool 与否）"
+>   的问号收掉：MySQL 与 PG 的布尔都归一到 `bool`。`tinyint(4)` 不在此列——它是窄整型，归 `tinyint`。
+> - **任意精度小数两方言都归 `numeric`，值域里没有 `decimal` 这个基名**（2026-09-30 补拍）。
+>   PG 的 `numeric`/`decimal` 与 MySQL 的 `decimal`/`numeric`/`dec`/`fixed` 本是同一家族的方言语面，
+>   各留一个名字就是"同一语义两种字面"，卡片与 prompt 跨方言比较时还得再归一次。代价是 MySQL 侧
+>   `data_type` 写出来的字面（`numeric(12,2)`）不是 MySQL 用户眼里的名字——所以 `raw_data_type`
+>   必须一直在：那里存的仍是 `decimal(12,2)`。
+> - 归一口径要点：变长/定长字符与 numeric/datetime/time/timestamp 保留长度或精度括号
+>   （`varchar(32)` / `numeric(10,2)` / `datetime(3)`，两方言同形状）；整型显示宽度（`bigint(20)`/
+>   `int(11)`/`tinyint(4)`）不是语义、归一后剥掉；`enum('a','b')`/`set('a','b')` 塌成基名
+>   `enum`/`set`（取值清单住在 `meta_column.enum_values`，卡片正文在那里渲染）；PG 数组
+>   `integer[]`→`int[]`、下划线 typname `_int4`→`int[]` 一并断出形状，二维保留层级（`int[][]`）；
+>   `serial` 取物理基名 `int`；`GENERATED ALWAYS` 是列属性、归一从原料里剥出类型部分。
+> - 真跑证据（验收 5）：`tests/integration/test_sync_live.py` 最后一张用例对真演示库跑一轮同步，
+>   把 `meta_column` 每一列的 `data_type` 逐个过共享值域断言，并点名八列比对
+>   `(data_type, raw_data_type)` 成对——包括 `order_item.is_gift` 的 `bool`/`tinyint(1)` 与
+>   `order_main.amount` 的 `numeric(12,2)`/`decimal(12,2)`。视图聚合列的精度由引擎算，只断"落在值域内"。
+> - 归一后卡片与 prompt 因此能跨方言说话：golden 快照里出现的类型字面就是归一值
+>   （`varchar` 现在带长度成 `varchar(32)`；`bigint`/`int`/`enum` 这类本就规范的字面不变）。
 
 ## 10. MySQL 5.7 特有的两个坑（写进代码注释）
 

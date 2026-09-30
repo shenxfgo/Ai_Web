@@ -29,6 +29,11 @@ TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "app" / "prompts" / "card_
 # 断言被测模块自己的常数只会证明"代码等于代码"，改数时两边一起动、测试永远不会红。
 _TOKEN_BUDGET_PER_CARD = 900
 
+# 工单 023 之后，卡片里出现的 `data_type` 是**归一值**（`meta_column.data_type` 现在存归一结果、
+# 方言原文在 `raw_data_type`）。下面的夹具因此按归一口径取值：`varchar` 带上了长度
+# （`varchar(32)`，与 `information_schema` 的 `COLUMN_TYPE` 同源）、整型不带显示宽度、
+# `enum` 塌成基名。归一映射本身由 `test_pg_type_normalize.py` / `test_mysql_type_normalize.py`
+# 和共享断言表 `test_type_domain.py` 钉；这里只保证"渲染器把归一后的 data_type 原样打进正文"。
 _MYSQL_57 = "不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY"
 
 
@@ -58,7 +63,7 @@ def _no_pk_table() -> TableMeta:
         approx_rows=12345,
         last_update="2026-09-20",
         columns=(
-            ColumnMeta(name="event_type", data_type="varchar", comment_zh="事件类型"),
+            ColumnMeta(name="event_type", data_type="varchar(32)", comment_zh="事件类型"),
             ColumnMeta(name="ts", data_type="datetime", comment_zh="事件时间"),
         ),
         server_major="5.7",
@@ -78,7 +83,7 @@ def _enum_table() -> TableMeta:
             ),
             ColumnMeta(
                 name="order_no",
-                data_type="varchar",
+                data_type="varchar(32)",
                 nullable=False,
                 is_unique=True,
                 comment_zh="订单号",

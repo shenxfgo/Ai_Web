@@ -299,10 +299,21 @@ def _enum_values(enum_def: object) -> tuple[str, ...] | None:
 
 
 def rows_to_columns(rows: Sequence[Row], *, schema_name: str = "") -> list[RawColumn]:
-    """§8.1 C 的行。列查询按 `:schema` 过滤、不 SELECT TABLE_SCHEMA，所以 schema 由调用方补。"""
+    """§8.1 C 的行。列查询按 `:schema` 过滤、不 SELECT TABLE_SCHEMA，所以 schema 由调用方补。
+
+    工单 023：`data_type` 从"方言原文"变成**归一值**（`mysql_types.normalize(COLUMN_TYPE)`），
+    `raw_data_type` 继续存 `COLUMN_TYPE` 方言原文（§9 的"raw 还在"那层保证不许破——
+    `unsigned`/`zerofill`/显示宽度这些修饰只有原文里看得见）。归一放在抽取层（写侧），
+    卡片层不再各归一次。
+    """
+    # 局部 import：归一函数与本模块同层，放在函数级是为了不牵动顶部那批
+    # "抽取器才需要的" import（type_normalize 是纯映射，探针与连接路径用不到它）。
+    from app.extractor import mysql_types
+
     out: list[RawColumn] = []
     for row in rows:
         extra = str(row["EXTRA"] or "")
+        column_type = str(row["COLUMN_TYPE"])
         out.append(
             RawColumn(
                 catalog_name="",
@@ -310,8 +321,8 @@ def rows_to_columns(rows: Sequence[Row], *, schema_name: str = "") -> list[RawCo
                 table_name=str(row["TABLE_NAME"]),
                 column_name=str(row["COLUMN_NAME"]),
                 ordinal_position=_counter(row["ORDINAL_POSITION"]),
-                data_type=str(row["DATA_TYPE"]),
-                raw_data_type=str(row["COLUMN_TYPE"]),
+                data_type=mysql_types.normalize(column_type),
+                raw_data_type=column_type,
                 nullable=str(row["IS_NULLABLE"]) == "YES",
                 default=_text(row["COLUMN_DEFAULT"]),
                 # auto_increment 也在 EXTRA 里，但它不是生成列

@@ -147,7 +147,7 @@ class MetaColumn(Base):
     )
     ordinal_position: Mapped[int] = mapped_column(Integer, nullable=False)
     column_name: Mapped[str] = mapped_column(Text, nullable=False)
-    # 归一化后（'int' / 'varchar(64)' / 'decimal(18,2)'）与方言原文（longtext / enum('a','b')）
+    # 归一化后（'int' / 'varchar(64)' / 'numeric(10,2)'）与方言原文（longtext / enum('a','b')）
     data_type: Mapped[str] = mapped_column(Text, nullable=False)
     raw_data_type: Mapped[str] = mapped_column(Text, nullable=False)
     nullable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))

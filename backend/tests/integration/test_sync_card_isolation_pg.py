@@ -329,6 +329,8 @@ async def test_卡片失败隔离不漏到元数据侧_注入前后meta行数一
 # 场景选取口径：六个窄场景里注释/粒度全走人工列的（order_main 的索引在 golden 里是
 # 手写序、而读料 SQL 按 is_primary DESC + index_name 排序——两条路的"顺序"本来就是两回事，
 # 硬比会把渲染器的契约读歪），所以取输入能由 `meta_*` 行**原样**复现的五个场景。
+# as-built(P3-023)：种子里的 `data_type` 字面跟着归一走了（`varchar` → `varchar(32)`），
+# 快照那份是 023 重录过的——事务边界的断言与类型字面的断言是两回事，这里仍只比文本。
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "prompts"
 
@@ -427,8 +429,8 @@ async def test_未注入时写进库的卡片文本与008golden快照逐字符�
             t_pk,
             1,
             "event_type",
-            data_type="varchar",
-            raw_data_type="varchar",
+            data_type="varchar(32)",
+            raw_data_type="varchar(32)",
             comment_zh="事件类型",
         )
         _seed_column(
