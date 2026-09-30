@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Final
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import Connection, Engine
@@ -219,16 +221,63 @@ def _charset_from_collation(collation: str | None) -> str | None:
     return None if collation is None else collation.partition("_")[0]
 
 
-def rows_to_tables(rows: Sequence[Row]) -> list[RawTable]:
+def _stamp_to_aware(value: object, zone: dt.tzinfo) -> dt.datetime | None:
+    """P3-022 时区口径：MySQL 的 `datetime` 无时区，目标列是 `timestamptz`——转换显式做，
+    不许靠驱动隐式转换（011 那批 `serialize_cell` 的时区教训同源）。
+
+    驱动解出的 naive `datetime` 按**源库所在机器时区**显式 attach；本身已带时区的值原样透传
+    （今天 pymysql 对 IS 这两列给的就是 naive，走到后者属于防御）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=zone)
+        return value
+    # IS 的时间列个别构建/驱动组合下回字符串：显式解析再挂时区，同样不走驱动的隐式转换
+    parsed = dt.datetime.fromisoformat(str(value))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=zone)
+
+
+def _source_machine_zone() -> dt.tzinfo:
+    """源库所在机器的时区（P3-022 拍板：本机演示库 = 与 API 同区）。
+
+    首选 `zoneinfo`：`TZ` 环境变量给了 IANA 键且平台有 tzdata 时拿到的就是 ZoneInfo。
+    平台取不到本地 IANA 键时（Windows 的 `zoneinfo.TZPATH` 是空的，系统时区也没有公开的
+    反查接口）退回机器当前 UTC 偏移的**显式**固定偏移——演示区（中国标准时间）全年无夏令时，
+    这一替换不损失信息；真部署到带 DST 的区时由 024 一并升级为可配置键。
+    """
+    key = os.environ.get("TZ")
+    if key:
+        try:
+            return ZoneInfo(key)
+        except (KeyError, ValueError):
+            pass  # tzdata 缺失的平台上 TZ 也可能是 Windows 本地化名，落回偏移档
+    offset = dt.datetime.now().astimezone().utcoffset()
+    return dt.timezone(offset) if offset is not None else dt.UTC
+
+
+def rows_to_tables(rows: Sequence[Row], *, source_tz: dt.tzinfo | None = None) -> list[RawTable]:
+    zone = source_tz if source_tz is not None else _source_machine_zone()
     out: list[RawTable] = []
     for row in rows:
         collation = _text(row["TABLE_COLLATION"])
+        table_type = str(row["table_type"])
+        # P3-022 拍板（metadata-model §2.4）：视图**不给造新鲜度**——MySQL 里视图行的
+        # CREATE_TIME 是定义时间、UPDATE_TIME 常为 NULL 且语义都不是"数据被更新"，
+        # 所以这一支不读那两列，恒 NULL；"没有"在这里不是 bug。
+        freshness: dt.datetime | None = None
+        if table_type != "VIEW":
+            # 已定口径：UPDATE_TIME 优先；UPDATE_TIME 为空则退回 CREATE_TIME；两者都空则 NULL
+            freshness = _stamp_to_aware(row["UPDATE_TIME"], zone) or _stamp_to_aware(
+                row["CREATE_TIME"], zone
+            )
         out.append(
             RawTable(
                 catalog_name="",  # §1：MySQL 的 catalog 恒空串，不塞 IS 里那个 'def'
                 schema_name=str(row["TABLE_SCHEMA"]),
                 table_name=str(row["TABLE_NAME"]),
-                table_type=str(row["table_type"]),
+                table_type=table_type,
                 comment=_text(row["TABLE_COMMENT"]),
                 engine=_text(row["ENGINE"]),
                 charset=_charset_from_collation(collation),
@@ -237,6 +286,7 @@ def rows_to_tables(rows: Sequence[Row]) -> list[RawTable]:
                 data_bytes=_int(row["DATA_LENGTH"]),
                 index_bytes=_int(row["INDEX_LENGTH"]),
                 row_format=_text(row["ROW_FORMAT"]),
+                last_analyze_at=freshness,
             )
         )
     return out

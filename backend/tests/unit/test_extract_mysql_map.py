@@ -6,9 +6,13 @@
   在驱动里回来的形状是实测过的：5.7 的布尔表达式回 int 0/1
 - 同文 §9：`enum('a','b')` 要拆成值清单，中文枚举值直接决定 where 能否命中
 - 同文 §10.1：5.7 的 IS 中文注释可能整片回 `???`，占比 >0.3 要打 `CHARSET_SUSPECT`
+- 同文 §2.4 as-built(P3-022)：`last_analyze_at` 的取值口径（UPDATE_TIME 优先 → 退回
+  CREATE_TIME → 都空 NULL；视图恒 NULL；naive datetime 按源库机器时区**显式**挂时区）
 """
 
 from __future__ import annotations
+
+import datetime as dt
 
 from app.extractor.mysql import (
     apply_index_flags,
@@ -290,6 +294,124 @@ def test_中文注释整片变成问号时必须报_charset_suspect() -> None:
     assert comment_charset_suspect(good) is False
     assert comment_charset_suspect(bad) is True
     assert comment_charset_suspect([]) is False, "一条注释都没有时不算乱码"
+
+
+# ---------------------------------------------------------------------------
+# P3-022：last_analyze_at 的取值口径（工单 022 已定口径，写进 metadata-model §2.4）
+# ---------------------------------------------------------------------------
+
+
+def _trow(
+    name: str,
+    *,
+    create: object = None,
+    update: object = None,
+    table_type: str = "BASE TABLE",
+) -> dict[str, object]:
+    """§8.1 B 的一行最小形状：只关心 CREATE_TIME / UPDATE_TIME，其余给齐键就够。"""
+    return {
+        "TABLE_SCHEMA": "ai_web_demo",
+        "TABLE_NAME": name,
+        "table_type": table_type,
+        "TABLE_COMMENT": "",
+        "ENGINE": "InnoDB",
+        "ROW_FORMAT": "Dynamic",
+        "TABLE_COLLATION": "utf8mb4_general_ci",
+        "TABLE_ROWS": 10,
+        "DATA_LENGTH": 16384,
+        "INDEX_LENGTH": 0,
+        "CREATE_TIME": create,
+        "UPDATE_TIME": update,
+    }
+
+
+def test_tables_只有_CREATE_TIME_时退回它并显式挂上源库机器时区() -> None:
+    """口径第一支：`UPDATE_TIME` 为空则退回 `CREATE_TIME`。
+
+    时区口径（P3-022 拍板，metadata-model §2.4）：MySQL 的 datetime 无时区、目标列是
+    timestamptz，转换必须显式——抽取层按源库所在机器时区 attach，不许靠驱动隐式转换。
+    期望值是手算的：东八区 18:30 的墙上时间，同一瞬间在 UTC 是 10:30。
+    """
+    east8 = dt.timezone(dt.timedelta(hours=8))
+    (table,) = rows_to_tables(
+        [_trow("order_main", create=dt.datetime(2026, 9, 28, 18, 30))], source_tz=east8
+    )
+    assert table.last_analyze_at == dt.datetime(2026, 9, 28, 18, 30, tzinfo=east8)
+    assert table.last_analyze_at is not None
+    in_utc = table.last_analyze_at.astimezone(dt.UTC)
+    assert in_utc == dt.datetime(2026, 9, 28, 10, 30, tzinfo=dt.UTC)
+
+
+def test_tables_时间戳以字符串回来时同样显式解析并挂时区() -> None:
+    """防御支钉住：个别驱动/构建组合下 IS 时间列回字符串——口径不变，仍是"显式转换，
+    不靠驱动隐式行为"（P3-022 时区拍板，metadata-model §2.4），期望值与第一支同一手算。
+    """
+    east8 = dt.timezone(dt.timedelta(hours=8))
+    (table,) = rows_to_tables([_trow("order_main", create="2026-09-28 18:30:00")], source_tz=east8)
+    assert table.last_analyze_at == dt.datetime(2026, 9, 28, 18, 30, tzinfo=east8)
+
+
+def test_tables_两者都有时取_UPDATE_TIME_只有_UPDATE_TIME_也同样取它() -> None:
+    """口径第二支：`UPDATE_TIME` 优先。期望值手算：东八区 2026-09-29 07:15 → UTC 前一日 23:15。
+
+    注意钉的方向：5.7 的 InnoDB `UPDATE_TIME` 在服务器重启后归 NULL（工单 022 明示），
+    所以这里只钉"有值时取谁"，真跑落到哪一支由 live 用例看事实，不预设。
+    """
+    east8 = dt.timezone(dt.timedelta(hours=8))
+    rows = [
+        _trow(
+            "order_main",
+            create=dt.datetime(2026, 1, 5, 9, 0),
+            update=dt.datetime(2026, 9, 29, 7, 15),
+        ),
+        _trow("product", update=dt.datetime(2026, 9, 2, 20, 5)),
+    ]
+    order, product = rows_to_tables(rows, source_tz=east8)
+    assert order.last_analyze_at == dt.datetime(2026, 9, 29, 7, 15, tzinfo=east8)
+    assert product.last_analyze_at == dt.datetime(2026, 9, 2, 20, 5, tzinfo=east8)
+
+
+def test_tables_两者都空时_last_analyze_at_是_NULL() -> None:
+    """口径第三支：两者都空则 NULL——视图不给造新鲜度，基表也不许造。
+
+    这条在 P3-022 之前是**唯一走得通的支**（映射整列没接，恒 NULL）；接上之后它仍是
+    5.7 重启后的真实形态，所以值得单独钉，而不是只藏在上面两条的边角里。
+    """
+    (table,) = rows_to_tables([_trow("order_main")], source_tz=dt.UTC)
+    assert table.last_analyze_at is None
+
+
+def test_tables_视图那一行恒_NULL_两个时间戳都不许冒充数据更新时间() -> None:
+    """P3-022 拍板（metadata-model §2.4）：视图**不给造新鲜度**。
+
+    MySQL 里视图行的 CREATE_TIME 是**定义时间**、UPDATE_TIME 语义上也不是"数据被更新"——
+    任何一个填进去都是给【规模】那句"最近更新"喂一个假日期。所以视图这半边不是"恰好为
+    NULL"（视图的 UPDATE_TIME 常为 NULL 不是 bug），而是**无论 IS 回了什么都不读**。
+    """
+    east8 = dt.timezone(dt.timedelta(hours=8))
+    rows = [
+        _trow(
+            "v_daily_sales",
+            create=dt.datetime(2026, 9, 1, 8, 0),
+            update=dt.datetime(2026, 9, 20, 23, 30),
+            table_type="VIEW",
+        )
+    ]
+    (view,) = rows_to_tables(rows, source_tz=east8)
+    assert view.last_analyze_at is None
+
+
+def test_tables_不传时区时按本机时区显式挂上而不是留_naive() -> None:
+    """默认口径：真实链路（`collect()`）不传 `source_tz`，取的是**源库所在机器**的时区。
+
+    期望值不经过被测助手，走标准库自己的口径：`naive.astimezone(...)` 在 PEP 与
+    `datetime` 文档里明写"naive 输入按系统本地时区解释"——与拍板口径同一句话，两个来源。
+    """
+    naive = dt.datetime(2026, 9, 28, 18, 30)
+    (table,) = rows_to_tables([_trow("order_main", create=naive)])
+    got = table.last_analyze_at
+    assert got is not None and got.tzinfo is not None, "naive datetime 进 timestamptz 列就是事故"
+    assert got.astimezone(dt.UTC) == naive.astimezone(dt.UTC)
 
 
 def _col(name: str) -> dict[str, object]:

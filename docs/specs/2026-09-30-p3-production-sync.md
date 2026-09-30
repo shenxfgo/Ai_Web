@@ -126,6 +126,10 @@ P2 交付的同步是**请求内跑完**的：`POST /api/sync/jobs` 同步调用
     那条账里"`RawTable` 也没有对应字段"半句失实，本片一并改口）。
     PG 侧的对应原料 §8.2 B 早已写好——那条 SQL 就 SELECT 了 `s.last_analyze, s.last_autoanalyze`
     （`metadata-model.md:809-812`，LEFT JOIN `pg_stat_user_tables`），取哪一个的口径归 024 落地。
+    **as-built(022)：MySQL 半边已落**——取值口径（UPDATE_TIME 优先 → 退回 CREATE_TIME → 都空
+    NULL；视图恒 NULL；时区显式 attach）逐字写进 `metadata-model §2.4`，上面引的"没有对应字段"
+    失实半句就此收口（全链只有 `rows_to_tables()` 那一处映射，已补）；PG 半边（取较晚者）留在
+    024 落地。
 
 ## 4. 已定决策（不要翻案）
 

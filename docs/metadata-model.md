@@ -166,7 +166,7 @@ business_desc text NULL      -- 业务描述："这张表记录什么、粒度�
 granularity   text NULL      -- 'one row = ?'  ← 极大提升 NL2SQL 准确率，人工填
 engine / row_format / collation / charset text NULL
 approx_rows bigint NULL / data_bytes / index_bytes bigint NULL
-last_analyze_at timestamptz NULL   -- 统计新鲜度；太旧提示 AI 别信 row count
+last_analyze_at timestamptz NULL   -- 统计新鲜度；太旧提示 AI 别信 row count（取值口径见下方 as-built(P3-022)）
 is_hidden bool DEFAULT false       -- 手工排除某些表（临时表/备份表 _old/_bak）
 is_stale bool                      -- 本次同步未出现的表打陈旧标记，不物理删
 synced_at / created_at
@@ -180,6 +180,22 @@ UNIQUE (datasource_id, catalog_name, schema_name, table_name)
 > `quoted_name("collation", True)`（见 `app/models/meta.py` 的 `COLLATION_COL`）。
 > ② §2.4 标题写"6 张"是对的，但按前缀数容易漏掉子表 **`meta_index_column`**——0004 落地的就是
 > 六张 + `sync_jobs`（§2.5）。
+
+> as-built(P3-022)：**`last_analyze_at` 的取值口径**（工单 022 拍板，MySQL 半边已落
+> `rows_to_tables()`；这一列的注释语义是"统计新鲜度"，口径钉死在这里，方言层照抄）：
+> ① **`last_analyze_at` = UPDATE_TIME 优先；UPDATE_TIME 为空则退回 CREATE_TIME；两者都空则 NULL**。
+> 5.7 的 InnoDB `UPDATE_TIME` 在服务器重启后归 NULL，所以"退回 CREATE_TIME"是常态支而不是兜底摆设。
+> ② **视图不给造新鲜度**：`table_type='VIEW'` 这一行恒 NULL——MySQL 里视图的 CREATE_TIME 是
+> **定义时间**、UPDATE_TIME 常为 NULL，两者都不是"数据被更新"，填进去就是给卡片那句
+> "最近更新 D"喂假日期的假新鲜度；NULL 在这里不是 bug。
+> ③ **时区口径**：MySQL 的 `datetime` 无时区、本列是 `timestamptz`，转换必须显式——抽取层
+> （`app/extractor/mysql.py` 的 `_stamp_to_aware`）按**源库所在机器时区**用 `zoneinfo` 显式
+> attach 后交给下游，不许靠驱动的隐式转换（011 那批 `serialize_cell` 的时区教训同源）。
+> 平台取不到 IANA 键时（如 Windows 的 `zoneinfo.TZPATH` 为空）退回机器当前 UTC 偏移的显式
+> 固定偏移；演示库与 API 同机同区，该替换无信息损失。
+> ④ **PG 侧预留**（落地归 024，本片不做——PG 抽取器今天还不存在）：原料是 §8.2 B 里
+> `LEFT JOIN pg_catalog.pg_stat_user_tables` 带出的 `s.last_analyze, s.last_autoanalyze`，
+> 两个值**取较晚者，都为 NULL 则 NULL**。
 
 **`aiweb.meta_column`**
 

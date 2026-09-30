@@ -169,6 +169,13 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 >   `pg_stat_user_tables.last_analyze`，007 也没做。**这是 007 的账，不是卡片层的**——
 >   008 只在 golden 里手喂 `last_update` 钉住"有值时怎么渲染"。下一张碰抽取器的工单要么补映射、
 >   要么把这一支从模板里删掉，别让它长期挂一个永不成立的分支（P3 由工单 022 认领补映射）。
+>   **as-built(P3-022)：这一支收口了——选的是"补映射"那半边。** `rows_to_tables()` 现在按
+>   `metadata-model §2.4` 拍定的取值口径落 `RawTable.last_analyze_at`（UPDATE_TIME 优先、
+>   为空退回 CREATE_TIME、都空则 NULL；视图恒 NULL 不造新鲜度；naive datetime 按源库机器时区
+>   显式挂时区），MySQL 侧该列不再是恒 NULL，卡片【规模】那句"最近更新 D"在真数据上会成立。
+>   golden 快照未动（008 手喂的那几份照旧逐字符相同，改的是原料供给不是文本构造）。
+>   残余未收：PG 侧要读 `pg_stat_user_tables.last_analyze / last_autoanalyze`（§8.2 B 的 SQL
+>   已带出两列，取较晚者的口径已写进 §2.4），落地归 024。
 
 卡片编辑的语义：编辑后 `template_version` 不变但 `content_hash` 变，标记"人工修订"，
 并触发该表 embedding 重算（`POST /kb/reembed {table_id}`）。
