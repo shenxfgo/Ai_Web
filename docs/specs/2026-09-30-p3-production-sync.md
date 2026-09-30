@@ -110,11 +110,17 @@ P2 交付的同步是**请求内跑完**的：`POST /api/sync/jobs` 同步调用
     `_text` / `_int4` / `_numeric` / `_timestamptz` / `_varchar` / `[]` / `_jsonb`。
 23. MySQL 侧同片归一：`decimal unsigned zerofill`、`enum('a','b')`、`set`、`datetime(3)` 一起处理，
     两方言的 `data_type` 口径一致（否则会出现 MySQL 存 `varchar`、PG 存 `varchar(64)`）。
-    008 的 7 份 golden 卡片因此要重录——**这是本片已知的影响面，不是回归**。
+    卡片 golden 快照因此要重录——现 8 份 `tests/fixtures/prompts/kb_card__*.expected.txt`，
+    逐份只许在类型字面处变化。**这是本片已知的影响面，不是回归**。
     `tinyint(1)` 归成 `bool` 还是保留原样，由 008 侧的用例先拍一次并写进文档，不许两方言各走一边。
-24. `CREATE_TIME` / `UPDATE_TIME` 映射进 `RawTable`（SQL 早已 SELECT 了，`mysql.py:84`，
-    但 `rows_to_tables()` 没接，`base.py:70-87` 连字段都没有）。后果是 `meta_table.last_analyze_at`
-    至今恒 NULL、卡片【规模】那句"最近更新"永不出现（008 账 ⑤ 明写"归下一张碰抽取器的工单"——就是这张）。
+24. `CREATE_TIME` / `UPDATE_TIME` 接进映射：SQL 早已 SELECT 了（`mysql.py:84`），`RawTable` 的
+    `last_analyze_at` 字段**也在**（`base.py:87`），下游 upsert 与卡片渲染都通了
+    （`sync_service.py:97`、`:375`、`kb_service.py:422`）——**缺的只有 `rows_to_tables()`
+    （`mysql.py:181-201`）没读那两列**。后果是 `meta_table.last_analyze_at` 至今恒 NULL、
+    卡片【规模】那句"最近更新"永不出现（008 账 ④ 明写"归下一张碰抽取器的工单"——就是这张。
+    那条账里"`RawTable` 也没有对应字段"半句失实，本片一并改口）。
+    PG 侧的对应原料 §8.2 B 早已写好——那条 SQL 就 SELECT 了 `s.last_analyze, s.last_autoanalyze`
+    （`metadata-model.md:809-812`，LEFT JOIN `pg_stat_user_tables`），取哪一个的口径归 024 落地。
 
 ## 4. 已定决策（不要翻案）
 
@@ -175,6 +181,14 @@ P2 交付的同步是**请求内跑完**的：`POST /api/sync/jobs` 同步调用
   ——`aiweb` 是真元数据库，`alembic_version` 至今停在 0002，别把"真库没这些表"当 bug，也别对它发 DDL。
 - **迁移**：`0007_sync_event`（建 `sync_job_event`）。ORM ↔ 迁移漂移的 `alembic check` 至今没接线，
   所以建表那一条要人工比对 `models/meta.py` 一次。
+- **PG 源驱动这一格是空的**（024 开工前必读）：`source_manager.py:23` 把 `kind='postgres'` 映射到
+  `postgresql+psycopg`，而 `psycopg` **根本不在依赖里**（`pyproject.toml` 只有 `asyncpg`（元数据库）+
+  `asyncmy` + `pymysql`）。本机实测：`create_async_engine("postgresql+psycopg://…")` →
+  `ModuleNotFoundError: No module named 'psycopg'`——也就是说今天登记一个 PG 源点"测试连接"就炸在方言加载。
+  `architecture §9` 的驱动表对此还写着两条打架的话（`:760`"psycopg3 的 async 方言在 SA 2.0 不可用"、
+  `:763`"源 PG 抽取用 psycopg 同步"）。**`:760` 那句已被证伪**：本机 SQLAlchemy 2.0.54 的
+  `postgresql/psycopg.py` 模块文档就写着 `create_async_engine` 用法（详见 §9 的 as-built 注）。
+  024 因此走"补 `psycopg[binary]` 依赖 + 异步方言"这条路，但仍要**真连一次 `ai_web_demo_pg`** 才算数。
 - **dev.ps1 / Makefile**：worker 是本机第二条命令，`scripts/dev.ps1` 与 roadmap §6 那张目标表要一起改，
   否则用户会遇到"点了同步但进度永远不动"——那正是入队成功而没人消费的形状。
 - **Windows 约束**：worker 脚本顶部要照 P1 的坑补上 Selector 事件循环策略

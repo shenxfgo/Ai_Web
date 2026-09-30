@@ -161,11 +161,14 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 >   说的就是整张表，报本卡列数会让 AI 以为宽表只有 26 列。）
 > ④ **`【规模】…，最近更新 D` 这一支在 P2 的真数据上恒不出现**：`last_update` 取自
 >   `meta_table.last_analyze_at`，而 MySQL 抽取器虽然 SELECT 了 `UPDATE_TIME`
->   （`app/extractor/mysql.py` 的 §8.1 A 查询），`rows_to_tables()` 并没有把它落进 `RawTable`
->   （`RawTable` 也没有对应字段），所以 MySQL 侧该列至今为 NULL；PG 侧要读
+>   （`app/extractor/mysql.py` 的 §8.1 A 查询），`rows_to_tables()` 并没有把它落进 `RawTable`，
+>   所以 MySQL 侧该列至今为 NULL。**as-built(P3 切工时修正)**：原记"（`RawTable` 也没有对应字段）"
+>   是失实之语——字段在 `RawTable.last_analyze_at`（`app/extractor/base.py:87`），下游也通
+>   （`sync_service.py:97`/`:375` 的 upsert、`kb_service.py:422` 的渲染分支），**缺的只有方言层
+>   那一次映射**，所以这一支的账比原来记的更轻。PG 侧要读
 >   `pg_stat_user_tables.last_analyze`，007 也没做。**这是 007 的账，不是卡片层的**——
 >   008 只在 golden 里手喂 `last_update` 钉住"有值时怎么渲染"。下一张碰抽取器的工单要么补映射、
->   要么把这一支从模板里删掉，别让它长期挂一个永不成立的分支。
+>   要么把这一支从模板里删掉，别让它长期挂一个永不成立的分支（P3 由工单 022 认领补映射）。
 
 卡片编辑的语义：编辑后 `template_version` 不变但 `content_hash` 变，标记"人工修订"，
 并触发该表 embedding 重算（`POST /kb/reembed {table_id}`）。

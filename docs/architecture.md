@@ -763,6 +763,18 @@ Chat 单条 assistant 消息的分区（都是可折叠 panel，默认按阶段�
 | 源 PG（抽取） | `psycopg[binary]` 3.x（同步） | 单驱动支持 sync/async、binary wheel 免编译；DSN 与 asyncpg 不通用，抽取侧统一用 psycopg |
 | 源 PG（问数执行） | psycopg3 `AsyncConnection` | 与抽取共用驱动，减依赖面 |
 
+> **as-built(P3 切工时证实)**：上表有两格与本机现状不符，动 PG 抽取（工单 024）前先看这段。
+> ① `:760` 那句括号"psycopg3 的 async 方言在 SA 2.0 不可用"**已过时**——本机 SQLAlchemy 2.0.54 的
+> `dialects/postgresql/psycopg.py` 模块文档里就写着 `create_async_engine("postgresql+psycopg://…")`
+> 的用法，并且定义了 `AsyncAdapt_psycopg`。元数据库这一格**继续用 `asyncpg` 不改**（001 起所有开通
+> SQL、迁移与用例都对着 asyncpg 验过，换驱动零收益）。
+> ② `:763` 那格"源 PG（抽取）用 psycopg 同步"至今**没落地**：`psycopg` 根本不在依赖里
+> （`uv run python -c "import psycopg"` → `ModuleNotFoundError`），而 `source_manager.py:23` 早已把
+> `kind='postgres'` 映射到 `postgresql+psycopg`——今天登记一个 PG 源、点测试连接就会在方言加载处失败
+> （实机复现：`create_async_engine('postgresql+psycopg://…')` → `ModuleNotFoundError: No module
+> named 'psycopg'`）。024 据此选路：补 `psycopg[binary]` 依赖、走异步方言，`:763` 的"同步 + to_thread"
+> 口径作废，届时回写本表。
+
 - **不用 SQLAlchemy 的 `inspect()` 做远端反射**：MySQL 方言没有 `get_multi_*` 批量覆写，会逐表
   `SHOW CREATE TABLE` 正则解析（2000 表 = 2000+ 次往返），且丢 `STATISTICS.CARDINALITY`、`SUB_PART`、
   `TABLE_ROWS`、`ENGINE`。因此 MySQL/PG 两侧都**手写批量 information_schema / pg_catalog SQL**
