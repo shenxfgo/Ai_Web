@@ -3,7 +3,7 @@ SHELL := bash
 BACKEND := backend
 FRONTEND := frontend
 
-.PHONY: help bootstrap check-env migrate seed-admin demo-db dev dev-backend dev-frontend lint fmt typecheck test check clean
+.PHONY: help bootstrap check-env migrate seed-admin demo-db demo-db-pg dev dev-backend dev-frontend lint fmt typecheck test check clean
 
 help:
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/^\([a-z-]*\):.*## /\1\t/'
@@ -22,6 +22,9 @@ seed-admin: ## 建初始 admin（口令走 AIWEB_BOOTSTRAP_ADMIN_PASSWORD，为�
 
 demo-db: ## 建本机演示库 ai_web_demo（只探测、只建不删；建库账号走 backend/.setup/my_login.cnf）
 	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo_db.ps1
+
+demo-db-pg: ## 建本机 PG 演示源库 ai_web_demo_pg（P3 验收 6 的原料；口令走 backend/.setup/pg_login.env）
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/demo_pg.ps1
 
 dev-backend: ## 起 FastAPI（127.0.0.1:8000，热重载）
 	cd $(BACKEND) && uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
