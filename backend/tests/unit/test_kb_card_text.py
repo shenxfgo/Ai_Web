@@ -56,7 +56,7 @@ def test_字段清单每列一行_带类型可空性键标记和中文注释() -
             ),
             ColumnMeta(
                 name="pay_amount",
-                data_type="decimal(18,2)",
+                data_type="numeric(18,2)",
                 nullable=False,
                 comment_zh="实付金额",
             ),
@@ -67,7 +67,7 @@ def test_字段清单每列一行_带类型可空性键标记和中文注释() -
     text = cards[0].text_md
     assert "【字段】共 3 个" in text
     assert "- id bigint NOT NULL 主键: 订单ID" in text
-    assert "- pay_amount decimal(18,2) NOT NULL: 实付金额" in text
+    assert "- pay_amount numeric(18,2) NOT NULL: 实付金额" in text
     # 无注释列不能整行消失，否则模型不知道这列存在
     assert "- remark varchar(255) 可空: （无注释）" in text
 
@@ -219,7 +219,7 @@ def test_search_text_抹掉排版噪声但保留标识符与中文值() -> None:
         _table(
             ColumnMeta(
                 name="pay_amount",
-                data_type="decimal(18,2)",
+                data_type="numeric(18,2)",
                 comment_zh="实付金额",
             ),
             ColumnMeta(
@@ -255,7 +255,7 @@ def _wide_table(n: int) -> TableMeta:
     cols = [
         ColumnMeta(
             name=f"c{i}",
-            data_type="decimal(18,4)",
+            data_type="numeric(18,4)",
             comment_zh=f"指标{i}的中文口径说明",
         )
         for i in range(n)

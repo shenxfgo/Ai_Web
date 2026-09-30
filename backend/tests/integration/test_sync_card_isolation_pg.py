@@ -469,7 +469,7 @@ async def test_未注入时写进库的卡片文本与008golden快照逐字符�
             view,
             3,
             "gmv",
-            data_type="decimal(18,2)",
+            data_type="numeric(18,2)",
             raw_data_type="decimal(18,2)",
             comment_zh="成交额",
         )

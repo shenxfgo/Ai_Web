@@ -283,7 +283,7 @@ async def test_宽表落主卡加切片(session_factory) -> None:
                     tbl,
                     i + 1,
                     f"c{i}",
-                    data_type="decimal(18,4)",
+                    data_type="numeric(18,4)",
                     raw_data_type="decimal(18,4)",
                     comment_zh=f"指标{i}的中文口径说明",
                 )

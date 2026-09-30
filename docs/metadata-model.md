@@ -1047,7 +1047,11 @@ PG `format_type` → 内部 `data_type`：`character varying(64)→varchar(64)`�
 >   `(data_type, raw_data_type)` 成对——包括 `order_item.is_gift` 的 `bool`/`tinyint(1)` 与
 >   `order_main.amount` 的 `numeric(12,2)`/`decimal(12,2)`。视图聚合列的精度由引擎算，只断"落在值域内"。
 > - 归一后卡片与 prompt 因此能跨方言说话：golden 快照里出现的类型字面就是归一值
->   （`varchar` 现在带长度成 `varchar(32)`；`bigint`/`int`/`enum` 这类本就规范的字面不变）。
+>   （`varchar` 现在带长度成 `varchar(32)`；`decimal(18,2)` 写成 `numeric(18,2)`；
+>   `bigint`/`int`/`enum`/`date`/`text`/`numeric` 这类本就规范的字面不变）。八份快照里**只有三份**因此改了行，
+>   其余五份diff 为空——这是"每份 diff 只出现在类型字面处"的可核对版本。夹具侧另加一条守卫
+>   （`test_kb_card_golden.py` 的 `test_夹具里的每个类型字面都在归一值域内`），
+>   漏改一个类型字面会红，而不是两侧一起错还继续绿。
 
 ## 10. MySQL 5.7 特有的两个坑（写进代码注释）
 

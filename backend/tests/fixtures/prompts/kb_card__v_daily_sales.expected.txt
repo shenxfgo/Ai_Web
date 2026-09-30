@@ -5,5 +5,5 @@
 【字段】共 3 个：
 - day date 可空: 统计日
 - order_count bigint 可空: 订单数
-- gmv decimal(18,2) 可空: 成交额
+- gmv numeric(18,2) 可空: 成交额
 【方言】mysql 5.7 — 不支持 CTE 与窗口函数，且默认 ONLY_FULL_GROUP_BY

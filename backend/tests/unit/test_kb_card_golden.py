@@ -21,6 +21,7 @@ from app.services.kb_service import (
     TableMeta,
     build_cards,
 )
+from tests.unit.test_type_domain import assert_in_value_domain
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "prompts"
 TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "app" / "prompts" / "card_template.j2"
@@ -135,7 +136,7 @@ def _view_table() -> TableMeta:
         columns=(
             ColumnMeta(name="day", data_type="date", comment_zh="统计日"),
             ColumnMeta(name="order_count", data_type="bigint", comment_zh="订单数"),
-            ColumnMeta(name="gmv", data_type="decimal(18,2)", comment_zh="成交额"),
+            ColumnMeta(name="gmv", data_type="numeric(18,2)", comment_zh="成交额"),
         ),
         server_major="5.7",
     )
@@ -198,6 +199,18 @@ def test_窄表一张卡正文与golden逐字符相同(name: str, table: TableMe
     docs = build_cards(table)
     assert [d.kind for d in docs] == ["table"], "≤40 列不该切片（§6 第一行）"
     assert docs[0].text_md == _fixture(name)
+
+
+# 快照那份是手写的，类型字面只可能从**夹具取值**这一侧漂走：漏改一个 `decimal(18,2)`，
+# 正文就渲染出一个 023 之后库里再也不可能出现的字面，而逐字符比对照样是绿的（两侧一起错）。
+# 所以把共享断言表直接套到夹具上——测试 id 给表名，断言消息给类型字面。
+_ALL_CASES: list[tuple[str, TableMeta]] = [*_NARROW, ("product_stats_wide", _wide_table())]
+
+
+@pytest.mark.parametrize("name,table", _ALL_CASES, ids=[name for name, _ in _ALL_CASES])
+def test_夹具里的每个类型字面都在归一值域内(name: str, table: TableMeta) -> None:
+    for col in table.columns:
+        assert_in_value_domain(col.data_type)
 
 
 def test_宽表主卡与两张切片卡各自对golden() -> None:
