@@ -11,7 +11,8 @@ Ai_Web（AI 问数）的设计参考文档。内容以实施方案为准，规�
 | [roadmap.md](./roadmap.md) | P1–P10 阶段拆分（目标、涉及文件、验收标准、踩坑预警、人日与依赖图）、配置四层归属（L1 密钥 / L2 部署 / L3 运行 `app_settings` / L4 数据源级）与 env 键清单、启动自检项、Makefile/dev.ps1 目标表。 |
 | [verification.md](./verification.md) | 演示库 `ai_web_demo`（9 张业务表 + 1 视图、只建不删守卫、`aiweb_ro` SELECT-only 账号）、测试分层与无 PG 时的 skip 策略、15 步端到端手测清单、SSE 冒烟步骤。 |
 | [ui-design.md](./ui-design.md) | 前端设计契约（专业工具风）：`--aw-*` 令牌唯一来源与裸值禁令、Element Plus 按需接入（`base.css` + `--el-*` 覆盖，不引 `dist/index.css`、不用 sass）、外壳与页面骨架、空/加载/失败三态文案规范、图表色板与可访问性、每页验收清单。 |
-| [adr/](./adr/) | 9 条不可逆决策，每条 1 段：元数据库复用远端 PG 用 schema 隔离、只读三层防御与正向白名单、pgvector 可插拔、结果集落文件、`table_uid` 指纹算法、`knowledge/` 覆盖层单向回写、Fernet 而非 KMS、权限止于数据源级、不容器化。 |
+| [adr/](./adr/) | 11 条不可逆决策，每条 1 段：元数据库复用远端 PG 用 schema 隔离、只读三层防御与正向白名单、pgvector 可插拔、结果集落文件、`table_uid` 指纹算法、`knowledge/` 覆盖层单向回写、Fernet 而非 KMS、权限止于数据源级、不容器化、同步队列介质是 PG（接缝是 JobQueue Protocol）、同步在独立 worker 进程执行。 |
+| [specs/](./specs/) | 阶段级规格说明书（grill 走完共识后落笔）：`2026-09-30-p3-production-sync.md` 是 P3 的问题陈述、24 条可独立验证的用户故事、已定决策表、测试接缝与明确不做。 |
 
 术语以仓库根的 [CONTEXT.md](../CONTEXT.md) 为准——它是纯词汇表，实现细节不写进去。
 文档里出现的词若与它冲突，以 `CONTEXT.md` 为准并回来修文档。
