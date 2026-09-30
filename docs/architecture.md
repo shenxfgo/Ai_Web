@@ -684,7 +684,10 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | PUT | `/datasources/{id}/grants` | admin | `{items:[{type:'user'\|'role',id?,role?,permission}]}` | 200（整体替换） |
 | POST | `/datasources/{id}/sync` | sync 权 | `{"force":false}` | 202 `{job_id}`；并发冲突 409。**as-built(007)**：P2 落的是 `POST /api/sync/jobs`（`{datasource_id}` → **200 + counters**，同步执行完再回）。这一行的 202+背景执行与 `force` 覆盖是 P3 的事，届时**只换返回码不动路径**——工单 007 的拍板表里记着这条决定。行权也不是本表写的 "sync 权" 而是 **owner/admin 档**（与 DELETE/test 同一把尺）：`datasource_grants` 至今没有任何读取点（grants 那两行也未实现），"授予某人 sync 权"这句话没有落脚处；且同步会拿这个源的凭据去连库，能触发就等于能试探它的口令，宁可收窄到 owner 也不放宽到 'global'。grants 实现后按本表恢复 "sync 权" 口径。**as-built(P3 开工前拍板)**：P3 落 202 + `{job_id}` 与
 `{"force":true}` 覆盖上限，但**路径保持 P2 的 `POST /api/sync/jobs`**（007 拍板"只换返回码不动路径"），
-执行体是独立 worker 进程而非请求内跑完，理由与后果见 ADR-0011 |
+执行体是独立 worker 进程而非请求内跑完，理由与后果见 ADR-0011。**as-built(P3-016 已交付)**：202 +
+`{job_id}` 与 worker 骨架落地（`app/services/job_queue.py` 的 `enqueue`/`claim` + `scripts/run_worker.py`，
+本机另开 `dev.ps1 worker`），终局只能从 `GET /sync/jobs/{id}` 那一行读、而它还没实现（下面两行仍挂无主账），
+所以 `sync_jobs.errors[].data` 成了结构化出路到前端的唯一一跳；`force` 这一半仍无端点开关（工单 021） |
 | GET | `/sync/jobs` | user | `?datasource_id&status&cursor` | 列表 |
 | GET | `/sync/jobs/{id}` | 同 ds 权 | — | `{status,phase,progress,counters,warnings,errors,started_at,finished_at}` |
 | POST | `/sync/jobs/{id}/cancel` | 同 ds 权 | — | 置 `cancel_requested`，worker 批间检查。**as-built(P3 开工前拍板)：挂 [P8]** —— `sync_jobs` 至今没有 `cancel_requested` 列（metadata-model §2.5 那份列清单里没有），加列与批间检查点等 P8 前端的"停止同步"按钮一起做；`status='cancelled'` 因此继续没有写入点 |

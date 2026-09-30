@@ -160,6 +160,8 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 > - **验收 1**："返回 job id"按 `POST /api/sync/jobs` 落 202 + `{job_id}` 判定。
 >   路径沿用 P2 的那一条（工单 007 已拍板"只换返回码不动路径"），`architecture.md` §7 端点表里
 >   `POST /datasources/{id}/sync` 那行的路径按此作废。`pending` 这个状态值从此有了写入点。
+>   **as-built(P3-016)：本条已交付**，且断言不止"码是 202"——响应体 `keys() == {"job_id"}`、
+>   读库断 `pending` + `started_at IS NULL` + 抽取器**一次都没被调用**，三条各挡一种假 202。
 > - **验收 2**：`phase=extract/embed/upsert` 这三个字面**不在** `sync_jobs.phase` 的 CHECK 里
 >   （那边是 9 值细粒度词表，`extract`/`upsert` 写进去会被 PG 直接拒）。判定改按双层词表：
 >   SSE 上出现的是粗粒度 `stage`，库里存的是细粒度 `phase`，映射只住在一个纯函数里。
@@ -167,6 +169,10 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 > - **验收 3**：409 的代码路径在 P2 已经通了（`_open_job` 撞 `ux_sync_running` → `Conflict`），
 >   P3 要补的是"API 只入队"之后这条还成不成立——入队写的是 `pending`，而索引管
 >   `status IN ('pending','running')`，所以互斥面反而变大（排队中的作业也挡住新作业）。
+>   **as-built(P3-016)：成立，而且比 P2 更纯**——`_open_job` 已随进程分离删掉，
+>   `enqueue` 里没有任何"先查有没有未结束作业"的分支，409 只能由 `IntegrityError` 撞
+>   `ux_sync_running` 翻出来（只认这一个索引名，FK/CHECK 之类的约束失败不许报成"已经在同步了"）。
+>   钉子 `test_排队中的_pending_行也挡住新作业`：队列里那行还是 pending、没有任何代码看过它。
 > - **验收 4**：kill 的对象是 **worker 进程**，不是 uvicorn。"重启后回收 N 个僵尸 job"因此要在
 >   worker 的启动日志里看，而回收动作按拍板是**心跳循环每轮都扫**（只在启动扫一次被否掉：
 >   worker 长驻不重启是常态）。

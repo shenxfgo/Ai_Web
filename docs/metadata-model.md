@@ -240,7 +240,13 @@ phase  text CHECK ('connect','discover','tables','columns','indexes','fks','card
 progress numeric(5,2) DEFAULT 0
 counters jsonb DEFAULT '{}'   -- {tables_seen,tables_ok,tables_failed,columns,indexes,fks,cards,cards_embedded}
 warnings jsonb DEFAULT '[]'   -- [{code:'permission_hidden', detail:'库 x 下 12 张表不可见'}]
-errors   jsonb DEFAULT '[]'   -- [{phase:'indexes', table:'db.t', message:...}]
+errors   jsonb DEFAULT '[]'   -- [{code, detail}]，分类过的 AppError 再多带一个 data
+                               -- （as-built(P3-016)：原记的 `{phase, table, message}` 从未落地过，
+                               --   007 起就是 `{code, detail}`，本片补上的是 `data`。进程分离之后
+                               --   202 只带 job_id，这一列成了 §6 那三条结构化出路到达前端的唯一
+                               --   一跳，只留人话就只剩一个 code 能看。`detail` 一律是字符串
+                               --   （给人读的那一句），机器可渲染的结构住在 `data`——读这一列的人
+                               --   不必为同一个键写两种分支，所以不让 detail 兼任结构）
 manifest_digest text NULL      -- 与上次成功的指纹，命中则短路
 heartbeat_at timestamptz       -- 用于回收僵尸 running 任务
 started_at / finished_at / created_at
@@ -537,6 +543,11 @@ DELETE FROM aiweb.meta_relation
 > 4. `ExtractScopeTooLarge` 是**拒绝开工**，不是"某一批失败"：它必须穿过 per-catalog 的兜底
 >    `except` 让整个请求以 400 结束，且 `detail` 里那三条出路要原样到达响应体（前端按结构化
 >    出路渲染，只剩一个 `code` 就没有可操作性了）。
+>    **as-built(P3-016)**：本条两处都随进程分离改了落点——请求在抛错之前就已经以 202 返回了，
+>    所以"整个请求 400"变成"**整个作业 `failed`**"（穿过 per-catalog 兜底这一半不变，
+>    见 `run_sync` 里那句 `except ExtractScopeTooLarge: raise`），"原样到达响应体"变成
+>    "原样到达 `sync_jobs.errors[0].data.remedies`"。钉子从 400 改成 202 + 三条文案逐字相等，
+>    落 `tests/integration/test_sync_pg.py`。
 > 5. `?force=true`（旧表格里 admin 覆盖上限那条）：`run_sync(force=)` 参数在，
 >    **端点没有开关**，工单 007 的验收里没有它 → P3 接背景执行时一并补。开关落地前，
 >    第三条出路的文案是"调高 `AIWEB_EXTRACT__MAX_TABLES` 上限（admin 改配置）"——出路必须
@@ -588,6 +599,28 @@ DELETE FROM aiweb.meta_relation
 > 11. **读侧真分批**：`collect()` 按 `BATCH_SIZE` 切片循环发那几条 `IN (...)` SQL，批间
 >    `sleep(BATCH_INTERVAL_MS)`。演示库只有 11 个对象，所以用例把 `BATCH_SIZE` 降到 3，
 >    在真库上跑出 4 批——这两个键不再是空转，而"分批"这件事也因此真的被验过。
+>
+> **as-built(P3-016 施工后)**（2026-09-30，工单 016；上面的拍板逐条落地，这里是施工现实）
+>
+> 1. 上面第 1 条已交付，`_open_job` 拆成了两条语句：`enqueue_stmt`（API 进程，只写
+>    `pending` + `RETURNING id`）与 `claim_stmt`（worker 进程，`FOR UPDATE SKIP LOCKED`
+>    选最老 + 外层 `AND status='pending'` 定胜负）。执行体在 `scripts/run_worker.py`，
+>    本机从此两条命令（`dev.ps1 dev` / `dev.ps1 worker`，`make worker` 同义）。
+> 2. **409 的唯一来源从此是索引**：P2 那句"`_open_job` 撞 `ux_sync_running` → `Conflict`"
+>    连同 `_open_job` 一起没了，`enqueue` 不查"有没有未结束的作业"，它只往表里插一行。
+>    于是 `status IN ('pending','running')` 里那个 `pending` 第一次真的挡人——
+>    排队中的作业也挡住新作业（上面第 8 条说的"互斥面反而变大"）。钉子：
+>    `test_排队中的_pending_行也挡住新作业`（把索引的 WHERE 改成只剩 `running` 它就红）。
+> 3. 上面第 8 条的"`pending` 有了写入点"已真跑验证（两终端时间线见工单 016 交付记录）。
+>    顺带一处搬家：`heartbeat_at` 的写入点从"建 job 时"（P2 与 `started_at` 同一句）移到了
+>    **claim 时**，仍然只写一次——上面第 4 条要求的"独立连接每 10s 刷"仍归 018。移的理由是
+>    僵尸回收判的是"开跑了却不再动"，而入队时刻还没有任何一帧属于执行。
+> 4. `JobQueue` Protocol 只有 `enqueue` / `claim` 两个成员：`subscribe` 要和新表
+>    `sync_job_event` 同时出现才有意义，在这一片挂进来就是一个没有人实现的空方法（归 017）。
+> 5. worker 的循环体 `run_once(session)` 是用例的进入点（已定口径"不真起子进程"），
+>    会话由调用方给、也由调用方关——018 的心跳要在**另一条连接**上刷，届时看的就是谁握着会话。
+>    作业级异常收在 `run_once` 而不是 `loop()`：收在 loop 里，用例跑的那条路就少了一层
+>    真进程有的保护，而 `run_sync` 的不变量恰恰是"终局写完之后把原因原样抛出去"。
 
 ## 7. `SourceDialect` 抽象与中间结构
 
