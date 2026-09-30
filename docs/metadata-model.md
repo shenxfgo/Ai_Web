@@ -238,7 +238,13 @@ id bigserial PK / datasource_id FK / triggered_by FK users
 status text CHECK ('pending','running','success','partial','failed','cancelled')
 phase  text CHECK ('connect','discover','tables','columns','indexes','fks','card_build','embed','done')
 progress numeric(5,2) DEFAULT 0
-counters jsonb DEFAULT '{}'   -- {tables_seen,tables_ok,tables_failed,columns,indexes,fks,cards,cards_embedded}
+counters jsonb DEFAULT '{}'   -- 交付的键（sync_service._Tally）：
+                               -- {databases,tables,columns,indexes,relations_extracted,
+                               --  relations_inferred,tables_stale,tables_failed,cards}
+                               -- （as-built(P3-016)：原记的 `{tables_seen,tables_ok,fks,cards_embedded}`
+                               --   从未落地过——007 落前八个，`cards` 由 008 加；`fks` 那一格按 §5.3
+                               --   的分类拆成 extracted/inferred，`cards_embedded` 要等向量启用（P4）。
+                               --   改它而不是留着：017 的收尾帧要按 key 渲染这一格）
 warnings jsonb DEFAULT '[]'   -- [{code:'permission_hidden', detail:'库 x 下 12 张表不可见'}]
 errors   jsonb DEFAULT '[]'   -- [{code, detail}]，分类过的 AppError 再多带一个 data
                                -- （as-built(P3-016)：原记的 `{phase, table, message}` 从未落地过，
