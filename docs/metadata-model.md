@@ -383,6 +383,35 @@ aiweb.chat_feedback : id / message_id FK UNIQUE / user_id / verdict CHECK('up','
 > `latency_ms`）。两列分开才答得出"慢在模型还是慢在源库"。同键里还多一个 `run_id`——
 > 它是结果文件的身份，013 的下载侧只认这个引用，不认路径。
 
+### 2.8 `aiweb.sync_job_event`（as-built(P3 开工前拍板) 新增，迁移 `0007_sync_event`）
+
+```
+id       bigserial PK
+job_id   bigint FK sync_jobs ON DELETE CASCADE  NOT NULL
+seq      bigint NOT NULL                 -- 每个 job 内单调 +1，SSE 的游标就是它
+stage    text NOT NULL CHECK ('extract','embed','upsert','card_build','done')
+phase    text NULL                       -- 细粒度真相（9 值词表里的那一个），排障用
+counters jsonb NOT NULL DEFAULT '{}'     -- 该事件时刻的累计账（done/total/base_table/view/cards…）
+payload  jsonb NOT NULL DEFAULT '{}'     -- {table:'db.t', code:'card_build_failed', detail:…, skipped:bool}
+created_at timestamptz NOT NULL DEFAULT now()
+UNIQUE (job_id, seq)
+INDEX (job_id, seq)
+```
+
+只追加、不改写：一行代表"作业状态发生过一次可对外说明的变化"。它是 P3 进度的**唯一真相**，
+而 `sync_jobs.progress` 只是一个百分比（`numeric(5,2)`），两者不互相代替。
+
+> ① **`stage` 与 `phase` 并存是有意的**（ADR-0010）：粗粒度给 SSE 与前端进度条，细粒度给排障。
+>    两套词表之间的映射**只许住在一个纯函数里**，任何第二处重复它的位置都是 bug——
+>    010 那次数出三处 `>= 0.8` 判定，就是同一个门槛散在多处后的形状。
+> ② **`NOTIFY` 不带这些字段**。通道 `sync_job_event` 的 payload 只有 `job_id`，作用是把正在
+>    `LISTEN` 的 SSE 连接叫醒，让它自己去按 `seq > cursor` 追读。原因写在 ADR-0010：
+>    `NOTIFY` 在没有监听者的那一刻永久丢失，asyncpg 重连也不补，所以它不配当真相。
+> ③ **保留期**由 worker 的回收循环按 `AIWEB_RESULT__RETENTION_DAYS`（30 天）删旧行——
+>    这张表是全仓唯一一张确定会随时间线性增长的表，而"保留 30 天"这句配置承诺此前没有任何读取点。
+>    结果 csv **不在本表的管辖范围**，也不在回收范围内（删文件不可逆，且 P2 的现场证据就在里面）。
+> ④ `ON DELETE CASCADE` 到 `sync_jobs`：作业行被人删掉时事件跟着走，不留孤儿。
+
 ## 3. 人工列与同步列的分离（幂等重跑的关键）
 
 `comment_raw` 由同步写，`comment_zh` / `business_desc` / `granularity` / `is_hidden` 是人工字段，
@@ -476,7 +505,7 @@ DELETE FROM aiweb.meta_relation
 | 超大库（>2000 表） | `probe()` 先 `SELECT COUNT(*)` 预估 → 超过 `AIWEB_EXTRACT__MAX_TABLES`（默认 2000）**拒绝**并返回结构化提示 + 三个出路：①配 `include_tables` 白名单 ②只同步部分 schema ③调高 `AIWEB_EXTRACT__MAX_TABLES` 上限（admin 改配置） |
 | 宽表（>200 列） | 抽取照常，卡片构建走列切片，并给 warning"字段过多建议拆视图" |
 | 同步中重复点"同步" | 部分唯一索引：`CREATE UNIQUE INDEX ux_sync_running ON aiweb.sync_jobs(datasource_id) WHERE status IN ('pending','running');` → 天然互斥，冲突返回 409 `sync_already_running`（是数据库保证，不是代码 race） |
-| 进程崩溃留下僵尸 running | 启动 `lifespan` 里 `UPDATE sync_jobs SET status='failed', error='reclaimed on startup' WHERE status IN ('pending','running') AND heartbeat_at < now()-interval '3 minutes'`；之后 admin 可"重跑" |
+| 进程崩溃留下僵尸 running | worker 心跳循环**每轮**扫一次：`UPDATE sync_jobs SET status='failed', errors = errors || '[{"code":"reclaimed","detail":"heartbeat 超时"}]'::jsonb WHERE status IN ('pending','running') AND heartbeat_at < now() - interval '180 seconds'`；之后用户可重新发起。**as-built(P3 开工前拍板)**：原句写的是"启动 `lifespan` 里回收"与 `error='reclaimed on startup'` 两处失实——① 列名是 `errors`（`jsonb NOT NULL DEFAULT '[]'`），没有 `error` 这一列；② worker 长驻不重启是常态，只扫一次等于僵尸行永久占住 `ux_sync_running`，正是 as-built(007) 第 1 条堵过的那类故障换了个进程而已 |
 | 抽取把源库拖垮 | 全部 IS 查询前 `SET SESSION max_execution_time` / `SET LOCAL statement_timeout`；批量大小固定 200；批间 `await asyncio.sleep(EXTRACT__BATCH_INTERVAL_MS)`；单连接串行，不开并发打源库 |
 
 对应配置：`AIWEB_EXTRACT__HEARTBEAT_INTERVAL_S=10`、`AIWEB_EXTRACT__STALE_JOB_RECLAIM_S=180`
@@ -515,6 +544,50 @@ DELETE FROM aiweb.meta_relation
 >    常量统一，`test_extract_mysql_client.py` 按本表钉字面量）。P3 落地时把这条文案换回
 >    "admin 用 `?force=true` 覆盖上限"并同步改常量与用例。
 >    同理 `AIWEB_EXTRACT__MIN_MYSQL_VERSION`（第 1 行）也还没有读取点。
+
+> **as-built(P3 开工前拍板)**（2026-09-30，ADR-0010 / ADR-0011；共识由 grill 逐条走完）
+>
+> 1. **执行模型换成独立 worker 进程**。`POST /api/sync/jobs` 只写 `pending` 行 + 返回 202 与 `job_id`，
+>    `run_sync` 归 `scripts/run_worker.py`。理由不是"背景执行更高级"，是 `AIWEB_RELOAD=true` 是本机默认，
+>    进程内跑作业等于**存一次盘打断一次同步**，而被打断的 `running` 会占住 `ux_sync_running`
+>    让该源永久 409（上表 as-built(0007) 第 1 条那个故障的另一个来源）。
+>    路径沿用 P2 的 `POST /api/sync/jobs`（工单 007 拍板："只换返回码不动路径"），
+>    `architecture.md` §7 端点表里 `POST /datasources/{id}/sync` 那一行的路径按此作废。
+> 2. **阶段词表是两套，且映射只能住在一个地方**。`sync_jobs.phase` 继续写 9 值细粒度（迁移不动，
+>    CHECK 不改）；对外（SSE）用粗粒度 `stage ∈ {extract, embed, upsert, done}`。
+>    roadmap P3 验收 2 那句 `phase=extract/embed/upsert` 里的 `extract`/`upsert` **不在** CHECK 里，
+>    按本条收口：worker 写库用细值，写事件用粗值，两者之间唯一的映射是一个纯函数。
+> 3. **进度真相在 `sync_job_event`，不在 `progress` 列**。新表见 §2.8。`NOTIFY` 只携带 `job_id`
+>    当叫醒信号（`NOTIFY` 在无监听者的那一刻永久丢失，所以它不配当真相）；SSE 端点按 `seq` 游标追读，
+>    重连不丢事件。`progress numeric(5,2)` 那一列仍然只是一个百分比，不承载序列。
+> 4. **心跳与回收都在 worker 的心跳循环里**：独立连接每 `HEARTBEAT_INTERVAL_S`（10s）刷 `heartbeat_at`，
+>    **同一轮**扫一次僵尸（阈值 `STALE_JOB_RECLAIM_S`，180s）。原表那句"启动 lifespan 里回收"的
+>    管辖对象从 API 进程变成 worker，且"只在启动扫一次"被否掉——worker 长驻不重启是常态。
+>    两个键（`heartbeat_interval_s` / `stale_job_reclaim_s`）从"定义了点都没有读取点"变成有读取点。
+>    上表第 1 行那条 `UNSUPPORTED_VERSION`（`MIN_MYSQL_VERSION` / `MIN_PG_VERSION`）**本片仍不接**，
+>    连同"权限不全 `SCHEMA_PARTIALLY_VISIBLE` + `known_complete` 门控"与 `manifest_digest` 短路
+>    一起转 P6/P10——PG 抽取器这轮落地而不做版本判定是**明示的偏离**，不是遗漏。
+> 5. **失败隔离粒度定在"元数据每库一事务（现状不动）+ 卡片逐表提交"**。验收 5 那句
+>    "3 张表抛错、其余 6 张已落库"之所以成立，是因为抛错发生在卡片阶段，而卡片改成逐表提交；
+>    元数据侧一旦某张表的 IS 查询真抛错，仍然是整库回滚 + `partial`。
+> 6. **`embed` 档在 P3 是 `skipped`**。本机 embedding 三键（`BASE_URL`/`API_KEY`/`MODEL`）全空，
+>    `settings.embedding.configured` 为 False，事件流里该档带 `skipped=true` 与原因，
+>    向量回填整块归 P4。验收 5 的注入点因此改用 `card_build`（008 的渲染器逐表调用）。
+> 7. **`?force=true` 本片接**（上表第 5 条的那笔账到此闭环）：端点加 `force` 参数透传
+>    `run_sync(force=)`，同时把 `SCOPE_REMEDIES` 第三条文案换回"admin 用 `?force=true` 覆盖上限"，
+>    §6 表 / 常量 / `test_extract_mysql_client.py` 三处一起动。
+> 8. **`cancel` 不做**，端点表那行挂 [P8]（`sync_jobs` 至今**没有** `cancel_requested` 列，
+>    加列与批间检查点等 P8 前端一起做）；`status='cancelled'` 与 `'pending'` 两个 CHECK 值里，
+>    `pending` 因本片的入队动作终于有了写入点，`cancelled` 继续没有。
+> 9. **保留期作业只清 `sync_job_event`**（按 `AIWEB_RESULT__RETENTION_DAYS`，30 天），结果 csv 一行不碰
+>    ——那些文件是 P2 验收 4/5 的现场证据，且删文件不可逆；结果文件的回收与 P8 下载端点一起考虑。
+>    这个键的名字目前比它的管辖范围大，按本条写明。
+> 10. **枚举 NDV 采样整块推 P4**：新增 `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键（此前**不存在**，
+>    而 kb-workflow §8 把它当已有键在讲），`sample_distinct` / `sample_distinct_max_distinct`
+>    两键挂 [P4]，`meta_column.sample_values` 继续无写入点。
+> 11. **读侧真分批**：`collect()` 按 `BATCH_SIZE` 切片循环发那几条 `IN (...)` SQL，批间
+>    `sleep(BATCH_INTERVAL_MS)`。演示库只有 11 个对象，所以用例把 `BATCH_SIZE` 降到 3，
+>    在真库上跑出 4 批——这两个键不再是空转，而"分批"这件事也因此真的被验过。
 
 ## 7. `SourceDialect` 抽象与中间结构
 

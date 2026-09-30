@@ -154,6 +154,48 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
    as-built(0007)：`SUB_PART` 这一半原先在演示库里**测不出来**（夹具没有前缀索引），已补
    `product.idx_product_name(name(32))` 并把期望值钉成 `sub_part == 32`，见 verification.md §1 注。
 
+> **as-built(P3 开工前拍板)**（2026-09-30，grill 逐条走完；执行模型与队列介质见 ADR-0010 / ADR-0011，
+> 全部口径细节在 metadata-model §6 末的那块 as-built）
+>
+> - **验收 1**："返回 job id"按 `POST /api/sync/jobs` 落 202 + `{job_id}` 判定。
+>   路径沿用 P2 的那一条（工单 007 已拍板"只换返回码不动路径"），`architecture.md` §7 端点表里
+>   `POST /datasources/{id}/sync` 那行的路径按此作废。`pending` 这个状态值从此有了写入点。
+> - **验收 2**：`phase=extract/embed/upsert` 这三个字面**不在** `sync_jobs.phase` 的 CHECK 里
+>   （那边是 9 值细粒度词表，`extract`/`upsert` 写进去会被 PG 直接拒）。判定改按双层词表：
+>   SSE 上出现的是粗粒度 `stage`，库里存的是细粒度 `phase`，映射只住在一个纯函数里。
+>   `total` 与"排除下划线前缀对象"的计数口径不变（仍是 10）。
+> - **验收 3**：409 的代码路径在 P2 已经通了（`_open_job` 撞 `ux_sync_running` → `Conflict`），
+>   P3 要补的是"API 只入队"之后这条还成不成立——入队写的是 `pending`，而索引管
+>   `status IN ('pending','running')`，所以互斥面反而变大（排队中的作业也挡住新作业）。
+> - **验收 4**：kill 的对象是 **worker 进程**，不是 uvicorn。"重启后回收 N 个僵尸 job"因此要在
+>   worker 的启动日志里看，而回收动作按拍板是**心跳循环每轮都扫**（只在启动扫一次被否掉：
+>   worker 长驻不重启是常态）。
+> - **验收 5**：注入点从 `embed` 换成 **`card_build`**——本机 embedding 三键全空
+>   （`settings.embedding.configured` 为 False），P3 的 `embed` 档是 `skipped=true` + 原因，
+>   向量回填整块归 P4。"其余 6 张已落库"能成立的前提是卡片改成**逐表提交**；
+>   元数据侧仍是每库一事务（007 现状不动），所以元数据真抛错时是整库回滚。
+>   三张失败表由测试专用的注入钩子造，走真 HTTP → 真入队 → 真跑。
+> - **验收 6**：需要一个**能被登记的 PG 源库**，由 `backend/.setup/init_demo_pg.sql` 建
+>   （`ai_web_demo_pg` + 10 张带中文注释的表，把 `text/_int4/_numeric/_timestamptz/_varchar/text[]/jsonb`
+>   全铺上 + `demo_pg_ro` 只读账号），用户以超管 psql 跑一次，形状与 002 的 MySQL 建库同构。
+>   类型归一化按 metadata-model §9 落，`test_pg_type_normalize.py` 这个名字按本条建。
+>   **注意**：`MIN_PG_VERSION` / `MIN_MYSQL_VERSION` 的 probe 版本闸门**本片不接**（连同
+>   `SCHEMA_PARTIALLY_VISIBLE` + `known_complete` 门控、`manifest_digest` 短路一起转 P6/P10）——
+>   "PG 抽取器落地而不做版本判定"是明示的偏离，不是遗漏。
+> - **验收 7**：`CARDINALITY`/`SUB_PART` 早在 007 就通了（`mysql.py:121` 读、`:259`/`:265` 映射、
+>   `sync_service.py:433`/`:444` 落库），P3 只补"分批后每批都还读到"这一格。
+> - **要点那句"一批 200 表"**：读侧真分批（`collect()` 切片循环发 `IN (...)`），
+>   用例把 `AIWEB_EXTRACT__BATCH_SIZE` 降到 3，在 11 个对象的真演示库上跑出 4 批——
+>   否则"分批"这条路径在真跑里永远走不到，只能算离线自证。
+> - **本片新接的 P2 转账**：`?force=true` 端点开关（连同 `SCOPE_REMEDIES` 第三条文案换回原文）。
+>   **本片新做的回收作业**：只清 `sync_job_event` 旧行（`AIWEB_RESULT__RETENTION_DAYS`，30 天），
+>   结果 csv 不碰。**本片明确不做**：`POST /sync/jobs/{id}/cancel`（连 `cancel_requested` 列一起挂 [P8]，
+>   `cancelled` 继续无写入点）、枚举 NDV 采样（整块推 P4，只新增 `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键，
+>   `sample_distinct*` 两键挂 [P4]，`meta_column.sample_values` 继续无写入点）。
+> - **测试地基**：P2 的三张 sync 用例（`test_sync_live.py` / `test_sync_pg.py` / `test_sync_cache_pg.py`）
+>   现在都在请求内等 `run_sync` 返回，必须改成"POST 拿 job_id → await worker 的循环体 → 照旧断言"；
+>   用例**不真起子进程**，SSE 与进程边界另有真进费用例钉。
+
 踩坑预警：① 5.7 的 `STATISTICS` 对 MyISAM/视图语义不同，视图要单独分支（列注释全空 → 卡片降级模板）；
 ② 别把源库读和元数据库写混在一个 session；③ `heartbeat_at` 必须在**独立连接**上更新。
 
