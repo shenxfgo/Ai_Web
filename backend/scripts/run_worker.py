@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,12 +36,18 @@ from app.services.job_queue import PostgresJobQueue  # noqa: E402
 IDLE_SECONDS = 2.0
 
 
-async def run_once(session: AsyncSession) -> int | None:
+async def run_once(
+    session: AsyncSession, *, card_build_hook: Callable[[str], None] | None = None
+) -> int | None:
     """领一个作业并跑完它，返回 job_id；队列空返回 None。
 
     会话由调用方给、也由调用方关：这一层不拥有连接，才不会把"一个作业一个会话"和
     "一个会话跑完所有作业"两种形状混在一个函数里——018 的心跳要在**另一条连接**上刷，
     到时候看的就是这里到底谁握着会话。
+
+    `card_build_hook` 是工单 019 的 test-only 注入点，原样透传给 `run_sync`：注入只有从
+    这个进入点进来才等于走真链路（HTTP → 入队 → worker 跑 → 落库）。常驻循环 `loop()`
+    不传它，生产路径恒为 None。
 
     作业级的异常在这里收，不在 `loop()` 里收，因为这一句是整个切片的进入方式：用例直接
     await 本函数（工单 016 已定口径"不真起子进程"），而 `run_sync` 的不变量恰恰是
@@ -65,6 +72,8 @@ async def run_once(session: AsyncSession) -> int | None:
             # 工单 021：入队那一刻的"覆盖规模上限"由作业行带出来——worker 进程读不到请求，
             # 没有这一格，端点收到的 force 就死在 sync_jobs 那一列里。
             force=claimed.force,
+            # 工单 019：卡片构建的 test-only 注入点从进入点穿到 sync_cards，生产 loop() 不传。
+            card_build_hook=card_build_hook,
         )
     except Exception as exc:
         # 走到这里终局一定已经写好（`run_sync` 的不变量 1），所以不需要补救，但要把原因

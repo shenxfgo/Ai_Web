@@ -695,6 +695,24 @@ DELETE FROM aiweb.meta_relation
 >    所以每一帧都说得出 `x/y`。它只发分组计数那一条 SQL，昂贵的 IS/列/索引一条都不发。演示库上
 >    `total=10` 而 `SHOW FULL TABLES` 数出 11，差的正是下划线前缀那几个建库脚本内部对象——
 >    分母口径与 §2.5 那本行级总账（`_Tally`）是两本账，故意不合并（`_Progress` 的理由写在源码里）。
+>
+> **as-built(P3-019 施工后)**（2026-09-30，工单 019；上面第 5 条的卡片半边落地，元数据半边原样不动）
+>
+> 1. 事务边界挪进 `sync_cards` 的循环体：**一张表一次 `execute` + 一次 `commit`**，失败的那张
+>    自己 `rollback`（回滚射程只覆盖它自己——前面已提交的卡片不在里面）。旧形状"攒够全部 rows
+>    再一次 upsert、由调用方单次提交"没了，`run_sync` 的 card_build 段因此**不再**为卡片发 commit；
+>    §6 已定口径那句"`_set_phase` 自己会 commit，卡片提交与 phase 提交不许并成一个事务"
+>    由"这里根本没有卡片提交"来满足，而不是由顺序满足。
+> 2. `ensure_profile` 后面跟着一次**单独的 commit**：它若还留在第一张表的事务里，那张表失败时的
+>    rollback 会把它一起带走，此后每张表的成功提交都在 `kb_card.index_profile_id` 的外键上当场拒收。
+>    这是逐表提交换来的、旧形状里不存在的一步。
+> 3. `sync_cards` 的返回值从 `int` 变成 `CardBuildOutcome(cards, failures)`：`cards` 仍只数**已提交**
+>    的条数（上面第 5 条的"只改事务边界、不改计数"），`failures` 带 `table_full_name`。调用方把它
+>    逐条转成 `errors` 的既有形状 `{code:'card_build_failed', detail:'<表全名>: <原句>'}` 并把终局判
+>    `partial`——与库级失败同一条追加路径，没有第二种错误形状。
+> 4. 注入点是参数不是分支：`run_once(session, *, card_build_hook=…)` → `run_sync(card_build_hook=…)`
+>    → `sync_cards(card_build_hook=…)`，在每张表构建的**起点**用表全名调用。生产 `loop()` 不传，
+>    源码里 grep 不到"如果这是测试就抛错"。
 
 ## 7. `SourceDialect` 抽象与中间结构
 

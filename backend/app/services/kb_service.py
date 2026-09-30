@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
@@ -512,6 +512,30 @@ def _as_dicts(mappings: MappingResult) -> list[dict[str, Any]]:
     return [dict(row) for row in mappings]
 
 
+@dataclass(frozen=True, slots=True)
+class CardBuildFailure:
+    """一张表的卡片构建失败：表全名（`db.t` 形状）+ 原始异常。
+
+    表名跟着失败走而不是编号：`sync_jobs.errors` 要带的是人读得出"哪张表"的名字
+    （CONTEXT.md 的 partial 词条："`errors` 里带表名"），而 table_id 到了库里就没人认得了。
+    """
+
+    table_full_name: str
+    error: Exception
+
+
+@dataclass(frozen=True, slots=True)
+class CardBuildOutcome:
+    """一轮卡片构建的收成：写出的卡片条数 + 逐表失败清单。
+
+    `cards` 只数**已提交**的那些（工单 019 已定口径：`counters.cards` 的语义仍是
+    "本轮写出的卡片条数"，逐表提交只改事务边界、不改计数）。
+    """
+
+    cards: int
+    failures: tuple[CardBuildFailure, ...] = ()
+
+
 async def sync_cards(
     session: AsyncSession,
     *,
@@ -520,16 +544,28 @@ async def sync_cards(
     table_ids: Sequence[int],
     dialect_name: str,
     server_version: str,
-) -> int:
-    """给"本轮确认过的"表重建卡片，返回写出的卡片条数（进 `sync_jobs.counters.cards`）。
+    card_build_hook: Callable[[str], None] | None = None,
+) -> CardBuildOutcome:
+    """给"本轮确认过的"表重建卡片；**一张表一个事务**，一张炸了不回滚已成功的那些张。
 
     `table_ids` 只准传本轮同步落成的表：陈旧表（`is_stale`）源库里已经没有实体了，
     还给它刷卡片等于让 AI 照一张不存在的表写 SQL。
+
+    逐表提交（工单 019，roadmap P3 验收 5 的前提）：每张表的卡片 upsert 自成一次
+    commit，下一张表的失败只作废它自己。事务边界挪到这里之后，调用方**不再**为卡片
+    统一提交——`_set_phase` 自己会 commit，卡片提交与 phase 提交不许并进同一个事务。
+
+    `card_build_hook` 是 **test-only** 的注入点（工单 019 已定口径）：由参数一路穿进来、
+    在每张表的卡片构建**起点**调用（表全名入参），抛错就是"这张表构建失败"。
+    生产路径永远传 `None`；生产代码里不存在"如果这是测试就抛错"的分支。
     """
     ids = sorted(set(table_ids))
     if not ids:
-        return 0
+        return CardBuildOutcome(cards=0)
     profile_id = await ensure_profile(session)
+    # profile 单独钉成事务：逐表失败的那次 rollback 不许把它一起带走——它若没落定，
+    # 之后每张表的成功提交都会在 `kb_card.index_profile_id` 的外键上当场拒收。
+    await session.commit()
 
     tables = _as_dicts(
         (
@@ -617,23 +653,29 @@ async def sync_cards(
         "from_table_id",
     )
 
-    rows: list[dict[str, Any]] = []
+    cards = 0
+    failures: list[CardBuildFailure] = []
     for table in tables:
-        meta = table_meta_from_rows(
-            dialect_name=dialect_name,
-            server_version=server_version,
-            table=table,
-            columns=columns.get(table["id"], []),
-            indexes=indexes.get(table["id"], []),
-            index_columns=[
-                child
-                for idx in indexes.get(table["id"], [])
-                for child in index_columns.get(idx["id"], [])
-            ],
-            relations=relations.get(table["id"], []),
+        full_name = _full_name(
+            str(table["catalog_name"]), str(table["schema_name"]), str(table["table_name"])
         )
-        for doc in build_cards(meta):
-            rows.append(
+        try:
+            if card_build_hook is not None:
+                card_build_hook(full_name)
+            meta = table_meta_from_rows(
+                dialect_name=dialect_name,
+                server_version=server_version,
+                table=table,
+                columns=columns.get(table["id"], []),
+                indexes=indexes.get(table["id"], []),
+                index_columns=[
+                    child
+                    for idx in indexes.get(table["id"], [])
+                    for child in index_columns.get(idx["id"], [])
+                ],
+                relations=relations.get(table["id"], []),
+            )
+            rows = [
                 {
                     "datasource_id": datasource_id,
                     "kind": doc.kind,
@@ -650,10 +692,18 @@ async def sync_cards(
                     "meta": doc.meta,
                     "sync_job_id": job_id,
                 }
-            )
-    if rows:
-        await session.execute(kb_card_upsert(), rows)
-    return len(rows)
+                for doc in build_cards(meta)
+            ]
+            if rows:
+                await session.execute(kb_card_upsert(), rows)
+            await session.commit()
+            cards += len(rows)
+        except Exception as exc:
+            # 一表一事务的收口：回滚只作废**这一张**（前面已 commit 的卡片不在射程内），
+            # 而驱动/语句级的异常在这里必须拦下——放行就是把整轮卡片构建按在一颗雷上。
+            await session.rollback()
+            failures.append(CardBuildFailure(table_full_name=full_name, error=exc))
+    return CardBuildOutcome(cards=cards, failures=tuple(failures))
 
 
 # ============================================================ 读取路径

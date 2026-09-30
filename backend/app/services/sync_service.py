@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from time import monotonic
 from typing import Any, cast
@@ -878,6 +878,7 @@ async def run_sync(
     job_id: int,
     synced_before: dt.datetime,
     force: bool = False,
+    card_build_hook: Callable[[str], None] | None = None,
 ) -> SyncOutcome:
     """一次完整同步：连源库 → 抽 → 落库 → 收尾写 `sync_jobs`。
 
@@ -890,6 +891,10 @@ async def run_sync(
     → `sync_jobs.force` → `ClaimedJob.force` → 这里）。它**只**关掉 `MAX_TABLES` 一档——
     scope 过滤（include/exclude）、删除差分、规模之外的行为一律不变，不是跳过所有保护的
     万能钥匙。
+
+    `card_build_hook` 是工单 019 的 **test-only** 注入点：由 worker 的进入点按参数传进来、
+    原样交给 `sync_cards`，生产路径（`loop()`）恒为 `None`。单表构建失败在卡片侧逐表收口
+    （提交/回滚各归各表），这里只负责把失败记进 `errors` 并把终局判成 `partial`。
 
     本函数的三条不变量（都被 `tests/integration/test_sync_pg.py` 钉着）：
 
@@ -997,15 +1002,28 @@ async def run_sync(
             )
             # 只给"本轮真的落成了"的表建卡：陈旧表源库已无实体，给它刷一张新卡等于
             # 继续向 AI 保证一张不存在的表。
-            tally.cards = await sync_cards(
+            card_result = await sync_cards(
                 session,
                 datasource_id=ds.id,
                 job_id=job_id,
                 table_ids=[int(i) for i in synced.scalars()],
                 dialect_name=ds.kind,
                 server_version=ds.server_version or "",
+                card_build_hook=card_build_hook,
             )
-            await session.commit()
+            tally.cards = card_result.cards
+            # 逐表提交（工单 019）之后这里**没有**统一 commit：每张表的成功或失败都在
+            # `sync_cards` 里各自收口了。单表失败不中断——与上面 per-catalog 的兜底同构：
+            # 错误按 `sync_jobs.errors` 的既有形状 `{code, detail}` 追加（§2.5 as-built P3-016），
+            # 表名进 `detail`（§2.8 的 payload 示例点名 `card_build_failed`），终局判 `partial`。
+            # 为什么不塞进 `_write_catalog`：`_set_phase` 自己会 commit，卡片提交与 phase
+            # 提交不许并进同一个事务——那等于把"每库一事务"当场切两半（§6 已定口径）。
+            for failure in card_result.failures:
+                status = "partial"
+                entry = _error_entry(failure.error, fallback_code="card_build_failed")
+                # 表名前缀：与库级失败那条同一条理由——一轮里几十张表，只说"注入故障"分不出炸了谁。
+                entry["detail"] = f"{failure.table_full_name}: {entry['detail']}"
+                errors.append(entry)
             progress.cards = tally.cards
 
             stale = await session.execute(
