@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.extractor.mysql import MySQLExtractor
 from tests.integration.conftest import Account, DbAccount
+from tests.integration.test_sync_pg import _sync
 
 pytestmark = [pytest.mark.pg, pytest.mark.live]
 
@@ -48,7 +49,9 @@ _CJK = re.compile(r"[一-鿿]")
 @dataclass
 class SyncRun:
     ds_id: int
-    headers: dict[str, str]
+    #: 发起这一轮同步的账号（工单 016 之后 `_trigger` 直接复用 `test_sync_pg._sync`，
+    #: 它要的是 headers 而不是一个裸字典）
+    acct: Account
     body: dict[str, Any]
     #: `repr=False`：这条口令是真账号的，用例一失败 pytest 就把帧局部变量倒进终端，
     #: 默认 dataclass repr 会连着它一起倒出来。断言用 `run.ro_password` 照旧拿得到。
@@ -63,10 +66,11 @@ async def _sync_once(
     monkeypatch: pytest.MonkeyPatch,
     account: DbAccount,
 ) -> SyncRun:
-    """登记一条指向演示库的源 → 打 `POST /api/sync/jobs`，两边的响应都带回来。
+    """登记一条指向演示库的源 → 发起同步并等 worker 跑完，终局那一行带回来。
 
     走端点而不是直接调 `run_sync`：这是示踪弹，要的是"一次 HTTP 调用之后库里就有元数据"，
-    顺手把 owner 档鉴权和 `get_db` 覆盖那条链也验一遍。
+    顺手把 owner 档鉴权和 `get_db` 覆盖那条链也验一遍。工单 016 之后这一次调用是两跳
+    （POST 拿 202 + await worker 的循环体），见 `_trigger`。
     """
     user, password, host, port = account
     acct = await login(username="sync-owner", role="member")
@@ -100,7 +104,7 @@ async def _sync_once(
     assert register.status_code == 201, register.text
     run = SyncRun(
         ds_id=int(register.json()["id"]),
-        headers=acct.headers,
+        acct=acct,
         body={},
         ro_password=password,
         sent=sent,
@@ -110,13 +114,17 @@ async def _sync_once(
 
 
 async def _trigger(client: AsyncClient, run: SyncRun) -> dict[str, Any]:
-    """对同一条源再打一次同步——幂等断言要的就是"同一个目标跑第二遍"。"""
-    resp = await client.post(
-        "/api/sync/jobs", json={"datasource_id": run.ds_id}, headers=run.headers
-    )
-    assert resp.status_code == 200, resp.text
-    run.body = resp.json()
-    assert run.ro_password not in resp.text, "响应体里出现了源库口令"
+    """对同一条源再发起一次同步，并等 worker 把它跑完——幂等断言要的就是"同一个目标跑第二遍"。
+
+    工单 016 之后这里是**两跳**：POST 只换回 202 与 job_id，活儿在 worker 那条连接上跑。
+    所以这一句直接复用 `test_sync_pg._sync`（它已经把两跳和终局投影都封好了），
+    `run.body` 于是是 `sync_jobs` 那一行的终局——字段名与 P2 的响应体一致，
+    验收 1/4 那些 `run.body["counters"][...]` 的断言本体因此一行不改。
+    """
+    submit = await _sync(client, run.acct, run.ds_id)
+    assert submit.status_code == 202, submit.text
+    run.body = submit.json()
+    assert run.ro_password not in submit.text, "同步任务的记录里出现了源库口令"
     return run.body
 
 

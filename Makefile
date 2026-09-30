@@ -3,7 +3,7 @@ SHELL := bash
 BACKEND := backend
 FRONTEND := frontend
 
-.PHONY: help bootstrap check-env migrate seed-admin demo-db demo-db-pg dev dev-backend dev-frontend lint fmt typecheck test check clean
+.PHONY: help bootstrap check-env migrate seed-admin demo-db demo-db-pg dev dev-backend dev-frontend worker lint fmt typecheck test check clean
 
 help:
 	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | sed 's/^\([a-z-]*\):.*## /\1\t/'
@@ -32,8 +32,11 @@ dev-backend: ## 起 FastAPI（127.0.0.1:8000，热重载）
 dev-frontend: ## 起 Vite（127.0.0.1:5173，/api 代理到 8000）
 	cd $(FRONTEND) && npm run dev
 
-dev: ## 并行起前后端（要分终端观察日志时改用上面两个目标）
+dev: ## 并行起前后端（要分终端观察日志时改用上面两个目标；同步作业另开 worker）
 	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 dev
+
+worker: ## 起同步 worker（常驻进程：API 只把作业写进队列，跑它的是这里，ADR-0011）
+	cd $(BACKEND) && uv run python scripts/run_worker.py
 
 lint: ## 后端 ruff 静态检查
 	cd $(BACKEND) && uv run ruff check app scripts tests alembic

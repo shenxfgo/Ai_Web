@@ -33,6 +33,8 @@ function Start-Dev {
         -ArgumentList "run", "dev" -WorkingDirectory $Frontend
     Write-Host "后端 pid=$($back.Id) http://127.0.0.1:8000/api/docs"
     Write-Host "前端 pid=$($front.Id) http://127.0.0.1:5173"
+    # 工单 016 之后同步是两条命令的事：API 只把作业写进队列，跑它的是 worker 进程。
+    Write-Host "同步作业不在这里——另开一条：dev.ps1 worker（否则点同步只会停在 pending）"
     Write-Host "Ctrl+C 只停掉本脚本前台，两个子进程需自行结束（或任务管理器按 pid）"
     Wait-Process -Id $back.Id, $front.Id -ErrorAction SilentlyContinue
 }
@@ -41,7 +43,7 @@ switch ($Target) {
     "help" {
         Write-Host "可用目标（与 Makefile 同名）："
         Write-Host "  bootstrap  check-env  migrate  seed-admin  demo-db"
-        Write-Host "  dev  dev-backend  dev-frontend"
+        Write-Host "  dev  dev-backend  dev-frontend  worker"
         Write-Host "  lint  fmt  typecheck  test  check  clean"
     }
     "bootstrap" { Invoke-Step $Root @("python", "scripts/bootstrap.py") }
@@ -51,6 +53,7 @@ switch ($Target) {
     "demo-db" { & (Join-Path $PSScriptRoot "demo_db.ps1") }
     "dev-backend" { Invoke-Step $Backend @("uv", "run", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000", "--reload") }
     "dev-frontend" { Invoke-Step $Frontend @("npm", "run", "dev") }
+    "worker" { Invoke-Step $Backend @("uv", "run", "python", "scripts/run_worker.py") }
     "dev" { Start-Dev }
     "lint" { Invoke-Step $Backend @("uv", "run", "ruff", "check", "app", "scripts", "tests", "alembic") }
     "fmt" { Invoke-Step $Backend @("uv", "run", "ruff", "format", "app", "scripts", "tests", "alembic") }

@@ -26,10 +26,14 @@ import httpx
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_ROOT))
+# worker 的循环体与本脚本同目录，而 `scripts/` 不是包：直接跑 `python scripts/demo_ask.py` 时
+# 解释器已经把这一层放进了 sys.path，按文件路径加载本脚本的用例却没有。
+sys.path.insert(0, str(BACKEND_ROOT / "scripts"))
 
 if sys.platform == "win32":  # asyncpg 与 Proactor 事件循环不兼容
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+import run_worker  # noqa: E402
 from sqlalchemy import func, select  # noqa: E402
 
 from app.core.db import dispose_engine, get_sessionmaker  # noqa: E402
@@ -37,9 +41,10 @@ from app.core.errors import AppError  # noqa: E402
 from app.core.logging import reconfigure_std_streams  # noqa: E402
 from app.models.chat import ChatMessage  # noqa: E402
 from app.models.datasource import DataSource  # noqa: E402
-from app.models.meta import MetaTable  # noqa: E402
+from app.models.meta import MetaTable, SyncJob  # noqa: E402
 from app.models.user import User  # noqa: E402
-from app.services import datasource_service, sync_service  # noqa: E402
+from app.services import datasource_service  # noqa: E402
+from app.services.job_queue import PostgresJobQueue  # noqa: E402
 from app.services.llm_client import LlmClient  # noqa: E402
 from app.services.nl2sql import pipeline  # noqa: E402
 from app.services.nl2sql.retriever import LikeRetriever  # noqa: E402
@@ -52,7 +57,7 @@ _NEXT_STEPS: dict[str, str] = {
     "no_schema_found": (
         "① 给要问的表补中文表注释/列注释（源库 COMMENT，或 knowledge/ 覆盖层） "
         "② 确认这个数据源对该用户可见（GET /api/datasources） "
-        "③ 触发一次同步：POST /api/sync/jobs（登录拿 token 后调用）"
+        "③ 触发一次同步：POST /api/sync/jobs（拿 token 调用；202 只是入队，跑它的是 worker 进程）"
     ),
     "sql_guard_rejected": (
         "这条 SQL 没有执行，也没有落任何结果文件。模型原文留在 chat_messages.sql_raw；"
@@ -140,6 +145,11 @@ async def _ensure_meta_extracted(ds: DataSource) -> None:
 
     判空必须按 `datasource_id` 而不是全表：一台机器登记两个源时，第一个源同步过就会让
     第二个源永远抽不到结构。
+
+    工单 016 之后这一步是**两跳**：入队 + 就地跑一轮 worker 的循环体。就地消费的理由是这颗
+    示踪弹的验收口径"一条命令跑通"（P2 验收 4）——改成要求使用者另起一个 worker 进程，
+    它就变成了两条命令。消费走 `run_worker.run_once` 而不是这里自己 claim，是为了让
+    "怎么领到一个作业"这一手与真进程跑的完全是同一份代码。
     """
     async with get_sessionmaker()() as session:
         count = await session.scalar(
@@ -148,23 +158,25 @@ async def _ensure_meta_extracted(ds: DataSource) -> None:
         if count:
             print(f"[准备] 源 {ds.id}（{ds.name}）已有 {count} 张表结构，跳过抽取")
             return
-        row = await session.get(DataSource, ds.id)
         owner = await session.get(User, ds.created_by)
-        if row is None or owner is None:
-            raise SystemExit(f"[FAIL] 源 {ds.id} 或它的登记人不见了，没法替它抽取")
-        # 抽取用登记人而不是脚本的 actor：`run_sync` 要的是"谁有权限动这个源的元数据"，
-        # 与"谁在问数"是两个角色。这句必须打出来，否则下一片会以为示踪弹以 admin 身份
-        # 跑通了同步，而真链路里同步是 007 那条 HTTP 路径的事。
+        if owner is None:
+            raise SystemExit(f"[FAIL] 源 {ds.id} 的登记人不见了，没法替它抽取")
+        # 入队用登记人而不是脚本的 actor：`sync_jobs.triggered_by` 要的是"谁有权限动这个源的
+        # 元数据"，与"谁在问数"是两个角色。这句必须打出来，否则下一片会以为示踪弹以 admin
+        # 身份跑通了同步，而真链路里同步是 007 那条 HTTP 路径的事。
         print(
             f"[准备] meta_table 为空，先对 {ds.name} 做一次完整同步…"
-            f"（以登记人 {owner.username} 的身份跑，不是本脚本的 actor）"
+            f"（以登记人 {owner.username} 的身份入队，不是本脚本的 actor）"
         )
-        outcome = await sync_service.run_sync(session, row, actor=owner)
-        print(f"       同步终态 status={outcome.status} counters={outcome.counters}")
-        for err in outcome.errors:
-            print(f"       errors: {err}")
-        if outcome.status != "success":
-            raise SystemExit(f"[FAIL] 同步未成功（status={outcome.status}），问数没有 schema 可用")
+        job_id = await PostgresJobQueue(session).enqueue(int(ds.id), int(owner.id))
+        ran = await run_worker.run_once(session)
+        if ran != job_id:
+            raise SystemExit(f"[FAIL] 入队的是 job {job_id}，worker 那一轮跑的却是 {ran}")
+        # 终态从库里读而不是从返回值读：这一轮的 counters/errors 已经由 `run_sync` 落进
+        # `sync_jobs`，worker 也把它们打在 stdout 上了，这里只关心"能不能接着问数"。
+        status = await session.scalar(select(SyncJob.status).where(SyncJob.id == job_id))
+        if status != "success":
+            raise SystemExit(f"[FAIL] 同步未成功（status={status}），问数没有 schema 可用")
 
 
 async def run_once(question: str, *, ds_id: int | None, username: str | None) -> int:

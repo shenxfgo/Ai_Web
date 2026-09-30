@@ -19,7 +19,7 @@ from typing import Any, cast
 from sqlalchemy import Table, bindparam, delete, func, literal_column, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import (
@@ -27,7 +27,6 @@ from app.core.errors import (
     ExtractScopeTooLarge,
     NotImplementedSource,
     SourceUnreachable,
-    SyncAlreadyRunning,
 )
 from app.core.security import decrypt_secret
 from app.extractor.base import (
@@ -52,7 +51,6 @@ from app.models.meta import (
     MetaTable,
     SyncJob,
 )
-from app.models.user import User
 from app.services.datasource_service import (
     describe_source_error,
     root_cause,
@@ -576,7 +574,11 @@ class _Tally:
 
 @dataclass(slots=True)
 class SyncOutcome:
-    """`POST /api/sync/jobs` 的返回（architecture §7 的 as-built：200 直接带计数）。"""
+    """`run_sync` 的返回值：这一轮跑成了什么样。
+
+    工单 016 之后它**不是** HTTP 响应体——端点只回 `{job_id}`，这一份的去处是 worker 的
+    stdout 和用例的断言面（同样的内容已经写进 `sync_jobs` 那一行）。
+    """
 
     job_id: int
     status: str
@@ -584,35 +586,6 @@ class SyncOutcome:
     warnings: list[dict[str, Any]]
     errors: list[dict[str, Any]]
     duration_ms: int
-
-
-async def _open_job(session: AsyncSession, ds_id: int, actor_id: int) -> tuple[int, dt.datetime]:
-    """先落一行 `sync_jobs` 并提交，让 `ux_sync_running` 当场做互斥（§6）。
-
-    单独提交有两个理由：一是撞锁要**立刻**回 409，不能等到抽取跑完；二是
-    `started_at` 由库的 `now()` 生成，后面所有"本轮/上轮"的判断都以它为钟。
-    """
-    stmt = (
-        pg_insert(_JOB)
-        .values(
-            datasource_id=ds_id,
-            triggered_by=actor_id,
-            status="running",
-            phase="connect",
-            started_at=func.now(),
-            heartbeat_at=func.now(),
-        )
-        .returning(_JOB.c.id, _JOB.c.started_at)
-    )
-    try:
-        row = (await session.execute(stmt)).one()
-        await session.commit()
-    except IntegrityError as exc:
-        await session.rollback()
-        if "ux_sync_running" in str(getattr(exc, "orig", exc)):
-            raise SyncAlreadyRunning("该数据源已有一个未结束的同步任务") from exc
-        raise
-    return int(row.id), row.started_at
 
 
 async def _set_phase(
@@ -646,6 +619,30 @@ def _why(exc: BaseException) -> str:
     if isinstance(exc, AppError):
         return str(exc)[:500]
     return describe_source_error(root_cause(exc))
+
+
+def _error_entry(exc: BaseException, *, fallback_code: str = "sync_failed") -> dict[str, Any]:
+    """终局那一格的形状：`{code, detail}`，分类过的 AppError 再多带一个 `data`。
+
+    `data` 存在的理由是进程分离之后换来的：P2 时代 `ExtractScopeTooLarge.detail` 里那三条出路
+    （§6 点名要结构化返回的东西）是走 HTTP 错误 envelope 到前端的，而 202 的响应体里只有
+    `job_id`——这一列成了它到达前端的唯一一跳。只留 `_why` 那句人话，前端就只剩一个 code 能看。
+
+    `detail` 一律是字符串（结构留在 `data`），否则读这一列的人要为同一个键写两种分支。
+
+    `fallback_code` 是"没分类过的异常算哪一档"：同一个异常在"整库抽取失败"那一档是
+    `extract_failed`，在"整个作业失败"这一档是 `sync_failed`——分档由**抛出点**决定，
+    不由异常类型决定，所以它是入参而不是从 `exc` 上推。
+    """
+    entry: dict[str, Any] = {
+        # 只认我们自己分类过的 code。SQLAlchemy 的异常**也**有 `.code`（文档码，真库里实测到的是
+        # "cd3x" 这种），拿 getattr 兜默认值等于把内部码当错误分类回给前端。
+        "code": exc.code if isinstance(exc, AppError) else fallback_code,
+        "detail": _why(exc),
+    }
+    if isinstance(exc, AppError) and exc.detail is not None:
+        entry["data"] = exc.detail
+    return entry
 
 
 def _extractor_for(ds: DataSource, spec: ConnectionSpec) -> Extractor:
@@ -761,13 +758,23 @@ async def _write_catalog(
 
 
 async def run_sync(
-    session: AsyncSession, ds: DataSource, *, actor: User, force: bool = False
+    session: AsyncSession,
+    ds: DataSource,
+    *,
+    job_id: int,
+    synced_before: dt.datetime,
+    force: bool = False,
 ) -> SyncOutcome:
     """一次完整同步：连源库 → 抽 → 落库 → 收尾写 `sync_jobs`。
 
+    **作业已经不是这里开的**（工单 016）：那一行在 `job_queue.enqueue` 落成 pending，
+    由 worker 的 `claim` 打成 running，这里拿到的 `job_id` 一定是 running 的，
+    而 `synced_before` 就是 claim 那一刻库里生成的 `started_at`——本轮所有"这行是不是
+    本轮写的"的判断都以它为钟。
+
     `force` 是 §6 给 admin 的"知道大还是要点"的口子，P2 还没接（工单验收没有它）。
 
-    本函数的两条不变量（都被 `tests/integration/test_sync_pg.py` 钉着）：
+    本函数的三条不变量（都被 `tests/integration/test_sync_pg.py` 钉着）：
 
     1. **`sync_jobs` 那行一定有终局状态**，包括异常路径。`ux_sync_running` 是部分唯一索引，
        一行留在 'running' 就等于把这条源永久锁死——此后每次同步都 409，只能手工进库删行。
@@ -784,10 +791,9 @@ async def run_sync(
     warnings: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     status = "success"
-    # 在 try 之前声明：终局那一次清缓存要看得见它，而 `_open_job` 之后、循环之前的任何一步
+    # 在 try 之前声明：终局那一次清缓存要看得见它，而循环之前的任何一步
     # （解密、probe、discover）都可能直接抛出去，那时这个名字必须已经绑到一个空列表上。
     completed_database_ids: list[int] = []
-    job_id, synced_before = await _open_job(session, ds.id, actor.id)
 
     extractor: Extractor | None = None
     try:
@@ -825,7 +831,7 @@ async def run_sync(
                 completed_database_ids.append(database_id)
                 tally.merge(part)
             except ExtractScopeTooLarge:
-                raise  # 这是"拒绝开工"，不是"某一批失败"，必须让整个请求以 400 结束
+                raise  # 这是"拒绝开工"，不是"某一批失败"：不许记成 partial 继续下一个库
             except Exception as exc:  # 宽是故意的：见下面的注释
                 # 一个库失败不该把整次请求打成 500，尤其当后面的库还有得抽、前面的库已经提交完。
                 # 驱动在这里能抛的异常种类没法穷举（pymysql 的 "Already closed"、IS 查询超时…），
@@ -833,17 +839,10 @@ async def run_sync(
                 await session.rollback()
                 status = "partial"
                 tally.tables_failed += 1
-                errors.append(
-                    {
-                        # 只认我们自己分类过的 code。SQLAlchemy 的异常**也**有 `.code`
-                        # （文档码，真库里实测到的是 "cd3x" 这种），拿 getattr 兜默认值
-                        # 等于把内部码当错误分类回给前端，前端按 code 分支时就永远不命中。
-                        "code": exc.code if isinstance(exc, AppError) else "extract_failed",
-                        # 抽取失败的原因分两类：我们自己分类过的（AppError）原文就有用，
-                        # 驱动异常则只能靠错误号——把原文抛出去等于把连接串线索送给前端
-                        "detail": f"{catalog.schema_name}: {_why(exc)}",
-                    }
-                )
+                entry = _error_entry(exc, fallback_code="extract_failed")
+                # 库名前缀：一个作业可以抽多个库，只说"索引查询失败"分不出是哪个库失败。
+                entry["detail"] = f"{catalog.schema_name}: {entry['detail']}"
+                errors.append(entry)
         # §5 + §6 末条：只有"本轮确认完整枚举过"的库参与陈旧判定。一个都没成功就整段跳过——
         # 空集合会让 expanding bindparam 渲染成 `IN ()`（语法错误），而"什么都没同步到"
         # 恰恰最不该被理解成"上次同步的东西全过期了"。
@@ -884,12 +883,7 @@ async def run_sync(
     except (AppError, SQLAlchemyError) as exc:
         await session.rollback()
         status = "failed"
-        errors.append(
-            {
-                "code": exc.code if isinstance(exc, AppError) else "sync_failed",
-                "detail": _why(exc),
-            }
-        )
+        errors.append(_error_entry(exc))
         if isinstance(exc, SQLAlchemyError):
             raise SourceUnreachable(describe_source_error(root_cause(exc))) from exc
         raise
@@ -899,7 +893,7 @@ async def run_sync(
         # 用户侧的表现是"这个源再也点不动了"，只能手工进库删那行才能救。
         await session.rollback()
         status = "failed"
-        errors.append({"code": "sync_failed", "detail": _why(exc)})
+        errors.append(_error_entry(exc))
         raise
     finally:
         # 构造方言之前的失败（密钥坏、501）没有 extractor 可关，但终局状态照样要写。

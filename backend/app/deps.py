@@ -13,6 +13,7 @@ from app.core.db import get_sessionmaker
 from app.core.errors import Unauthorized
 from app.core.security import decode_access_token
 from app.models.user import User
+from app.services.job_queue import JobQueue, PostgresJobQueue
 from app.services.llm_client import LlmClient
 from app.settings import get_settings
 
@@ -20,6 +21,14 @@ from app.settings import get_settings
 async def get_db() -> AsyncIterator[AsyncSession]:
     async with get_sessionmaker()() as session:
         yield session
+
+
+def get_job_queue(db: AsyncSession = Depends(get_db)) -> JobQueue:
+    """作业队列的装配点（ADR-0011）：返回类型写 Protocol 而不是 `PostgresJobQueue`。
+
+    端点只该认这条缝的形状——换介质时改动面是这一个函数，不是每个调用点。
+    """
+    return PostgresJobQueue(db)
 
 
 # auto_error=True 时 FastAPI 自己抛的是 403，且不带我们的错误 envelope；

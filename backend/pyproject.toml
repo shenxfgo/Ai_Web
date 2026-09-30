@@ -53,6 +53,7 @@ known-first-party = ["app"]
 # 跨模块复用夹具的 pytest 写法：夹具只在自己模块内自动可见，别的模块要用就得 import 进来，
 # 而形参必须与它同名才解析得到——F811 把这一手当成"重复定义"，而它正是这条 import 存在的理由。
 "tests/integration/test_sync_cache_pg.py" = ["F811"]
+"tests/integration/test_sync_enqueue_pg.py" = ["F811"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

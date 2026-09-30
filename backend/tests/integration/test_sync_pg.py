@@ -1,7 +1,7 @@
 """同步编排的失败路径（桩抽取器 + 真元数据库）：计数诚实、锁、鉴权、规模保护。
 
 为什么这些用例不打真 MySQL：它们要的是"抽取中途炸了"这个前提，真库给不了；
-而恰恰是这些前提决定了 `partial`、409、400 这三个状态是不是真话。
+而恰恰是这些前提决定了 `partial`、409、`failed` 这三个状态是不是真话。
 `test_sync_live.py` 管"成功的时候东西对不对"，这里管"失败的时候说的对不对"。
 
 期望值口径：metadata-model §3/§5/§6 + architecture §7 + roadmap P2 验收 3
@@ -11,15 +11,19 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.core.errors import SCOPE_REMEDIES, AppError, ExtractScopeTooLarge
 from app.extractor.base import (
@@ -33,11 +37,39 @@ from app.extractor.base import (
     SourceManifest,
 )
 from app.services import sync_service
+from tests.conftest import load_script
 from tests.integration.conftest import Account
 
 pytestmark = [pytest.mark.pg]
 
 Login = Callable[..., Awaitable[Account]]
+
+# worker 的循环体按文件路径加载（`scripts/` 不是包，理由见 tests/conftest.py 的 load_script）
+RUN_WORKER = load_script(
+    "run_worker_for_sync_tests", Path(__file__).resolve().parents[2] / "scripts" / "run_worker.py"
+)
+
+
+@dataclass
+class SyncSubmit:
+    """一次「发起 + 消费」之后可断言的形状。
+
+    `status_code` 是 POST 的返回码（202 或 4xx），其余字段来自**库里那一行的终局**——
+    P2 时代它们来自同一个响应体，进程分离之后分成两跳，而这片要钉的东西没变。
+    `.json()` / `.text` 保持 httpx 的形状，是为了让绝大多数断言本体一行不改；
+    改了的只有两处，都是"落点跟着进程边界搬"的那两条（400 与 500 用例）。
+    """
+
+    status_code: int
+    body: dict[str, Any]
+
+    def json(self) -> dict[str, Any]:
+        return self.body
+
+    @property
+    def text(self) -> str:
+        return json.dumps(self.body, ensure_ascii=False, default=str)
+
 
 PASSWORD = "口令-不会出现在任何响应里"
 DS_BODY = {
@@ -248,8 +280,54 @@ async def _register(client: AsyncClient, acct: Account, **over: Any) -> int:
     return int(resp.json()["id"])
 
 
-async def _sync(client: AsyncClient, acct: Account, ds_id: int) -> Any:
-    return await client.post("/api/sync/jobs", json={"datasource_id": ds_id}, headers=acct.headers)
+async def _terminal_row(factory: async_sessionmaker[AsyncSession], job_id: int) -> dict[str, Any]:
+    """读回终局那一行，投影成 P2 响应体的字段名。"""
+    schema = os.environ["AIWEB_PG__SCHEMA_NAME"]
+    async with factory() as session:
+        rows = (
+            (
+                await session.execute(
+                    text(f'select * from "{schema}".sync_jobs where id = :id'), {"id": job_id}
+                )
+            )
+            .mappings()
+            .all()
+        )
+    assert len(rows) == 1, rows
+    row = dict(rows[0])
+    return {
+        "job_id": job_id,
+        "status": row["status"],
+        "counters": row["counters"],
+        "warnings": row["warnings"],
+        "errors": row["errors"],
+    }
+
+
+async def _sync(client: AsyncClient, acct: Account, ds_id: int) -> SyncSubmit:
+    """发起 + 消费：`POST` 只拿到 202 与 job_id，然后 await worker 的循环体把这一轮跑完。
+
+    工单 016 的已定口径是用例**不真起子进程**，所以这里 await 的 `run_once` 就是常驻循环
+    每一轮做的事。返回的 `SyncSubmit` 把库里那一行的终局投影成 P2 那套字段名，于是这片
+    所有断言本体（计数诚实、错误 code、口令不外泄）一行都不用改，变的只有进入方式。
+
+    worker 用的是一条**新连接**而不是 `client` 那条 `get_db`：真机上它们不在同一个进程里，
+    测试里共用会话就会把"两条连接各自看见什么锁"这一格糊过去。NullPool + 用完 dispose，
+    免得闲置连接挡住随机 schema 结尾那句 DROP SCHEMA。
+    """
+    resp = await client.post("/api/sync/jobs", json={"datasource_id": ds_id}, headers=acct.headers)
+    if resp.status_code != 202:
+        return SyncSubmit(resp.status_code, resp.json())
+
+    job_id = int(resp.json()["job_id"])
+    engine = create_async_engine(os.environ["AIWEB_PG_TEST_DSN"], poolclass=NullPool)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with factory() as session:
+            await RUN_WORKER.run_once(session)
+        return SyncSubmit(202, await _terminal_row(factory, job_id))
+    finally:
+        await engine.dispose()
 
 
 async def _scalar(
@@ -281,7 +359,7 @@ async def test_第二个库失败时计数只算写完的那个库(
     )
 
     resp = await _sync(client, acct, ds_id)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     body = resp.json()
     assert body["status"] == "partial", body
     assert extractor.calls == ["shop", "warehouse"]
@@ -360,11 +438,11 @@ async def test_失败之后这条源还能再同步(
     stub(fail_on="shop")
 
     first = await _sync(client, acct, ds_id)
-    assert first.status_code == 200, first.text
+    assert first.status_code == 202, first.text
     assert first.json()["status"] == "partial"
 
     second = await _sync(client, acct, ds_id)
-    assert second.status_code == 200, "第二次不该被上一次留下的僵尸 job 挡住"
+    assert second.status_code == 202, "第二次不该被上一次留下的僵尸 job 挡住"
 
     stuck = await _scalar(
         session_factory,
@@ -390,10 +468,10 @@ async def test_非_owner_不能触发同步(
     assert extractor.calls == [], "鉴权失败时连源库都不该被连"
 
     admin = await login(username="boss", role="admin")
-    assert (await _sync(client, admin, ds_id)).status_code == 200, "admin 档可以替别人触发"
+    assert (await _sync(client, admin, ds_id)).status_code == 202, "admin 档可以替别人触发"
 
 
-async def test_超过_max_tables_时整个请求回_400_且一行都不落(
+async def test_超过_max_tables_时整个作业失败且三条出路原样到达(
     client: AsyncClient,
     login: Login,
     stub: Callable[..., StubExtractor],
@@ -402,8 +480,11 @@ async def test_超过_max_tables_时整个请求回_400_且一行都不落(
 ) -> None:
     """§6 的规模保护：这是 007 认领的活（此前 `AIWEB_EXTRACT__MAX_TABLES` 全仓库无读取点）。
 
-    拒绝必须发生在**昂贵的列/索引查询之前**，而且整个请求以 400 结束——不是 partial、
-    不是"0 张表成功"。
+    拒绝必须发生在**昂贵的列/索引查询之前**，而且一行都不落——不是 partial、不是"0 张表成功"。
+
+    工单 016 改的是这件事的**落点**而不是它的实质：请求侧只入队，POST 一律 202（上限要真连库
+    数过表才量得出来，而那时响应早就发出去了），所以那三条出路如今住在 `sync_jobs.errors[]`
+    里而不是错误 envelope 里。逐字相等的断言照旧——它钉的就是"穿过编排层不许换成任意三句话"。
     """
     acct = await login(username="owner-d", role="member")
     ds_id = await _register(client, acct)
@@ -413,10 +494,11 @@ async def test_超过_max_tables_时整个请求回_400_且一行都不落(
     )
 
     resp = await _sync(client, acct, ds_id)
-    assert resp.status_code == 400, resp.text
-    err = resp.json()["error"]
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["status"] == "failed", "拒绝开工不是部分成功"
+    err = resp.json()["errors"][0]
     assert err["code"] == "extract_scope_too_large"
-    assert err["detail"]["remedies"] == list(SCOPE_REMEDIES), (
+    assert err["data"]["remedies"] == list(SCOPE_REMEDIES), (
         "§6 点名要结构化返回三条出路，且要**原样**到达。这里验的是它能不能穿过编排层："
         "run_sync 若在 rollback + 重新抛出的路上把 detail 换成一句人话（或只剩长度对得上的"
         "三句话），前端就只剩一个 code 能看——所以断言是逐字相等，不是数一下有三条"
@@ -441,7 +523,7 @@ async def test_口令不进响应也不进同步任务记录(
     stub(fail_on="shop")
 
     resp = await _sync(client, acct, ds_id)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     assert PASSWORD not in resp.text
     listing = await client.get("/api/datasources", headers=acct.headers)
     assert PASSWORD not in listing.text
@@ -500,7 +582,7 @@ async def test_多库同步时后写的库不能删光先写的库的边(
     )
 
     first = await _sync(client, acct, ds_id)
-    assert first.status_code == 200, first.text
+    assert first.status_code == 202, first.text
     assert first.json()["counters"]["relations_extracted"] == 2, "两个库各一条真外键"
     assert await _extracted_edges(session_factory, ds_id, "shop") == 1
     assert await _extracted_edges(session_factory, ds_id, "warehouse") == 1, (
@@ -514,7 +596,7 @@ async def test_多库同步时后写的库不能删光先写的库的边(
         fks={"shop": [_fk("shop", "orders", "user_id", "users")]},
     )
     second = await _sync(client, acct, ds_id)
-    assert second.status_code == 200, second.text
+    assert second.status_code == 202, second.text
     assert second.json()["counters"]["relations_extracted"] == 1
     assert await _extracted_edges(session_factory, ds_id, "shop") == 1, "还在的外键不许被差分收走"
     assert await _extracted_edges(session_factory, ds_id, "warehouse") == 0, (
@@ -545,12 +627,12 @@ async def test_还没连上源库就失败也要给_job_写终局(
 
     monkeypatch.setattr(sync_service, "decrypt_secret", _bad_key)
     first = await _sync(client, acct, ds_id)
-    assert first.status_code == 500, first.text
-    assert first.json()["error"]["code"] == "internal_error"
+    assert first.status_code == 202, first.text
+    assert first.json()["errors"][0]["code"] == "internal_error"
 
     monkeypatch.setattr(sync_service, "decrypt_secret", real_decrypt)
     second = await _sync(client, acct, ds_id)
-    assert second.status_code == 200, "密钥修好后这条源必须还能同步——上一次的 job 不许挡路"
+    assert second.status_code == 202, "密钥修好后这条源必须还能同步——上一次的 job 不许挡路"
     assert second.json()["status"] == "success"
 
     failed = await _scalar(
@@ -589,7 +671,7 @@ async def test_泛列只出告警不丢边(
     )
 
     resp = await _sync(client, acct, ds_id)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     body = resp.json()
     generic = [w for w in body["warnings"] if w["code"] == "join_field_too_generic"]
     assert len(generic) == 1, body["warnings"]

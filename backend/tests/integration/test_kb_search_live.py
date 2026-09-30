@@ -41,7 +41,7 @@ async def _search_once(
     resp = await client.post(
         "/api/kb/search",
         json={"query": query, "datasource_ids": [run.ds_id], **extra},
-        headers=run.headers,
+        headers=run.acct.headers,
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["items"]

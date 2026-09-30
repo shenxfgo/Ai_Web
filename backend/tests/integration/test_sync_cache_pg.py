@@ -80,11 +80,11 @@ async def test_同步成功要清掉本轮那个库的图(
         tables={"shop": ("orders", "users")},
         fks={"shop": [_fk("shop", "orders", "user_id", "users")]},
     )
-    assert (await _sync(client, acct, ds_id)).status_code == 200
+    assert (await _sync(client, acct, ds_id)).status_code == 202
 
     shop = await _warm(session_factory, ds_id, "shop")
 
-    assert (await _sync(client, acct, ds_id)).status_code == 200
+    assert (await _sync(client, acct, ds_id)).status_code == 202
     assert (ds_id, shop) not in join_graph._CACHE
 
 
@@ -100,7 +100,7 @@ async def test_部分失败只清提交完的那个库(
       不清就是拿旧图回答一个已经改过结构的库。
     - **失败的那个不许清**：它那一次 `_write_catalog` 整段 rollback，`meta_relation` 一行没变，
       清它是让下一次问数白跑一趟查库建图。这一格同时也是"清在 finally 里"的证据——
-      整次请求的状态是 `partial`，成功分支末尾那段收尾根本没执行。
+      这一轮 job 的终局是 `partial`，成功分支末尾那段收尾根本没执行。
     """
     acct = await login(username="owner-cache-partial", role="member")
     ds_id = await _register(client, acct, include_schemas=["shop", "warehouse"])
@@ -110,13 +110,13 @@ async def test_部分失败只清提交完的那个库(
         "warehouse": [_fk("warehouse", "shipments", "order_id", "orders")],
     }
     stub(catalogs=("shop", "warehouse"), tables=tables, fks=fks)
-    assert (await _sync(client, acct, ds_id)).status_code == 200
+    assert (await _sync(client, acct, ds_id)).status_code == 202
     shop = await _warm(session_factory, ds_id, "shop")
     warehouse = await _warm(session_factory, ds_id, "warehouse")
 
     second = stub(catalogs=("shop", "warehouse"), tables=tables, fks=fks, fail_on="warehouse")
     resp = await _sync(client, acct, ds_id)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     assert resp.json()["status"] == "partial", resp.json()
     assert second.calls == ["shop", "warehouse"], "桩没走到失败那一步，上面两条断言就是空的"
 
@@ -138,11 +138,11 @@ async def test_一个库都没写成时一个键都不清(
     acct = await login(username="owner-cache-none", role="member")
     ds_id = await _register(client, acct)
     stub(tables={"shop": ("orders", "users")})
-    assert (await _sync(client, acct, ds_id)).status_code == 200
+    assert (await _sync(client, acct, ds_id)).status_code == 202
     shop = await _warm(session_factory, ds_id, "shop")
 
     stub(tables={"shop": ("orders", "users")}, fail_on="shop")
     resp = await _sync(client, acct, ds_id)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
     assert resp.json()["status"] == "partial", resp.json()
     assert (ds_id, shop) in join_graph._CACHE
