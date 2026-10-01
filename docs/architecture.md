@@ -821,9 +821,17 @@ Chat 单条 assistant 消息的分区（都是可折叠 panel，默认按阶段�
 > worker 侧 `scripts/run_worker.py:40` 已把策略切成 `WindowsSelectorEventLoopPolicy`，异步理论上能跑，
 > 但同步这一路在两种环流下都不踩那个坑，而且与 `mysql.py`/`pymysql` 同形（`_rows` 是唯一 I/O 出口，
 > 编排因此能在不连库的情况下被单测钉住），所以选它。元数据库那一格继续 `asyncpg`，与 ① 的结论不变。
-> **仍未证的**：`postgres.py` 的五条 SQL 没有连过 §1.5 的 `ai_web_demo_pg`（那个库还没建），
-> 本表的最终结论"PG 源抽取跑通"要等工单 024 的 live 半边；已证的边界写在 metadata-model §8.2
-> 末注 as-built(P3-024)。
+> **as-built(P3-024 live)：本表"PG 源抽取跑通"那一格现在有了执行证据。** `postgres.py` 的五条 SQL
+> 已真发往 §1.5 的 `ai_web_demo_pg`（`tests/integration/test_extract_pg_live.py` 四条，走真
+> `POST /api/datasources` → `POST /api/sync/jobs` → worker 循环体），同步 + `to_thread` 这一路把
+> 五条发完、把 10 对象/82 列/14 索引/6+2 条关系/10 张卡落了行。一句限定：用例跑在
+> `tests/conftest.py` 强制的 `WindowsSelectorEventLoopPolicy` 下，与 worker 进程
+> `run_worker.py:40` 的策略同型，所以这一轮**没有**覆盖 ① 那个 Proactor 场景——而它也不需要：
+> 抽取器只在 worker 进程里跑，API 进程对 PG 源连的是 501 那条早退路径（见 verification §1.6 第 2 步）。
+> 对账数字与"仍没证到的那一格"写在 verification §1.6.1 与 metadata-model §8.2 末注 as-built(P3-024)。
+> live 同时抓出两个**不在本表这一格里**的缺陷（推断边的 catalog 查找键写死了 MySQL 惯例、
+> `enum_values` 落的是 JSON `null` 而不是 SQL NULL），理由与修法分别写在 metadata-model §4 与 §2.4
+> 的 as-built(P3-024) 两块。
 
 - **不用 SQLAlchemy 的 `inspect()` 做远端反射**：MySQL 方言没有 `get_multi_*` 批量覆写，会逐表
   `SHOW CREATE TABLE` 正则解析（2000 表 = 2000+ 次往返），且丢 `STATISTICS.CARDINALITY`、`SUB_PART`、

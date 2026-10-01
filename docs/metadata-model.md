@@ -199,7 +199,12 @@ UNIQUE (datasource_id, catalog_name, schema_name, table_name)
 > as-built(P3-024)：这一档已经落地（`app/extractor/postgres.py::rows_to_tables` 走 `_later()`，
 > 视图恒 NULL 与注② 同口径），注③ 那套时区 attach **PG 侧不需要**——`timestamptz` 回来的就是
 > aware `datetime`（本机 PG 18.6 + psycopg 3.3.6 实测带 `ZoneInfo('Asia/Shanghai')`），
-> 没有隐式转换可防。未在 `ai_web_demo_pg` 上证过。
+> 没有隐式转换可防。
+> as-built(P3-024 live)：**"非空"与"视图恒 NULL"两格已在真 `ai_web_demo_pg` 上证过**
+> （`tests/integration/test_extract_pg_live.py` 验收 5），但**"取较晚者"这一支证不到**——
+> 本轮只读 `pg_stat_user_tables` 实测（schema `demo`，10 行）：7 行只有 `last_autoanalyze`、
+> 3 行两枚全空、**0 行两枚都在场**。所以分辨力全在 `tests/unit/test_extract_pg_map.py` 那颗桩上，
+> 而不是 live 上（详见 §8.2 末注"证到哪一步"）。
 
 **`aiweb.meta_column`**
 
@@ -534,6 +539,12 @@ DELETE FROM aiweb.meta_relation
   `now()`：PG 的 `now()` 是事务时间戳，同一事务内恒定，拿它和自己比永远不成立。
 - `enum_values` 归同步列而不是人工列：它是源库 `COLUMN_TYPE` 的投影（§8.1 C 的 `enum_def`），
   同步每次都能重算出来，人工改它没有意义（要改语义写 `comment_zh`）。
+- **as-built(P3-024)：`enum_values`/`sample_values` 两格的"没有值域"是 SQL NULL，不是 JSON `null`。**
+  SQLAlchemy 的 `JSON`/`JSONB` 默认 `none_as_null=False`，它把 Python `None` 序列成 `'null'::jsonb`
+  落库，于是 `IS NOT NULL` 成立、`count(*) filter (where enum_values is not null)` 会把每一列都数进去
+  （live 第一次跑 PG 源就是 82 列全中）。声明处因此写 `JSONB(none_as_null=True)`（`models/meta.py`）：
+  只改绑定值、不改 DDL，所以迁移 0004 不动；老行由下一次同步自清（`enum_values` 在
+  `_COLUMN_SYNC_COLS` 里是整列覆盖，不是 `COALESCE` 保旧）。
 
 ## 4. `meta_relation.source_kind` 与删除差分
 
@@ -543,6 +554,12 @@ DELETE FROM aiweb.meta_relation
   > 否则每次点"同步"人工补录的关系全没了。
 - `inferred` 由命名约定打分产生（`confidence` ≥0.8 才进 prompt，标签 `[推断,置信 0.87]`），
   UI 可一键 accept → 转成 `manual`（`GET /metadata/relations/inferred` + `POST /metadata/relations`）。
+  > **as-built(P3-024)**：一条推断边要落库，先得查到两端的 `meta_table.id`，而那张表的查找键是
+  > `(catalog_name, schema_name, table_name)` 三元组（§1 的规范化列：MySQL 的 catalog 恒空串、
+  > PG 的是目标库名）。`InferredRelation` 因此带一个 `catalog_name`，值跟着**发起侧那一列**走，
+  > 写侧不许把它写成空串——写死 `""` 的写法在 MySQL 演示库上跑了一年都对，到 PG 源上就是
+  > **每条推断边都查不到 id 而静默丢弃**（`counters.relations_inferred` 回 0，不报错、不告警）。
+  > `extracted` 那一路从来是按 `fk.catalog_name` 查的，两边同构才对。
 - `extracted` 不可在 UI 删除（`DELETE /metadata/relations/{id}` 只允许 manual/inferred）。
 - `is_authors_enforced` 记录"外键存在但库没启用 FK 约束"这类现实情况。
 - **as-built(0007)：delete-diff 的范围是"本轮写完的那些库"**（`from_table_id IN (这些库的表)`），
@@ -1139,8 +1156,10 @@ WHERE con.contype='f' AND sn.nspname = ANY(%s);
 PG 侧 `indkey::int[]` 与 `unnest ... WITH ORDINALITY` 用来**保序**，`atttypmod` 用来归一
 `numeric(10,2)` / `varchar(n)`。
 
-> **as-built(P3-024)：本节五条 SQL 的落地版在 `app/extractor/postgres.py`，与原文有七处出入。**
-> 逐条理由写在那个模块的 docstring（它是目录），这里只留两处**照抄原文就会报错**的坑和口径摘要：
+> **as-built(P3-024)：本节五条 SQL 的落地版在 `app/extractor/postgres.py`，与原文有八处出入。**
+> 逐条理由写在那个模块的 docstring（它是目录）——那边只编到 7，因为它的偏离 2（CASE 搬出 SQL）
+> 与这里的 ⑧（搬走之后"本节原文 ≠ 落地查询文本"这条比对后果）是同一处改动的两面。
+> 这里只留两处**照抄原文就会报错**的坑和口径摘要：
 >
 > ① `= ANY(%s)` 换成 `= :schema` + `IN (:tbl_N)`。020 的按批形状要具名绑定参数，而表名是用户填的，
 > 拼进语句文本就是注入面（与 §8.1 注② 同一口径）。
@@ -1167,25 +1186,37 @@ PG 侧 `indkey::int[]` 与 `unnest ... WITH ORDINALITY` 用来**保序**，`attt
 > 的差别只有绑定参数写法与新增的表名过滤，C 却还少了整整一段投影。所以比对别拿本节原文去 diff
 > `build_sql_columns()`，会误判成漏了字段。
 >
-> 三处原料在 §2.4 没有落点、因此不硬造语义：表达式索引的那位 `column_name` 是 NULL（索引**文本**
-> 没有列可存）、部分索引的谓词 `indpred` 没有列、以及 ⑥ 的合计尺寸。
+> 三处原料在 §2.4 有没有落点上分两档，别混着说：**部分索引的谓词 `indpred`** 与 **⑥ 的合计尺寸**
+> 确实没有列，因此不硬造语义；而**表达式索引的文本**是有列的——§2.4 的 `meta_index.funcdef`
+> （列在 `models/meta.py:199`，同文件 :213 那句"名字落在 funcdef 里"说的就是它），只是 `RawIndexColumn` 没有搬运它的
+> 字段，D 条取到的 `pg_get_indexdef(...) AS def` 在映射处被丢弃，所以那一格今天恒为 NULL。
+> 这是一个**缺口**而不是设计：`tests/integration/test_extract_pg_live.py` 钉的是"当前为空"，
+> 补它的人要让 def 走到落库并连卡片模板一起看（模板现在按列名渲染，那位是空的）。
 >
-> **证到哪一步（诚实边界）**：①③④⑦ 有执行结果做凭——五条 SQL 都真发过、真回了行，但发往的是
-> **本机那台 PG 服务上的元数据库**（只读 SELECT/SHOW，不落一行、不发 DDL），**不是** §1.5 的
-> `ai_web_demo_pg`（它还没建）；②⑤⑥⑧ 是读原文与 §2.4/DDL 得出的判定（⑧ 那格另说：它改的是
-> SQL 文本本身，本轮既没在真库上证过搬走 CASE 后的 C 条、也证不到"`jsonb_agg` 回来是 Python
-> `list`"——元数据库里一个枚举类型都没有，那一段 CASE 本机全部回 NULL）。所以"这四条查询语法能跑、
-> 返回形状如此"是证过的，"演示源的 10/9/1/11 抽得出来、七个类型原料归一对"还没证——那半在
-> 工单 024 的 live 用例里，等 `demo_pg.ps1` 跑完。
-> **那次取证本身是一处已记偏离**：工单 024 的已定口径写着"元数据库 `aiweb` 与 `aiweb_test`
-> 一个都不许当源库抽取"，而"拿 §8.2 的五条 SQL 去问一台真 PG"按字面就是越了这条界。减害是
-> 只读、不建结构、不落 `meta_*` 行、且没走"登记数据源"那条路（连接参数取自应用侧连元数据库的那份
-> 设置，不是源库账号 `demo_pg_ro`）；`aiweb_test` 那一次未被触碰。这条写在 024 交付记录的
-> 「记下的偏离」里等追认，不因为只读就当作没发生。
-> **本片不猜的一格**：C 条的枚举取值段按列**自己**的 `t.typtype='e'` 判，元素类型才是枚举的
-> 数组列（`typname` 是 `_order_status` 那一形）会不会命中，本轮无从验证——§1.5 的演示库里
-> 根本没有 `CREATE TYPE`。若它不命中，`normalize` 会把未知基名原样放行，`data_type` 就成了
-> 值域之外的 `order_status[]`。这一格连同"要不要改判元素类型"一起留给 live 半边。
+> **证到哪一步（诚实边界，as-built(P3-024 live)）**：五条 SQL 都已真发往 §1.5 的
+> `ai_web_demo_pg`（`tests/integration/test_extract_pg_live.py` 四条 live 用例，逐字对账清单在
+> verification §1.6.1），所以 ①④⑦⑧ 有执行结果做凭，②⑥ 也在真数据上证到了各自那句
+> （`modifiers` 白名单在 `customer.name`/`product.price`/数组列三档各回其所预期的值；
+> `meta_database.approx_size_bytes` 实测落 NULL）。③ 那一句（每批重取整个 schema 的外键会把同一
+> 关系落两次）live 证不到——演示库 10 个对象在默认批 200 下只有一批，它由
+> `tests/unit/test_extract_pg_client.py` 那颗 4 批的桩钉住；真数据侧只证到"6 条外键没有重复"。
+> ④ 也要补一刀限定：live 逐张比的是"`meta_table.last_analyze_at` == 源库那两枚里较晚的一枚"，
+> 而本轮实测（只读 `pg_stat_user_tables`，schema `demo`）拿到的是 **7 张只有 `last_autoanalyze`、
+> 3 张两枚都空（`category`/`t_no_comment` 与内部标记表）、0 张同时在场**——所以"两枚都在场时取
+> 较晚的那一枚"这个分支在真库里没有样本，分辨力仍在 `test_extract_pg_map.py` 那颗两枚都摆出来的桩上。
+> 真跑证到的是另外两件事：搬运没走样（aware datetime 原值落进 `timestamptz` 再读回相等），
+> 以及"两枚都空的表留 NULL、视图恒 NULL"这一支（`category`/`t_no_comment` 就是那两张）。
+> **还没证到的语法分支是 ⑤ 的 `relkind`**：演示库里只有 `'r'` 与 `'v'`，分区表（`'p'`）/物化视图
+> （`'m'`）/外部表（`'f'`）三支一条都不在场，所以"少了原文那两支会不会有别的后果"仍是从 §2.4
+> 那道 `CHECK` 推的判定，不是实测。
+> 早先那次拿元数据库当取证靶（只读、不落行、不发 DDL，按工单 024 的已定口径按字面越界）
+> 现在被真跑覆盖了——这正是 024 交付记录里给那条偏离写的出路；越界这件事本身仍记在那条记录里，
+> 不因为证据被替换就当没发生。
+> **仍未猜的一格**：C 条的枚举取值段按列**自己**的 `t.typtype='e'` 判，元素类型才是枚举的
+> 数组列（`typname` 是 `_order_status` 那一形）会不会命中，live 也覆盖不到——§1.5 的演示库里
+> 根本没有 `CREATE TYPE`（`typtype='e'` 实测 0 行）。若它不命中，`normalize` 会把未知基名原样放行，
+> `data_type` 就成了值域之外的 `order_status[]`。这一格连同"要不要改判元素类型"一起
+> **仍没人认领**：它需要一个带真枚举类型的源才证得了，024 交付完还挂着。
 > 类型归一在 PG 侧的接线（023 留的那半）也落了：`build_sql_columns` 把 `format_type(...)` 的原文
 > 交给 `postgres_types.normalize()`，`data_type` 存归一值、`raw_data_type` 存原文。
 

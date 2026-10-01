@@ -306,6 +306,82 @@ PASS  enum:customer.level=4            ← normal/silver/gold/platinum
 | 账号 | `demo_pg_ro`，口令来源 `backend/.setup/demo_pg_ro.env` 的 `PGPASSWORD=`（不进对话、不进 git） |
 | 期望探测结果 | `table_count=9`、`view_count=1` |
 
+> **as-built(P3-024)**：这一格今天**人肉点不到**。工单 024 只把"同步"那条路按 kind 分发
+> （「涉及层」点名的是 `sync_service._extractor_for`），`datasource_service._connect_and_describe`
+> 仍然 `kind != 'mysql'` 就抛，所以 PG 源点"测试连接"得到的是 501 `not_implemented`。
+> 那两个数本轮是按 §1.5.4 的自检查询与 live 落库行数对上的，不是探测端点回吐的；
+> 接探测那一张片（未认领，见 §2.1 末注）跑通后这一格才算被界面路径证过。
+
+### 1.6 PG 源同步手测（工单 024 验收 7）
+
+前置：§1.5.3 跑完（`ai_web_demo_pg` 已建、`backend/.setup/demo_pg_ro.env` 在场且 `PGUSER=demo_pg_ro`——
+拿超管跑下面这些步的话，第 9 步那三条"期待失败"会全绿成"竟然读得到"，判定就反了）；
+元数据库侧 `uv run alembic upgrade head` 到位；两条进程都起着（`dev.ps1 dev` + `dev.ps1 worker`）。
+
+| # | 动作 | 期望证据 |
+|---|---|---|
+| 1 | 新建数据源 `demo-pg`：`kind='postgres'`、`host`/`port` = `127.0.0.1`/`5432`、**库名填进 `catalog_name`**（`ai_web_demo_pg`，不是 MySQL 那样留空）、`include_schemas=["demo"]`、`exclude_tables=["\\_%"]`、账号 `demo_pg_ro` | 201 + `id`；那一行的口令只存在于 `secret_enc`（Fernet 密文），`data_sources` 里任何一列都不是明文 |
+| 2 | 点"测试连接" | 501 `not_implemented`（见上面 §1.5.5 的 as-built 注）——**这一行是"应该还没有"而不是"失败"** |
+| 3 | 立即同步 | `POST /api/sync/jobs` → 202 + `job_id`；终局 `status='success'`、`errors=[]`、`warnings=[]`、`counters` 逐字见 §1.6.1；`sync_job_event` 按 `seq` 从 1 连续可回放、最后一帧 `stage='done'`；`tables` 那一帧的 `payload.batches` 是**一个含 10 个表名的列表**（`AIWEB_EXTRACT__BATCH_SIZE` 默认 200，10 对象抽不满一批） |
+| 4 | 元数据浏览 → `product` | 8 列；中文注释在场（`tags` 一列的注释是「标签数组（text[]，归一化考点）」）；三棵索引，其中 `ix_product_name_lower` 的**索引列位置是空**（表达式索引：`indkey` 那一位是 0，§8.2 D 接不到 `pg_attribute`），`ix_product_on_sale` 的索引列是 `price` 而不是 `status`（`WHERE` 只是谓词） |
+| 5 | 元数据浏览 → `v_daily_sales` | `table_type='VIEW'`、四列且列注释全空（夹具刻意不写注释，抽取器不许补造）、`engine IS NULL`（没被硬造成 `heap`）、`last_analyze_at IS NULL`（视图本来就不在 `pg_stat_user_tables` 里，§2.4 注② 的口径是方言无关的） |
+| 6 | 元数据浏览 → `t_no_comment` | 表注释与四列注释全空、没有任何一列是主键（它没有 PRIMARY KEY）、`is_indexed` 全 false；它**在名单里**——名字没有下划线前缀，不归排除规则管 |
+| 7 | 关系页 | 6 条 `extracted`（`fk_category_parent`/`fk_product_category`/`fk_order_main_customer`/`fk_order_item_order`/`fk_order_item_product`/`fk_payment_order`，`on_delete` 全是 `NO ACTION`——夹具一条 ON DELETE 子句都没写）+ **2 条 `inferred`**（`user_activity_log.product_id → product`、`product_stats_wide.product_id → product`，都是 1.00）；`user_id` 不在推断清单里（库里没有 `user` 表，§5.3 不许编） |
+| 8 | `select ... from aiweb.meta_column` 抽类型 | §1.6.1 那张七类原料表逐字一致：`data_type` 是 §9 归一值、`raw_data_type` 是 `format_type` 的 PG 原文 |
+| 9 | （反向）用 `demo_pg_ro` 手工连源库 | 读 `other_app.secret_table`、`INSERT demo.t_no_comment`、连进 `aiweb` 读 `aiweb.users` 三条都以 `permission denied` 失败（§1.5.3 末条的同一复验，只认这一个错误码） |
+
+#### 1.6.1 实跑输出的枚举清单（一次 PG 同步的全部对账数字）
+
+本轮实跑（2026-10-01，`ai_web_demo_pg` + `demo_pg_ro`）终局 counters，逐字：
+
+```
+{'databases': 1, 'tables': 10, 'columns': 82, 'indexes': 14,
+ 'relations_extracted': 6, 'relations_inferred': 2, 'tables_stale': 0,
+ 'tables_failed': 0, 'cards': 10, 'batches': 1}
+```
+
+`tables=10` 是 9 张 BASE TABLE + 1 张 VIEW（排除规则生效后的全计数，§1.5.4 首行 `business_objects=10`
+同字）；`columns=82` 是逐张数过 `init_demo_pg.sql` 的 `CREATE TABLE`：7+3+8+9+6+6+10+25+4+4；
+`indexes=14` = 8 张有主键的表各一棵 `*_pkey`（`t_no_comment` 无主键、视图无索引各出 0 棵）
++ `uq_customer_phone` + `order_main_order_no_key` + `payment_record_trade_no_key`
++ `ix_product_name_lower` + `ix_product_on_sale` + `ix_order_main_customer_created`，
+它们在 `meta_index_column` 占 **15** 位（只有最后那棵复合索引占 2 位）；`cards=10` 是一表一卡——
+PG 侧最宽的 `product_stats_wide` 只有 25 列，过不了 kb-workflow §6 那条 40 列切片线
+（MySQL 版的同名表 68 列，所以那边是 12 张，差异来自两份夹具的 DDL 而不是切片逻辑）。
+
+七类类型原料（015 的 `typ` CTE 同一份清单，`raw` = `format_type` 原文、`norm` = §9 归一值）：
+
+| 表.列 | `raw_data_type` | `data_type` |
+|---|---|---|
+| `customer.remark` | `text` | `text` |
+| `product.attrs` | `jsonb` | `jsonb` |
+| `product.tags` | `text[]` | `text[]` |
+| `user_activity_log.hit_ids` | `integer[]` | `int[]` |
+| `user_activity_log.scores` | `numeric(10,2)[]` | `numeric(10,2)[]` |
+| `user_activity_log.occurred_at` | `timestamp with time zone[]` | `timestamptz[]` |
+| `product_stats_wide.top_keywords` | `character varying(64)[]` | `varchar(64)[]` |
+
+外加三条只在 PG 侧才有的对账：`customer.name` 的 `char_length=64`（`character varying(64)`），
+`product.price` 的 `numeric_precision/scale = 10/2`，而**数组列的三个修饰值全空**——
+`character varying(64)[]` 里那个 64 属于元素而不属于列，填上就是假话。`serial` 与 `identity`
+都是 `integer`/`int`，分开靠 `default_value`：`customer.id` 是 `nextval(...)` 那一串，
+`order_main.id`/`payment_record.id` 是 NULL（两份都不是生成列）。
+
+**这一路的证据边界（本轮真跑说清楚）**：上面每一个数字都来自
+`tests/integration/test_extract_pg_live.py` 的四条 live 用例——它们走真 `POST /api/datasources`
+→ `POST /api/sync/jobs`（202）→ worker 的循环体 → 回读元数据库那一行，源库是真 `ai_web_demo_pg`、
+账号是真 `demo_pg_ro`、§8.2 五条 SQL 一条不落空。两处按工单 016 的已定口径**没有**真起子进程
+（`run_once` 在测试进程里代跑），而第 4~8 步的**界面**侧未逐字复跑，是"库里的行"证到的。
+仍未证到的那一组也说清楚（**唯一一份清单在 metadata-model §8.2 末注"证到哪一步"**，别处只指它）：
+`typtype='e'` 的真枚举类型在这个演示库里一个都没有（§1.5.4 实测 0 行），所以 §8.2 C 那条
+`jsonb_agg(...)` 的形状 live 覆盖不到——本轮能证的只有"没有枚举时那一格落
+**SQL NULL** 而不是 JSON `null`"，而这一句本身是 live 抓出来的（`enum_values` 一度 82 列全非空）；
+同类的还有 `relkind` 的 `'p'/'m'/'f'`（夹具只有 `r`/`v`）、④ 的"两枚时间戳同时在场时取较晚那枚"
+（实测 0 张表两枚都在场）、③ 的"每批重取 FK 会不会落两次"（默认批 200 只有一批）。
+第 9 步的四条判定不在 live 用例里（用例只把"`PGUSER` 必须是 `demo_pg_ro`"钉成前置，越权那一格留给脚本）：
+本轮由一次性 psql 复验跑过、跑完即删，仓库里可复跑的那一份住在 `scripts/demo_pg.ps1` 的收尾复验里
+（§1.5.3 末条，"已建过"分支也会重跑一遍）。
+
 ## 2. 测试分层
 
 ### 2.1 单元测试重点（纯函数，不碰 DB / 不碰网络）
@@ -326,7 +402,7 @@ PASS  enum:customer.level=4            ← normal/silver/gold/platinum
 | `job_queue` 两条语句的**形状**（as-built(P3-016)：`app/services/job_queue.py` 的 `enqueue_stmt` / `claim_stmt`） | 编译成 PG 方言文本比对，**不执行**（与 `test_sync_upsert_sql.py` 同一条理由：进程分离的三条口径——互斥靠 `ux_sync_running`、claim 靠**条件更新行数**、排队中的 pending 也算未结束——全是"语句长什么样"的事，写错一个谓词在真库上照样可能绿。`claim` 少外层那个 `status='pending'` 就是两个 worker 同时抽同一个源，而这一格要到 019 的僵尸回收真跑起来才看得见） | ① 入队只写 `pending`：`INSERT` 里不许出现 `running`，也不许顺手把 `started_at` / `heartbeat_at` 点上（那两列是 claim 的钟，也是"响应返回时这一轮还没开始跑"的可断言证据）；② claim 两处条件缺一不可：`FOR UPDATE SKIP LOCKED`（多 worker 各拿一个、谁都不等谁）+ 外层 `AND status='pending' RETURNING`（行数才是"我抢到了"的判据），且终局那几列（`finished_at`/`counters`）不许出现在这里。行为侧的七条在 `tests/integration/test_sync_enqueue_pg.py`（202/409/第二 worker 空手/源删后级联带走 job 行/终局三样/入队顺序） |
 | `run_worker` 一轮心跳的三条语句（as-built(P3-018)：`scripts/run_worker.py` 的 `heartbeat_update_stmt` / `reclaim_update_stmt` / `retention_delete_stmt`） | 同一套手法：编译成 PG 方言文本比对，**不执行**。三条口径全是"语句长什么样"的事——心跳只动 `heartbeat_at` 那一格、回收往 `errors`（`jsonb`，**没有 `error` 这一列**）里**追加**、保留期只删 `sync_job_event`——写错一个谓词或把追加写成覆盖，在真库上照样可能绿（`tests/unit/test_worker_reclaim.py`，7 条） | ① 刷钟那条里 `finished_at`/`errors`/`failed` 一个字都不许出现（它是"我还活着"的声明不是终局），且带 `status IN ('pending','running')` 守卫：收尾先落定时这一句必须打不中；② 回收那条逐字对上 §6 表格原句——`errors = (errors || CAST('[{"code":"reclaimed","detail":"heartbeat 超时"}]' AS JSONB))`、`heartbeat_at < now() - make_interval(secs => N)`、`RETURNING id` 三者缺一不可，条目常量 `RECLAIM_ENTRY_JSON` 直接抄文档字面量（`json.loads` 比回去只能证明序列化没变形，证明不了那两个词没被改写）；③ **阈值是入参不是字面量**：换 42 重编译，文本里必须出现 42 且不出现 180；④ 保留期那条编译文本里只许出现 `sync_job_event`，出现 `sync_jobs` 就是灭迹。⑤ **三个键各喂给哪个参数**：`cadence(settings)` 是那条映射的唯一住处（`loop()` 里不出现第二个 `settings.extract.*`），用例拿三个互不相同的数（11/181/31）断它——这条是补上来的：把 `interval_s` 与 `stale_seconds` 互换后跑完整轮，**只有这一条红**（真效果是刷钟 181s、回收阈值 11s，正在跑的作业被自己的 worker 判成僵尸）。⑥ **阈值不是整数就当场抛**：`180.7` / `True` / `"7; DROP TABLE x"` / `None` 四种都从**公共** builder 驱动，期望 `(TypeError, ValueError)`；同一用例再断 `180` 正常编译，否则"全拒"和"没生效"分不开。理由是实测：`int()` 式闸门会把 180.7 悄悄截成 180，而 `make_interval` 那条语句的全部语义就是"差多少秒算僵尸"。行为侧五条在 `tests/integration/test_worker_heartbeat_pg.py`：主事务未提交时换连接已可见、一轮循环改判 + 补终局事件、NOTIFY 丢失时最迟一个心跳周期仍读到、179s 不动 / 181s 判失败 / `pending@NULL` 不杀、保留期删 31 天那行且 `data/results/` 清单快照逐字节相同 |
 | MySQL 读侧的**发送切片**（as-built(P3-020)：`app/extractor/mysql.py` 的 `slice_names` + `collect()` 的批循环 + `SourceManifest.batches`） | 切片是纯函数、批是编排，两层分开钉：`collect` 的批语义钉在**假连接**上（`_rows` 是方言层唯一的 I/O 出口，同 §2.1 `test_extract_mysql_client` 那条理由），真库那一份钉在拦下来的语句清单上。为什么必须两层：假件看得见"第 k 条昂贵查询收到哪几个表名"，真库只看得见条数与顺序，而这两件都不是"总共发了几条" | 单测 11 条在 `tests/unit/test_extract_mysql_batching.py`：① 验收 2 那三个边界各一条（整除无空末批 / 末批只剩 1 张 / `batch>N` 退化成一批，外加空名单回 `[]` 而不是 `[[]]`——`collect` 靠"没有表就不发 C/D/E"躲开 `IN ()` 这个语法错误）；② `batch_size` 非正整数当场抛（`0` 会让切片要么死循环要么空清单）；③ 三条昂贵查询各 4 发、**每发各自的名单**——那四刀是手写的字面量，不写 `slice_names(VISIBLE, 3)`：用被测的那把刀去算刀口，红了也只是"刀和期望一起改错"；④ 反注入两条一起断（占位符 `:tbl_0..n` 与这一批的表名**逐一对应**，且语句文本里一个真表名都不出现——只断前者的话"`IN (:` + 拼接"那种形状照样过）；⑤ 退化路径与分批前同形（默认 200 在 10 个对象上必须退回"一 schema 四条"，防"分批把自己变成永远多发"）；⑥ 分批不改归并结果（批大小 3 与 200 抽出的列/索引逐个相同）；⑦ `MAX_TABLES` 仍在昂贵查询**之前**判（断的是 IS 语句**条数**==1，不是错误码——把门槛挪到 C/D/E 之后也照样抛同一个错）；⑧ 批间隔用耗时下限钉（120ms×3 个间隔 → `>=0.36`，并留 `<0.6` 的上限排除"每批之前都睡"）。live 两条在 `tests/integration/test_extract_mysql_live_batches.py`（验收 1/3/4/5/7）：批名单同时出现在事件负载与那三条昂贵查询的 `IN` 清单里，两边逐批相等；间隔 250ms 时 4 批之间三个间隙各 `>=0.25s`（实测同一份源：间隔 0 那一轮 `duration=1125ms`、间隔 250 那一轮 `1985ms`，差出来的就是那三次让气）。名单**不硬写"第一批是哪三张"**——§8.1 B 没有 `ORDER BY`，交付顺序不是源库的承诺；断的是每批的成员（批大小逐个钉 3/3/3/1、批间不重叠、并起来正好是 §1 那份 10 个对象的名单）。**验收 5 比的是另一次真跑而不是 008 的 golden**——那七份快照喂的是手工摆出来的 `meta_*` 输入（见上面卡片 golden 行），拿它对演示库等于比两件本来不该相等的事；做法是先按 200 跑一轮、再按 3 跑一轮，比五张 `meta_*` 行数与全部卡片 `text_md` 逐字符，只放行 `counters.batches` 那一格变化。**同一轮还比索引那条链的形状**（验收 7"P3 只补'分批后每批都还读到'那一格"）：两侧各取一份按 `(表名, 索引名, SEQ_IN_INDEX)` 排序的 `(列名, SUB_PART, cardinality 是否非空)` 清单逐位相等，再对分批那一次断每一行 `cardinality` 都非空、且全库唯一那处前缀索引 `product.name(32)` 仍在场。比"非空"而不比**数值**：`CARDINALITY` 是 InnoDB 的采样估算，两次真跑之间它可以合法地变，把"分批没改变结果"钉在它上面就变成看运气发红。这跟 007 那条 `test_sync_live.py::test_验收2_cardinality_与_sub_part_真的有非空值` 不互替——那一条走的是默认批大小（10 个对象一批装完），证的是链通着；"切成四批后每批还读得到"只有走分批那条路才答得出。实测变异：D 条投影换成 `NULL AS CARDINALITY, NULL AS SUB_PART` 后这条 live 用例红在 `has_cardinality` 那一行（007 那条同步变红，两个靶心各自独立）。**两个键都走真配置通道**（`monkeypatch.setenv` + `get_settings.cache_clear()`，同 021 的 `max_tables_one`）：桩掉 `get_settings` 的话"`run_sync` 有没有把配置传给方言"就永远验不到。实测过——把 `sync_service.py:989` 那行换成硬编码 `200`：`test_sync_events_pg.py` 只红 `test_分批的两个配置键真有读取点_每批的表名随_tables_帧交回` 那一条，live 两条**一起红**（`counters.batches` 变成 1），而方言层那 11 条单测全绿——它们自己传 `batch_size`，本来就不该替编排层背书 |
-| PG 抽取器的**不连库那一半**（as-built(P3-024)：`app/extractor/postgres.py` 的五条 §8.2 SQL 与行→`Raw*` 映射，加上 `sync_service` 的方言驱动表 `_DIALECTS`） | SQL 文本与映射钉在**假连接**上（`_rows` 仍是方言层唯一的 I/O 出口，同上面 020 那行的理由），501 分发与"列写法跟着 kind"钉在纯函数 + 真 `run_sync` 上 | **30 条不连库单测分两张**：`tests/unit/test_extract_pg_map.py` 14 条吃 §8.2 那条查询**自己的别名**当行键（假件与真 SQL 同形才有意义），钉的是 serial 与 identity 分得开（`default_value` 是 `nextval(...)` 那一串）、`_text[]`/`numeric(10,2)[]` 走 023 的归一而 `raw_data_type` 留原文、`modifiers` 白名单只认 `varchar`/`bpchar`/`numeric` 且数组一律 `NULL`、表达式索引那一位的 `column_name` 是 `NULL`（§8.2 D 的分支）、视图 `last_analyze_at` 恒 `NULL` 而表取 `last_analyze`/`last_autoanalyze` **较晚者**（§2.4 注④ 的 PG 半边）、`idx_scan` 只进 `cardinality_hint` 不进 `cardinality`（单位不同）。`tests/unit/test_extract_pg_client.py` 16 条把编排钉在同一颗桩上：`probe` 的三值 + **只有 42704 才降级**（`OperationalError` 且 `sqlstate is None` 不许被吞——那是连不上，不是版本不支持）、`discover` 排除三个系统 schema 与 `pg\_temp%`/`pg\_toast%`、四条查询的发出顺序 `pg_class → pg_index → pg_attribute → pg_constraint`、空范围**不发 `IN ()`**、`MAX_TABLES` 仍在昂贵查询之前判且三条出路原文到达、PG 侧永不产出 `CHARSET_SUSPECT`（那一格的原料是 MySQL 的会话变量）、020 的批形状在 PG 上同形（10 对象/批 3 → 4 批、昂贵查询 12 发、`:tbl_N` 与名单逐一对应、表名不拼进文本）、以及"方言层不许发写语句"——那条用**词边界正则**而不是子串禁（`AS ON_UPDATE` 里的 `ON ` 会被子串 ban 误杀，误杀一次就没人再敢加别名）。**驱动表 10 条**在 `tests/unit/test_sync_dialect_dispatch.py`，钉工单 024 验收 2 的两面：`kind='postgres'` 不再命中 `NotImplementedSource`（只构造不连接，所以演示源没建时这条不会 skip——skip 掉的正好是要钉的那一句），而 `oracle`/`mssql`/`MySQL`/`""` 仍抛且 `code=='not_implemented'`（不许顺手放宽）；另有一条配对断言，把 `table_scope_filter(ds, column=该格的 scope_column)` 渲染出的片段拿去断它**逐字出现在该方言的 B 查询里**（构造器由测试自己按 kind 查表，不从 `_DIALECTS` 拿——从被测那张表读出的构造器去验同一张表，红了只是两格一起改错）。**接线那一条是集成用例**：`test_sync_pg.py::test_postgres_源的范围条件按_pg_的列写法下发`——`kind='postgres'` 的源跑真 `run_sync`，形状桩件把收到的 `table_sql` 原样记下（桩件自己不渲染口径）。实测变异：把编排里那一行换回硬编码 `t.table_name` 之后**只有这一条红**，上面 40 条全绿（它们都不经过 `run_sync`），红了的内容是"PG 源带着 MySQL 的别名出发了"，而那一句本来要等源库报 42703/1054 才看得见。**未证的那一半说清楚**：五条 SQL 没连过 §1.5 的 `ai_web_demo_pg`（还没建），已证的边界写在 metadata-model §8.2 末注与 architecture §9 末注；验收 1/3/4/5/7 的 live 半边（含 `tests/integration/test_extract_pg_live.py` 与 §1.5.5 那份登记参数）等 `scripts/demo_pg.ps1` 跑完；**验收 6（MySQL 侧回归不变）不阻塞在那里、本轮已跑**——被搬动的 `slice_names`/`in_list`/`apply_index_flags` 那三样正对着 MySQL 链，四张文件 19 条全绿，细节记在 roadmap §P3 验收 6 的 as-built |
+| PG 抽取器的**两半**（as-built(P3-024)：不连库那半是 `app/extractor/postgres.py` 的五条 §8.2 SQL 与行→`Raw*` 映射，加上 `sync_service` 的方言驱动表 `_DIALECTS`；live 那半是 §1.6 那份对账清单） | SQL 文本与映射钉在**假连接**上（`_rows` 仍是方言层唯一的 I/O 出口，同上面 020 那行的理由），501 分发与"列写法跟着 kind"钉在纯函数 + 真 `run_sync` 上 | **30 条不连库单测分两张**：`tests/unit/test_extract_pg_map.py` 14 条吃 §8.2 那条查询**自己的别名**当行键（假件与真 SQL 同形才有意义），钉的是 serial 与 identity 分得开（`default_value` 是 `nextval(...)` 那一串）、`_text[]`/`numeric(10,2)[]` 走 023 的归一而 `raw_data_type` 留原文、`modifiers` 白名单只认 `varchar`/`bpchar`/`numeric` 且数组一律 `NULL`、表达式索引那一位的 `column_name` 是 `NULL`（§8.2 D 的分支）、视图 `last_analyze_at` 恒 `NULL` 而表取 `last_analyze`/`last_autoanalyze` **较晚者**（§2.4 注④ 的 PG 半边）、`idx_scan` 只进 `cardinality_hint` 不进 `cardinality`（单位不同）。`tests/unit/test_extract_pg_client.py` 16 条把编排钉在同一颗桩上：`probe` 的三值 + **只有 42704 才降级**（`OperationalError` 且 `sqlstate is None` 不许被吞——那是连不上，不是版本不支持）、`discover` 排除三个系统 schema 与 `pg\_temp%`/`pg\_toast%`、四条查询的发出顺序 `pg_class → pg_index → pg_attribute → pg_constraint`、空范围**不发 `IN ()`**、`MAX_TABLES` 仍在昂贵查询之前判且三条出路原文到达、PG 侧永不产出 `CHARSET_SUSPECT`（那一格的原料是 MySQL 的会话变量）、020 的批形状在 PG 上同形（10 对象/批 3 → 4 批、昂贵查询 12 发、`:tbl_N` 与名单逐一对应、表名不拼进文本）、以及"方言层不许发写语句"——那条用**词边界正则**而不是子串禁（`AS ON_UPDATE` 里的 `ON ` 会被子串 ban 误杀，误杀一次就没人再敢加别名）。**驱动表 10 条**在 `tests/unit/test_sync_dialect_dispatch.py`，钉工单 024 验收 2 的两面：`kind='postgres'` 不再命中 `NotImplementedSource`（只构造不连接，所以演示源没建时这条不会 skip——skip 掉的正好是要钉的那一句），而 `oracle`/`mssql`/`MySQL`/`""` 仍抛且 `code=='not_implemented'`（不许顺手放宽）；另有一条配对断言，把 `table_scope_filter(ds, column=该格的 scope_column)` 渲染出的片段拿去断它**逐字出现在该方言的 B 查询里**（构造器由测试自己按 kind 查表，不从 `_DIALECTS` 拿——从被测那张表读出的构造器去验同一张表，红了只是两格一起改错）。**接线那一条是集成用例**：`test_sync_pg.py::test_postgres_源的范围条件按_pg_的列写法下发`——`kind='postgres'` 的源跑真 `run_sync`，形状桩件把收到的 `table_sql` 原样记下（桩件自己不渲染口径）。实测变异：把编排里那一行换回硬编码 `t.table_name` 之后**只有这一条红**，上面 40 条全绿（它们都不经过 `run_sync`），红了的内容是"PG 源带着 MySQL 的别名出发了"，而那一句本来要等源库报 42703/1054 才看得见。**as-built(P3-024 live 半边)：那条 SQL 已经在真 `ai_web_demo_pg` 上跑过**——`tests/integration/test_extract_pg_live.py` 四条（验收 1/3/4/5），走真 `POST /api/datasources` → `POST /api/sync/jobs`（202）→ worker 循环体 → 回读元数据库，源库与账号都是真的，逐字对账清单与"证到哪一格"写在 §1.6/§1.6.1；仍没证到的那一组（枚举数组形状、`relkind` 的 `'p'/'m'/'f'`、④ 的"两枚时间戳同时在场时取较晚那枚"、③ 的"每批重取 FK 会不会落两次"）**逐条只列在 metadata-model §8.2 末注"证到哪一步"那一份里**，本行不复述清单以免两处各漂一次。live 另钉到一个**缺口**而不是未证项：表达式索引的文本有列可存（§2.4 `meta_index.funcdef`），但 `RawIndexColumn` 不搬它，所以当前恒空。live 抓出两个**不在 PG 抽取器里**的缺陷并已修：① `inferred_rows` 把表 id 的查找键写死成 `_key("", …)`（MySQL 的 catalog 恒空串惯例），PG 侧每条推断边都查不到而**静默丢弃**（`relations_inferred` 报 0），修法是让 `InferredRelation` 带上它本来就该带的 `catalog_name`，`tests/unit/test_sync_rows.py` 补一条纯函数用例钉住（变异验过：换回 `""` 只有这条红）；② `meta_column.enum_values` 落的不是 SQL NULL 而是 JSON `null`（SQLAlchemy 的 JSON 类型默认 `none_as_null=False`，把 Python `None` 序列成 `'null'::jsonb`，于是 `IS NOT NULL` 成立、82 列全都"有枚举值域"），修法是 `enum_values`/`sample_values` 两格显式 `JSONB(none_as_null=True)`——只改绑定值不动 DDL，而 `_COLUMN_SYNC_COLS` 是整列覆盖，重跑一次同步就自清。**验收 6（MySQL 侧回归不变）在两个修复之后随整轮闸重跑**：被搬动的 `slice_names`/`in_list`/`apply_index_flags` 那三样正对着 MySQL 链，细节记在 roadmap §P3 验收 6 的 as-built |
 
 配置层的已落地单测：嵌套 `__` 解析、DSN 凭据转义（`u@site` / `p@ss#w/1` → `%40`/`%23`/`%2F`）、
 `masked_dsn` 不出明文、embedding 维度 >2000 被拒、部分配置时 `configured=False`、

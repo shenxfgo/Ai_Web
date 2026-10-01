@@ -216,13 +216,41 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   §8.2 原文两处照抄必报错的坑（`facts` 别名不存在、`pg_stat_user_tables` 没有 `reltuples`）
 >   连同八处偏离记在 metadata-model §8.2 末注（这一份是**第八处**的目录：C 的 `modifiers` 搬到
 >   Python，因此 C 是五条里唯一"文档原文 ≠ 落地查询文本"的那条，见 §8.2 末注 ⑧）。
->   **仍未交付的是 live 半边**：工单 024 的验收 1/3/4/5/7 要等用户以超管跑一次 `scripts/demo_pg.ps1`，
->   五条 SQL 至今没在 `ai_web_demo_pg` 上跑过（已证边界见 §8.2 末注那句"证到哪一步"）。
->   **验收 6（MySQL 侧回归不变）不阻塞在那上面，本轮已跑**：`test_sync_live.py` + `test_extract_mysql_live_batches.py`
->   + `test_kb_cards_live.py` + `test_sync_card_isolation_pg.py` 四张 19 条全绿（10 对象那一条是
->   `test_sync_live.py::test_验收1_十个对象落进_meta_table_且宽表_68_列带中文注释`）。为什么这条必须单独记：
->   本片把 `mysql.py` 的 `slice_names`/`in_list`/`in_params` 与 `apply_index_flags` 搬进了
->   `batching.py`/`base.py`，MySQL 那条链的回归面正是被搬动的地方，"PG 没建库"不是跳过它的理由。
+>   **as-built(P3-024 live：验收 1/3/4/5/7 也已交付)**：用户以超管跑过建库脚本、`ai_web_demo_pg` 已在本机，
+>   `tests/integration/test_extract_pg_live.py` 4 条走真 HTTP 登记 → 真入队 → 进程内 worker 真跑，
+>   §8.2 五条 SQL 第一次落在真 PG 上，计数对成 **10 个对象（9 表 + 1 视图）/ 82 列 / 14 索引 /
+>   15 条索引列 / 6 条外键 / 2 条推断 / 10 张卡片**，逐位清单与每个数的推导写在
+>   [verification.md §1.6.1](./verification.md)。live 抓出两个**离线全绿**的缺陷，都已修并各留一条永久用例：
+>   ① `sync_service.inferred_rows` 的表 id 查找键写死 `catalog=""`，而 PG 侧那一格是真库名（§1 口径），
+>   于是推断边整批查不到表 id 被**静默丢弃**（`counters.relations_inferred` 报 0，`meta_relation` 少两条）——
+>   修法是让 `InferredRelation` 带 `catalog_name`、由 `relation_infer` 透传，钉它的用例是
+>   `tests/unit/test_sync_rows.py::test_推断行的表id查找带catalog_pg侧那是真库名`；
+>   ② `meta_column.enum_values` / `sample_values` 用的是 SQLAlchemy `JSONB` 默认 `none_as_null=False`，
+>   Python `None` 落成 JSON 字面 `'null'::jsonb`，§2.4 那两格的"没有值域"因此在 SQL 侧 `IS NOT NULL` 成立——
+>   修法是那两列加 `none_as_null=True`，live 用例则改成拿 `count(*) filter (where … is null)` 这个
+>   **数据库自己的谓词**来断，而不是拿测试端读回来的值反推。
+>   **live 仍未证的**（逐条列在 metadata-model §8.2 末注"证到哪一步"，那里是唯一的一份）：
+>   `relkind` 的 `'p'/'m'/'f'` 三分支（演示库只有 `r`/`v`；注意 `'m'`/`'f'` 在落地版是被 WHERE
+>   筛掉的、不是"原样落库"，见 §8.2 末注 ⑤，所以那两支没有实测样本连"落库长什么样"都无从证）、
+>   ④ 的"两枚时间戳同时在场时取较晚那枚"
+>   （实测 0 张表两枚都在场，分辨力在桩上）、③ 的"每批重取 FK 会不会落两次"（默认批 200 只有一批）、
+>   以及 C 条**真枚举数组**那一格（库里没有 `CREATE TYPE`，`typtype='e'` 实测 0 行）。
+>   注意别把它跟 ② 搞混：② 的 `modifiers`（`varchar` 长度 / `numeric` 精度标度 / 数组三值全空）
+>   **已经在真数据上证到了**，没证到的只有"元素类型是枚举的那个数组会不会命中 C 条的枚举段"。
+>   还有一格是缺口而不是未证：表达式索引的文本有列可存（§2.4 `meta_index.funcdef`），
+>   但 `RawIndexColumn` 不搬它，live 只钉到"当前恒空"。
+>   **验收 6（MySQL 侧回归不变）**：本片把 `mysql.py` 的 `slice_names`/`in_list`/`in_params` 与
+>   `apply_index_flags` 搬进了 `batching.py`/`base.py`，MySQL 那条链的回归面正是被搬动的地方，
+>   "PG 没建库"不是跳过它的理由。为什么这一条在 live 半边必须重写口径：上面那两个修复落在
+>   **MySQL 也走的同一条路**上（`inferred_rows` 对 MySQL 的 `catalog` 就是空串，`meta_column` 两列
+>   属于元数据库而非源库方言），所以"PG live 跑通"与"MySQL 回归不变"不能各自单独自证——
+>   as-built 的记法是**合并跑**：`-m "pg or live"` **182 条全绿**，含
+>   `test_sync_live.py` + `test_extract_mysql_live_batches.py` + `test_kb_cards_live.py` +
+>   `test_sync_card_isolation_pg.py` 四张（10 对象那一条是
+>   `test_sync_live.py::test_验收1_十个对象落进_meta_table_且宽表_68_列带中文注释`）。
+>   那四张只是选择器里的子集——同一个选择器 `--collect-only` 数出 **32 张文件 / 182 条**，
+>   写清这个是为了别把"182"读成"就这四张"，也别拿手写拆分去代替数（工单 024 的交付记录里
+>   记着这里漂过一次）。
 >   一句限定：卡片那半的 golden 逐字符比较（`test_sync_card_isolation_pg.py`）喂的是手工摆出来的
 >   `meta_*` 输入，它钉的是模板与逐表提交路径；"真抽取出来的文本没被搬动改坏"那半在
 >   `test_extract_mysql_live_batches.py` 的两次真跑对比里。
