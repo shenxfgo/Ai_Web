@@ -184,6 +184,8 @@ async def test_NOTIFY_丢失时一条流最迟一个心跳周期仍读到那一�
             # 赌的是"生成器那次 `read_events` 已经跑完"——那是一次真往返，整轮闸里机器忙时
             # 它排在 20ms 之后，于是那一行被第一轮直接读走，"第一帧只能是心跳"就假了
             # （与 `679af99` 那条同一个根：拿墙钟余量当顺序保证）。
+            # 这一位的分辨力**只在整轮负载下暴露**：本轮实测把顺序换回旧写法后单跑该文件五遍
+            # 全绿，而旧写法在整轮闸里红过一条（1 failed / 973 passed，红的就是这一条）。
             first = await asyncio.wait_for(agen.__anext__(), 10)
             assert first == ": ping\n\n", "叫醒确实被打掉了：第一帧只能是心跳"
             await _write_event_without_notify(session_factory, job_id)
