@@ -185,6 +185,10 @@ class SourceManifest:
     warnings: list[ExtractWarning] = field(default_factory=list)
     # 触发规模保护（§6 的 MAX_TABLES）时为 True
     truncated: bool = False
+    # 工单 020：本轮读源库实际分了哪几批、每批哪些表名（顺序即发出顺序）。
+    # 交回的是**名单**而不是批数：事件负载要说得出"这一批抽了谁"，而方言层不写事件。
+    # 不分批的方言留空列表，`len(...)` 因此在 services 层只当"这一库没批处理"。
+    batches: list[list[str]] = field(default_factory=list)
 
 
 @dataclass(slots=True, frozen=True)
@@ -210,6 +214,9 @@ class Extractor(Protocol):
     `datasource_service.table_scope_filter`），方言层因此不认识 ORM 行也不认识正则口径；
     `max_tables` 是 §6 的规模保护，超限在跑昂贵的列/索引查询之前就拒绝；
     `count_scope` 吃同一段范围片段，它存在的理由就是"每帧都得有分母"（§2.8）。
+    `batch_size` / `batch_interval_ms` 是工单 020 加的第二对必填参数：**故意不给默认值**——
+    这两个数的口径住在 `Settings.extract`（200 / 100），方言侧再写一遍就出现第二个定义点，
+    而"改了配置不生效"正是这一片要闭掉的那类错。
     """
 
     # `kind` 只要求**可读**：方言类上是 `kind: Final = "mysql"`，声明成裸属性会让
@@ -236,6 +243,8 @@ class Extractor(Protocol):
         table_sql: str | None = None,
         table_params: Mapping[str, str] | None = None,
         max_tables: int | None = None,
+        batch_size: int,
+        batch_interval_ms: int,
     ) -> SourceManifest: ...
 
     async def close(self) -> None: ...

@@ -69,6 +69,20 @@ def _in_list(tables: Sequence[str], column: str) -> str:
     return f"{column} IN ({', '.join(f':tbl_{i}' for i in range(len(tables)))})"
 
 
+def slice_names(names: Sequence[str], batch_size: int) -> list[list[str]]:
+    """把抽取范围内的表名切成"每批一次 `IN`"的那几刀（工单 020 验收 2）。
+
+    单列成函数是因为那三个边界跟"发几条 SQL"无关：整除时不许有空末批、末批只剩一张也要
+    单独成批、`batch_size > N` 退化成一批。混在 `collect` 里就得靠假连接才看得见。
+
+    空名单回**空列表**而不是 `[[]]`：`collect` 靠"没有表就不发 C/D/E"躲开 `IN ()` 这个
+    语法错误（见 `_in_params`），一个空批会把它推回那条路上。
+    """
+    if batch_size < 1:
+        raise ValueError(f"batch_size 至少是 1，收到 {batch_size}")
+    return [list(names[i : i + batch_size]) for i in range(0, len(names), batch_size)]
+
+
 def _tables_from(
     schema: str, scope_sql: str | None, scope_params: Mapping[str, str]
 ) -> tuple[str, dict[str, object]]:
@@ -547,6 +561,8 @@ class MySQLExtractor:
         table_sql: str | None = None,
         table_params: Mapping[str, str] | None = None,
         max_tables: int | None = None,
+        batch_size: int,
+        batch_interval_ms: int,
     ) -> SourceManifest:
         server = self._server_info or await self.probe()
         scope = dict(table_params or {})
@@ -558,10 +574,10 @@ class MySQLExtractor:
         for catalog in catalogs:
             sql, params = build_sql_tables(catalog.schema_name, table_sql, scope)
             rows = await self._fetch(sql, params)
-            batch = rows_to_tables(rows)
-            tables.extend(batch)
-            if batch:
-                names_by_schema[catalog.schema_name] = [t.table_name for t in batch]
+            found = rows_to_tables(rows)
+            tables.extend(found)
+            if found:
+                names_by_schema[catalog.schema_name] = [t.table_name for t in found]
         if max_tables is not None and len(tables) > max_tables:
             raise ExtractScopeTooLarge(
                 f"抽取范围里有 {len(tables)} 张表，超过上限 {max_tables}",
@@ -575,18 +591,29 @@ class MySQLExtractor:
         columns: list[RawColumn] = []
         indexes: list[RawIndex] = []
         foreign_keys: list[RawForeignKey] = []
+        batches: list[list[str]] = []
         for schema, names in names_by_schema.items():
-            # 第二段：C/D/E 各一次，与表数量无关（§8.1 的整段前提）
-            sql, params = build_sql_indexes(schema, names)
-            batch_indexes = rows_to_indexes(await self._fetch(sql, params), schema_name=schema)
-            indexes.extend(batch_indexes)
+            # 第二段：C/D/E **按批**各发一次（工单 020）。§8.1 那句"查询条数与表数量无关"
+            # 的前提在这里被有意换掉：换到的是"两千张表挤一条 `IN` 把 IS 的锁拿满 / 回一条
+            # 1064"这条路走不通，代价是语句条数从 3 变成 3×批数。批大小由调用方从 Settings 传，
+            # 本模块不认识 `get_settings`（方言层只产 SQL 文本，也不自己发明口径）。
+            for batch in slice_names(names, batch_size):
+                if batches:
+                    # 让气只发生在批与批**之间**：第一批之前睡一觉等于"作业已开始却什么都没发"，
+                    # 那一刻 018 的心跳正好刚开始计时。
+                    await asyncio.sleep(batch_interval_ms / 1000)
+                batches.append(batch)
 
-            sql, params = build_sql_columns(schema, names)
-            batch_columns = rows_to_columns(await self._fetch(sql, params), schema_name=schema)
-            columns.extend(apply_index_flags(batch_columns, batch_indexes))
+                sql, params = build_sql_indexes(schema, batch)
+                batch_indexes = rows_to_indexes(await self._fetch(sql, params), schema_name=schema)
+                indexes.extend(batch_indexes)
 
-            sql, params = build_sql_foreign_keys(schema, names)
-            foreign_keys.extend(rows_to_fks(await self._fetch(sql, params), schema_name=schema))
+                sql, params = build_sql_columns(schema, batch)
+                batch_columns = rows_to_columns(await self._fetch(sql, params), schema_name=schema)
+                columns.extend(apply_index_flags(batch_columns, batch_indexes))
+
+                sql, params = build_sql_foreign_keys(schema, batch)
+                foreign_keys.extend(rows_to_fks(await self._fetch(sql, params), schema_name=schema))
 
         warnings: list[ExtractWarning] = []
         comments = [t.comment for t in tables] + [c.comment for c in columns]
@@ -610,6 +637,7 @@ class MySQLExtractor:
             indexes=indexes,
             foreign_keys=foreign_keys,
             warnings=warnings,
+            batches=batches,
         )
 
     async def close(self) -> None:

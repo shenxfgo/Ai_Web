@@ -37,6 +37,7 @@ from app.extractor.base import (
     ServerInfo,
     SourceManifest,
 )
+from app.extractor.mysql import slice_names
 from app.services import sync_service
 from tests.conftest import load_script
 from tests.integration.conftest import Account
@@ -174,6 +175,7 @@ def _manifest(
     id_is_pk: bool = False,
     extra_column: str | None = None,
     views: Sequence[str] = (),
+    batches: Sequence[Sequence[str]] = (),
 ) -> SourceManifest:
     names = ["id", "name"] + ([extra_column] if extra_column else [])
     return SourceManifest(
@@ -186,6 +188,7 @@ def _manifest(
         columns=[_column(catalog, t, c, pk=id_is_pk and c == "id") for t in tables for c in names],
         indexes=[_index(catalog, t) for t in tables],
         foreign_keys=list(foreign_keys),
+        batches=[list(b) for b in batches],
     )
 
 
@@ -257,6 +260,8 @@ class StubExtractor:
         table_sql: str | None = None,
         table_params: Mapping[str, str] | None = None,
         max_tables: int | None = None,
+        batch_size: int,
+        batch_interval_ms: int,
     ) -> SourceManifest:
         name = catalogs[0].schema_name
         self.calls.append(name)
@@ -283,6 +288,10 @@ class StubExtractor:
             id_is_pk=self._id_is_pk,
             extra_column=self._extra_column,
             views=views,
+            # 批名单按**真方言那一份切片函数**算，而不是随手 `[list(tables)]` 交一份：
+            # 编排层往下传的正是这一格，桩件与实现不同形的话，"payload 里有每批的表名"
+            # 这句话就只能等真 MySQL 才验得到（同上面 `SCOPE_REMEDIES` 那条理由）。
+            batches=slice_names(list(tables) + list(views), batch_size),
         )
 
     async def close(self) -> None:
@@ -521,7 +530,14 @@ async def test_超过_max_tables_时整个作业失败且三条出路原样到�
     ds_id = await _register(client, acct)
     stub(tables={"shop": ("a", "b", "c")})
     monkeypatch.setattr(
-        sync_service, "get_settings", lambda: SimpleNamespace(extract=SimpleNamespace(max_tables=2))
+        sync_service,
+        "get_settings",
+        lambda: SimpleNamespace(
+            # 三个键一起给：`run_sync` 现在从同一份 Settings 读 max_tables（007）、
+            # batch_size 与 batch_interval_ms（020）。少给后两个的话这条用例会以
+            # AttributeError 失败，而那看起来像"编排层写错了"而不是"桩件没跟上"。
+            extract=SimpleNamespace(max_tables=2, batch_size=200, batch_interval_ms=0)
+        ),
     )
 
     resp = await _sync(client, acct, ds_id)

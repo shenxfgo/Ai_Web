@@ -208,9 +208,25 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   "PG 抽取器落地而不做版本判定"是明示的偏离，不是遗漏。
 > - **验收 7**：`CARDINALITY`/`SUB_PART` 早在 007 就通了（`mysql.py:121` 读、`:259`/`:265` 映射、
 >   `sync_service.py:433`/`:444` 落库），P3 只补"分批后每批都还读到"这一格。
+>   **as-built(P3-020)：这一格补上了，补法是"两次真跑比形状"**——`test_extract_mysql_live_batches.py`
+>   的第二条用例先按默认 200（一批装完）跑一次、再按 3 切四批跑一次，比对索引那条链的
+>   `(表名, 索引名, SEQ_IN_INDEX, 列名, SUB_PART, cardinality 是否非空)` 有序清单逐位相同，
+>   并对分批那一次断"每一行 `cardinality` 都非空 + 全库唯一那处前缀索引 `product.name(32)` 仍在场"。
+>   为什么比的是"非空"而不是**数值**：`CARDINALITY` 是 InnoDB 的采样估算，两次真跑之间它可以合法地变，
+>   把它钉进"分批没改变结果"就变成看运气发红。为什么这比 007 那条用例多证明了一件事：
+>   `test_sync_live.py` 的 `test_验收2_…` 用的是**默认批大小**（10 个对象一批装完），
+>   它证明的是那条链通着，而"切成四批后每批还读得到"必须是走分批那条路才答得出。
+>   实测变异：把 D 条投影里的 `s.CARDINALITY, s.SUB_PART` 换成 `NULL AS …`，这条 live 用例红在
+>   `has_cardinality` 那一行（`test_sync_live.py` 的同名锚点也一起红——两者不互替，一个管单批、一个管多批）。
+>   原行引用的行号是 007 时代的，020 之后 D 条在 `mysql.py:178`、映射在 `:375`/`:381`，别再照抄去定位。
 > - **要点那句"一批 200 表"**：读侧真分批（`collect()` 切片循环发 `IN (...)`），
 >   用例把 `AIWEB_EXTRACT__BATCH_SIZE` 降到 3，在 11 个对象的真演示库上跑出 4 批——
 >   否则"分批"这条路径在真跑里永远走不到，只能算离线自证。
+>   **as-built(P3-020)：那个"11"是 `SHOW FULL TABLES` 的行数**（10 个业务对象 + 建库脚本自己的
+>   `_aiweb_demo_marker`），而同一条范围过滤排除 `_%` 后同步看到的是 **10**（9 表 + 1 视图，
+>   verification §1/§1.2 的口径）。所以 4 批这个结论不变，只是把两个数写清了：11 是夹具的行数、
+>   10 是抽取的分母，刀口是 `[3,3,3,1]`。批大小 200 在这 10 个对象上只有一批，所以"默认值不改"
+>   与"真跑必须走到分批"这两句靠用例把键压到 3 来同时成立。
 > - **本片新接的 P2 转账**：`?force=true` 端点开关（连同 `SCOPE_REMEDIES` 第三条文案换回原文）。
 >   **本片新做的回收作业**：只清 `sync_job_event` 旧行（`AIWEB_RESULT__RETENTION_DAYS`，30 天），
 >   结果 csv 不碰。**本片明确不做**：`POST /sync/jobs/{id}/cancel`（连 `cancel_requested` 列一起挂 [P8]，

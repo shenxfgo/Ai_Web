@@ -200,6 +200,54 @@ async def test_事件_counters_带全五键_分母来自带_scope_的那次计�
     assert events[-1]["stage"] == "done" and events[-1]["counters"]["total"] == 3
 
 
+@pytest.fixture
+def batch_size_three(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """把 `AIWEB_EXTRACT__BATCH_SIZE` 钉成 3——走真配置通道，而不是桩掉 `get_settings`（021 同款）。
+
+    这一格在 020 之前**从来没有读取点**，所以"用例把它设成 3"这句话本身就是被测对象：
+    桩掉 `get_settings` 只换掉抽取那一次的读取，`run_sync` 有没有真把配置往下传就永远验不到。
+    """
+    monkeypatch.setenv("AIWEB_EXTRACT__BATCH_SIZE", "3")
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        # 不清回去的话，同会话后头的用例会拿着 batch_size=3 继续跑
+        get_settings.cache_clear()
+
+
+async def test_分批的两个配置键真有读取点_每批的表名随_tables_帧交回(
+    client: AsyncClient,
+    login: Login,
+    stub: Maker,
+    session_factory: Factory,
+    embedding_off: None,
+    batch_size_three: None,
+) -> None:
+    """工单 020 验收 6 的编排层一半：4 张表在 `BATCH_SIZE=3` 下是**两批**，名单进事件。
+
+    期望值手算（4 ÷ 3 = 2 批，切刀 `orders/users/items` + `payments`）。这一条同时钉三件事：
+    ① 键有读取点（读不到的话按默认 200 只有 1 批）；② 值穿过 `run_sync` 到达方言；
+    ③ 每批的表名进了 `tables` 帧的 `payload`，而**不是**每批一帧——分批不改提交边界（§2.8
+    的"事件与元数据同事务"），多出来的帧只会在同一次提交后一起可见，把流拉长却不让进度条提前。
+    """
+    body, events = await _one_run(
+        client,
+        login,
+        "ev-batch",
+        session_factory,
+        stub,
+        tables={"shop": ("orders", "users", "items", "payments")},
+    )
+    tables_frame = next(e for e in events if e["phase"] == "tables")
+    assert tables_frame["payload"]["batches"] == [
+        ["orders", "users", "items"],
+        ["payments"],
+    ], tables_frame
+    assert body["counters"]["batches"] == 2, body
+    assert len(events) == 5, "两批仍然只有五帧：一批一帧的话这里是 6"
+
+
 async def test_embed_档未配置时以_skipped_出现_作业终局仍是_success(
     client: AsyncClient,
     login: Login,

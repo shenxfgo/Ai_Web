@@ -256,11 +256,14 @@ phase  text CHECK ('connect','discover','tables','columns','indexes','fks','card
 progress numeric(5,2) DEFAULT 0
 counters jsonb DEFAULT '{}'   -- 交付的键（sync_service._Tally）：
                                -- {databases,tables,columns,indexes,relations_extracted,
-                               --  relations_inferred,tables_stale,tables_failed,cards}
+                               --  relations_inferred,tables_stale,tables_failed,cards,batches}
                                -- （as-built(P3-016)：原记的 `{tables_seen,tables_ok,fks,cards_embedded}`
                                --   从未落地过——007 落前八个，`cards` 由 008 加；`fks` 那一格按 §5.3
                                --   的分类拆成 extracted/inferred，`cards_embedded` 要等向量启用（P4）。
                                --   改它而不是留着：017 的收尾帧要按 key 渲染这一格）
+                               --   as-built(P3-020)：`batches` 是第十个键，说的是"这一轮读源库真的
+                               --   发了几批"（跨库相加），不是"落了多少行"。它只进这一本行级总账，
+                               --   不进 §2.8 那五键的进度账：进度条按对象数画百分比，批数对它没有意义）
 warnings jsonb DEFAULT '[]'   -- [{code:'permission_hidden', detail:'库 x 下 12 张表不可见'}]
 errors   jsonb DEFAULT '[]'   -- [{code, detail}]，分类过的 AppError 再多带一个 data
                                -- （as-built(P3-016)：原记的 `{phase, table, message}` 从未落地过，
@@ -462,11 +465,18 @@ INDEX (job_id, seq)             -- as-built(P3-017)：不单独建，见下方 �
 > ⑧ `NOTIFY` 与事件行**同事务**发出。PG 的事务型 `NOTIFY` 到 COMMIT 才投递，所以"被叫醒"天然蕴含
 >    "那一行已可见"；写进同一个事务是为了让回滚的那一帧连带把叫醒一起撤掉——否则会出现
 >    "流被叫醒、读到的还是旧游标"的空转。读侧本来靠游标补读能自愈，但没有理由留着这个窗口。
+> ⑨ **as-built(P3-020)：`tables` 那一帧的 `payload` 多带一格 `batches`** ——
+>    `[[这一批的表名...], [下一批...]]`，顺序即发出顺序（原料是 `SourceManifest.batches`）。
+>    它是**每批一条记录**而不是**每批一帧**：本表 ⑥ 说的那五个发帧点没变，因为分批不许改提交边界
+>    （§6 as-built(P3 开工前拍板) 第 5 条），而事件行与元数据同事务——多加的批次帧只会在同一次
+>    COMMIT 后一起可见，把流拉长却不让进度条早一格动。要"每批立刻可见"得先让每批立刻提交，那是
+>    `stream_manifest`（§7 as-built(007) 第 2 条）的活，不归 020。
 
 ## 3. 人工列与同步列的分离（幂等重跑的关键）
 
 `comment_raw` 由同步写，`comment_zh` / `business_desc` / `granularity` / `is_hidden` 是人工字段，
-**同步永不冲掉**。三段式 upsert（每个 batch 一个事务）：
+**同步永不冲掉**。三段式 upsert（每个 batch 一个事务——这里的 batch 指**一个 catalog 一次
+`collect`**，即 §6 的失败隔离单位；它与工单 020 那个"读侧发送批"不是一个东西，后者不另起事务）：
 
 ```python
 # 1) 按自然键 upsert，人工字段永不被覆盖
@@ -557,11 +567,14 @@ DELETE FROM aiweb.meta_relation
 | 宽表（>200 列） | 抽取照常，卡片构建走列切片，并给 warning"字段过多建议拆视图" |
 | 同步中重复点"同步" | 部分唯一索引：`CREATE UNIQUE INDEX ux_sync_running ON aiweb.sync_jobs(datasource_id) WHERE status IN ('pending','running');` → 天然互斥，冲突返回 409 `sync_already_running`（是数据库保证，不是代码 race） |
 | 进程崩溃留下僵尸 running | worker 心跳循环**每轮**扫一次：`UPDATE sync_jobs SET status='failed', errors = errors || '[{"code":"reclaimed","detail":"heartbeat 超时"}]'::jsonb WHERE status IN ('pending','running') AND heartbeat_at < now() - interval '180 seconds'`；之后用户可重新发起。**as-built(P3 开工前拍板)**：原句写的是"启动 `lifespan` 里回收"与 `error='reclaimed on startup'` 两处失实——① 列名是 `errors`（`jsonb NOT NULL DEFAULT '[]'`），没有 `error` 这一列；② worker 长驻不重启是常态，只扫一次等于僵尸行永久占住 `ux_sync_running`，正是 as-built(007) 第 1 条堵过的那类故障换了个进程而已 |
-| 抽取把源库拖垮 | 全部 IS 查询前 `SET SESSION max_execution_time` / `SET LOCAL statement_timeout`；批量大小固定 200；批间 `await asyncio.sleep(EXTRACT__BATCH_INTERVAL_MS)`；单连接串行，不开并发打源库 |
+| 抽取把源库拖垮 | 全部 IS 查询前 `SET SESSION max_execution_time` / `SET LOCAL statement_timeout`；批大小默认 200（`AIWEB_EXTRACT__BATCH_SIZE`，020 起有读取点）；批间 `await asyncio.sleep(EXTRACT__BATCH_INTERVAL_MS)`；单连接串行，不开并发打源库 |
 
 对应配置：`AIWEB_EXTRACT__HEARTBEAT_INTERVAL_S=10`、`AIWEB_EXTRACT__STALE_JOB_RECLAIM_S=180`
-（体检/自检里 heartbeat_at 超过该值判僵尸并在启动时回收）、`AIWEB_EXTRACT__BATCH_SIZE=200`（每批一个事务，
-也是 `partial` 的粒度）、`AIWEB_EXTRACT__MAX_TABLES=2000`、`AIWEB_EXTRACT__MIN_MYSQL_VERSION=5.7`、
+（体检/自检里 heartbeat_at 超过该值判僵尸并在启动时回收）、`AIWEB_EXTRACT__BATCH_SIZE=200`
+（**as-built(P3-020) 更正**：原句"每批一个事务，也是 `partial` 的粒度"从未成立过，也不该成立——
+批是**读源库的发送切片**，一个 catalog 的几批共用同一个元数据事务，`partial` 的粒度仍是 catalog
+（上面拍板第 5 条）。改它需要先把 `collect` 换成 `stream_manifest` 的边抽边 yield，那不是 020），
+`AIWEB_EXTRACT__MAX_TABLES=2000`、`AIWEB_EXTRACT__MIN_MYSQL_VERSION=5.7`、
 `AIWEB_EXTRACT__MIN_PG_VERSION=12`。
 
 三条实现约束：
@@ -767,6 +780,58 @@ DELETE FROM aiweb.meta_relation
 >    记账点，018 里没有。**都不做，留这一条字。**真正会先疼的是 (c)：清理的频率不是清理自己
 >    要的，是搭刷钟那班车的（`heartbeat_interval_s`=10s），两件事同轮是 §6 as-built(P3-018) 第 2 条
 >    的拍板——于是这条扫描的次数被一个与它无关的常数绑住。
+>
+> **as-built(P3-020 施工后)**（2026-10-01，工单 020；上面拍板第 11 条落地，真跑见工单 020 交付记录）
+>
+> 1. **两个键从这一片起才有读取点**：`run_sync` 在 `sync_service.py:989-990` 读
+>    `extract.batch_size` / `extract.batch_interval_ms`，作为**必填**关键字参数交给 `collect()`。
+>    P2 那本"配置键只剩定义点"的账到此闭掉最后两条。必填而不给默认值是刻意的：给了默认就在方言层
+>    多出第二个 200，而改这个数的人改的是 `Settings`。
+> 2. **B 那条不参与分批**（§8.1 的表清单查询）。它是名单的来源，把它分批就没有全量可切了；
+>    所以"四条查询都要跟着分批"这句工单原文的落地形状是 **1 条 B + 3×批数 条 C/D/E**，
+>    而不是"四条各乘以批数"。真跑实测（拦 `MySQLExtractor._rows` 数发出条数）：演示库 4 批时
+>    B（认它靠 `t.row_format`，A 与分母那条共用同一个 FROM）只出现 1 次，C/D/E 各 4 次，
+>    且第 k 次收到的 `IN` 名单正是第 k 批。
+> 3. **事件形状是"一帧带名单"，不是"一批一帧"**（§2.8 ⑨）。发帧点仍是 ⑥ 说的那五个，
+>    `tables` 帧的 `payload` 多一格 `batches`，`sync_jobs.counters` 多一格 `batches`（§2.5）。
+>    理由不是省事：事件行与元数据同事务，多出来的批次帧只会在同一次 COMMIT 后一起可见，
+>    流被拉长而进度条一格也不提前。钉子 `test_分批的两个配置键真有读取点_每批的表名随_tables_帧交回`
+>    ——实测过：把 `batch_size` 那行换成硬编码 200，这条整轮只红它自己（终局账里 `batches: 1`）。
+> 4. **提交边界一行没动**：一个 catalog 一次 `collect`、一个事务，`partial` 的粒度仍是 catalog
+>    （上面拍板第 5 条）。§7 原文"service 每批一个事务提交"与 §6 配置行"每批一个事务，也是
+>    `partial` 的粒度"两句都是**从未落地过的承诺**，已按本条更正而不是照抄。要走到那句原文，
+>    得先实现 `stream_manifest`（边抽边 yield），它动的是提交边界与 stale 判定，不归 020。
+> 5. **失败隔离粒度没有因为分批而变细**：上表第 2 行"中途某张表 IS 查询失败 → 继续下一批"
+>    到今天仍然**没有落地**——`collect` 里那三条 `IN` 任何一条抛错，异常照冒，整个 catalog 回滚。
+>    020 只改发送节奏；"按批隔离失败"需要 (4) 那条 yield 先在场，否则失败的批与成功的批
+>    还在同一个事务里，分开记也没意义。这一格继续挂在纸上，不属于 019（卡片逐表提交）也不属于 020。
+> 6. **规模保护仍在昂贵查询之前**（已定口径）：`max_tables` 超限那一步只看 B 的结果，
+>    C/D/E 一条都不发。分批把它挪后是最容易顺手改错的地方，所以用 `executed` 里 IS 语句的
+>    **条数**钉死（`test_超限判断仍在昂贵的列查询之前_分批不许把它挪后`：只有 1 条）。
+> 7. **真演示库的实样**（2026-10-01 跑，`BATCH_SIZE=3`）：10 个业务对象切成 4 批
+>    `[3,3,3,1]`，末批只剩 1 张——正好是验收 2 那个边界的真库版本；`counters.batches=4`、
+>    `counters.tables=10`（与 §1 的 9 表 + 1 视图对齐）。批间隔 250ms 那一轮 `duration=1985ms`，
+>    同一份源、同样 4 批但间隔设 0 的那一轮 `duration=1125ms`——差出来的约 860ms 就是三个间隔，
+>    这条下限因此不是"库本来就慢"能蒙过去的。工单原文的"11 个可见对象"是**含内部标记表**那本账
+>    （§1.2 已拍板：排除 `_%` 后 `total=10`），10/3 与 11/3 同样是 4 批，用例按排除口径跑，
+>    这样验收 1 与验收 5 说的是同一次同步。
+> 8. **"分批不改变落库结果"跟的是另一次真跑，不是 008 的 golden**：那七份快照喂的是按 §2.1
+>    手工摆出来的 `meta_*` 输入（`test_sync_card_isolation_pg.py` 开头记着），不是演示库实样，
+>    拿它对真库等于比两件本来不该相等的事。所以 live 用例的做法是先按默认 200 跑一轮、再按 3 跑一轮，
+>    比五张 `meta_*` 的行数与全部卡片 `text_md` **逐字符**，只放行 `counters.batches` 这一格变化。
+> 9. **验收 7（`CARDINALITY`/`SUB_PART` "分批后每批都还读到"）补的是形状而不是数值**：同一条 live
+>    用例两侧各取一份按 `(表名, 索引名, SEQ_IN_INDEX)` 排序的 `(列名, SUB_PART, cardinality 是否非空)`
+>    清单逐位相等，再对分批那一次断每行 `cardinality` 非空、且全库唯一那处前缀索引
+>    `product.name(32)`（§1 的夹具）仍在场。数值不比是因为 `CARDINALITY` 是 InnoDB 的采样估算，
+>    两次真跑之间它可以合法地变——把"没改变结果"钉在它上面就变成看运气发红。这跟 007 那条
+>    `test_sync_live.py::test_验收2_…` 不互替：那一条走默认批大小（10 个对象一批装完）。
+>    实测变异：D 条投影换成 `NULL AS CARDINALITY, NULL AS SUB_PART` 后这条 live 用例红在
+>    `has_cardinality` 那一行（007 那条同步变红，两个靶心各自独立）。
+> 10. **上面表里第 5 行只有分批那两件事落地了**：`SET SESSION max_execution_time` /
+>     `SET LOCAL statement_timeout` 这半句到今天**仍无实现点**——`mysql.py` 只有
+>     `supports_max_execution_time` 这个**探测**（probe 阶段问源库支不支持），没有任何地方真的发过
+>     `SET`。本行不是 020 的承诺（工单的已定口径与验收 1~7 都没提它），记在这里是为了让"抽取把源库
+>     拖垮"这一格不被误读成整行已交付：现在真正保护源库的只有批大小与批间隔两条。
 
 ## 7. `SourceDialect` 抽象与中间结构
 
@@ -867,6 +932,17 @@ class SourceDialect(Protocol):
 一批一个 schema（MySQL 一个 db、PG 一个 schema），每批 ≤ `batch_size` 张表
 → **service 每批一个事务提交**，这就是 `partial` 状态和进度百分比的来源。
 
+> **as-built(P3-020)：上面这句里的"一批一个事务"没有落地，而且刻意不落地。**
+> 020 交付的分批住在 `collect()` **内部**：一个 schema 的 C/D/E 三条 `IN (...)` 按 `batch_size`
+> 切片循环发，`SourceManifest` 仍然**一次交回整个 catalog**，service 因此仍然一 catalog 一事务
+> （§6 拍板第 5 条"元数据每库一事务不动"）。要走到原文那个"每批 yield、每批一提交"，得先实现
+> 上面 `stream_manifest` 那条协议（as-built(007) 第 2 条至今挂着它），那件事的爆炸半径是提交边界
+> 与 stale 判定，不是发送节奏，所以它不属于 020。
+> 落地形状：`collect(..., *, max_tables, batch_size: int, batch_interval_ms: int)` —— 后两个
+> **故意不给默认值**（原文的 `batch_size: int = 200` 会在方言层留下第二个定义点，而 200 这个数
+> 的口径住在 `Settings.extract`），`SourceManifest.batches: list[list[str]]` 交回"本轮实际分了
+> 哪几批、每批哪些表名"，由 §2.8 ⑨ 投影进 `tables` 帧的 `payload`。
+
 > as-built(007)：这段协议在落地时有三处必须先说清楚，否则读代码的人会以为少实现了东西。
 >
 > 1. **`ConnectionSpec` 原文被引用但从未定义**。现在它定义在 `app/extractor/base.py`：
@@ -889,6 +965,13 @@ class SourceDialect(Protocol):
 ## 8. 抽取 SQL 原文
 
 ### 8.1 MySQL 5.7（4 条批量 SQL 拿全一切，与表数量无关）
+
+> **as-built(P3-020)：标题里"与表数量无关"这个前提被有意换掉了，换到的是"一次 `IN` 装两千张表"**
+> **那条路走不通**。C/D/E 三条现在按 `AIWEB_EXTRACT__BATCH_SIZE` 切片循环发，语句条数从 3 变成**3×批数**
+> （A/B 两条不变，各一条：B 是名单的来源，把它分批就没有全量可抽了）。省下的是一句 1064 和
+> IS 的锁，多付的是往返次数——批间隔 `BATCH_INTERVAL_MS` 就是为后者准备的让气。
+> 钉子：`tests/integration/test_extract_mysql_live_batches.py`（真演示库、`BATCH_SIZE=3` → 4 批，
+> 三条昂贵查询各 4 发，且第 k 发问的就是第 k 批）与 `tests/unit/test_extract_mysql_batching.py`。
 
 ```sql
 -- A. catalogs（= databases）+ 尺寸

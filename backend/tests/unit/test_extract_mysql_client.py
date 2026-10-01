@@ -266,7 +266,7 @@ async def test_collect_一个_schema_四条查询并把外键归并进来() -> N
             ("from information_schema.key_column_usage k", []),
         ]
     )
-    manifest = await stub.collect([_catalog()])
+    manifest = await stub.collect([_catalog()], batch_size=200, batch_interval_ms=0)
     assert manifest.kind == "mysql"
     assert manifest.server_version == "5.7.17-log"
     assert [t.table_name for t in manifest.tables] == ["order_main"]
@@ -300,6 +300,8 @@ async def test_collect_把数据源配置的表范围原样带进_b() -> None:
         [_catalog()],
         table_sql="(t.table_name not like :exc_0)",
         table_params={"exc_0": r"\_%"},
+        batch_size=200,
+        batch_interval_ms=0,
     )
     sql, params = _statement_for(stub, "information_schema.tables")
     assert "(t.table_name not like :exc_0)" in " ".join(sql.split())
@@ -309,7 +311,7 @@ async def test_collect_把数据源配置的表范围原样带进_b() -> None:
 async def test_collect_范围里没有表时不发_in_空列表() -> None:
     """`IN ()` 是语法错误：没有表就没有细节可查，直接给空清单。"""
     stub = Stub([("from information_schema.tables t", [])])
-    manifest = await stub.collect([_catalog()])
+    manifest = await stub.collect([_catalog()], batch_size=200, batch_interval_ms=0)
     assert manifest.tables == [] and manifest.columns == []
     assert _is_sources(stub) == ["information_schema.tables"], "只有 B 那一条"
 
@@ -325,7 +327,7 @@ async def test_collect_超限在昂贵的列查询之前就拒绝并给三个出
         ]
     )
     with pytest.raises(ExtractScopeTooLarge) as caught:
-        await stub.collect([_catalog()], max_tables=2)
+        await stub.collect([_catalog()], max_tables=2, batch_size=200, batch_interval_ms=0)
     assert caught.value.detail == {
         "table_count": 3,
         "max_tables": 2,
@@ -348,7 +350,7 @@ async def test_collect_中文注释整片回问号时打_charset_suspect() -> No
         ]
     )
     # 列注释是正常中文，表注释全是问号：整体占比 (5)/(5+2) > 0.3 才算乱码
-    manifest = await stub.collect([_catalog()])
+    manifest = await stub.collect([_catalog()], batch_size=200, batch_interval_ms=0)
     assert [w.code for w in manifest.warnings] == ["CHARSET_SUSPECT"]
 
 
@@ -361,7 +363,7 @@ async def test_collect_注释正常时不乱打警告() -> None:
             ("from information_schema.key_column_usage k", []),
         ]
     )
-    assert (await stub.collect([_catalog()])).warnings == []
+    assert (await stub.collect([_catalog()], batch_size=200, batch_interval_ms=0)).warnings == []
 
 
 async def test_抽取全程只对源库发_select() -> None:
@@ -381,7 +383,7 @@ async def test_抽取全程只对源库发_select() -> None:
             ),
         ]
     )
-    await stub.collect([_catalog()])
+    await stub.collect([_catalog()], batch_size=200, batch_interval_ms=0)
     for sql, _ in stub.executed:
         normalized = " ".join(sql.split())
         assert normalized.upper().startswith("SELECT"), normalized

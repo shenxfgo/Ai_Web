@@ -564,6 +564,9 @@ class _Tally:
     tables_failed: int = 0
     # 工单 008：卡片条数（不是表条数——宽表一张表出多张卡，§6）
     cards: int = 0
+    # 工单 020：本轮读源库实际发出的批数（跨库相加）。它说的是"打了多少次源库"，
+    # 不是"落了多少行"——所以它进 `_Tally` 而不进 `_Progress`：进度条不靠批数画百分比。
+    batches: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -833,6 +836,7 @@ async def _write_catalog(
     table_id = await _table_ids(session, database_id, synced_before)
     part.databases += 1
     part.tables += len(table_id)
+    part.batches += len(manifest.batches)
 
     await session.execute(meta_column_upsert(), column_rows(table_id, manifest.columns))
     await session.execute(
@@ -883,13 +887,16 @@ async def _write_catalog(
     # 进度事件与它宣布的那次元数据写入在同一个事务里（工单 017 的拍板）：这个库失败回滚时
     # 这一行也一起消失，事件流里就不会出现"宣布了一个没落成的 upsert"。
     # `done` 传的是"这一步之后"的数——总账要等这次 commit 才涨，而事件说的是这一帧。
+    # 工单 020 把每批的表名集合挂在同一帧的 payload 上，而**没有**为每批另开一帧：那些帧
+    # 落在同一个事务里，要到这一次 commit 才看得见，多开只让事件流变长、不会让进度条早动一步
+    # （分批不改提交边界是已定口径），而"哪一批抽了谁"这句话仍然原样到达读侧。
     await _set_phase(
         session,
         job_id,
         "tables",
         commit=False,
         event_counters=progress.as_dict(done=progress.done + part.tables),
-        event_payload={"schema": catalog.schema_name},
+        event_payload={"schema": catalog.schema_name, "batches": manifest.batches},
     )
     await session.commit()
     return database_id, part
@@ -977,6 +984,10 @@ async def run_sync(
         )
 
         max_tables = get_settings().extract.max_tables
+        # 工单 020：这两个键从这一行起才有读取点（P2 那本"只剩定义点"的账里最后两条）。
+        # 在编排层读而不是在方言层读：`MySQLExtractor` 只产 SQL 文本，配置口径归 settings。
+        batch_size = get_settings().extract.batch_size
+        batch_interval_ms = get_settings().extract.batch_interval_ms
         for catalog in catalogs:
             try:
                 manifest = await extractor.collect(
@@ -984,6 +995,8 @@ async def run_sync(
                     table_sql=scope_sql,
                     table_params=scope_params,
                     max_tables=None if force else max_tables,
+                    batch_size=batch_size,
+                    batch_interval_ms=batch_interval_ms,
                 )
                 database_id, part = await _write_catalog(
                     session, ds, job_id, manifest, synced_before, warnings, progress
