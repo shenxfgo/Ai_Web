@@ -625,6 +625,22 @@ class _Progress:
         }
 
 
+def progress_of(counters: Mapping[str, int]) -> float | None:
+    """`sync_jobs.progress`（§2.5 的 `numeric(5,2)`）：把对象级 counters 折成百分比。
+
+    分工要写清楚（§2.8 决策 3）：**进度的序列真相在 `sync_job_event`**，这一格只是同一份
+    `done`/`total` 的派生百分比，给"不想重放事件流只要一个数"的读侧用（P8 的进度条）。
+    所以这里只吃两个键，`base_table`/`view`/`cards` 是另外三本账，不参与折算。
+
+    `total <= 0` 回 `None` 而不是 0.0：discover 之前分母还没定出来，那一刻写 0.0 等于替
+    `DEFAULT 0` 宣布一次"我确定现在是 0%"，而真话是"还不知道"。不回值时那一行留在原值上。
+    """
+    total = counters.get("total", 0)
+    if total <= 0:
+        return None
+    return round(counters.get("done", 0) / total * 100, 2)
+
+
 async def _add_event(
     session: AsyncSession,
     job_id: int,
@@ -720,6 +736,12 @@ async def _set_phase(
         values["errors"] = errors
     if finished:
         values["finished_at"] = func.now()
+    # 比例的唯一来源是事件帧那一份 counters：同一个 `event_counters` 参数既喂这里的 progress、
+    # 又喂下面那条事件行，所以一个数只有一条产生路径。折不折、回 None 时怎么办在 `progress_of` 上。
+    if event_counters is not None:
+        pct = progress_of(event_counters)
+        if pct is not None:
+            values["progress"] = pct
     await session.execute(update(_JOB).where(_JOB.c.id == job_id).values(**values))
     if event_counters is not None:
         await _add_event(session, job_id, phase, event_counters, event_payload)

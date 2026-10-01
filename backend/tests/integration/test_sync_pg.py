@@ -763,3 +763,111 @@ async def test_postgres_源的范围条件按_pg_的列写法下发(
     for sql in extractor.scope_sqls:
         assert sql is not None and "c.relname" in sql, sql
         assert "t.table_name" not in sql, sql
+
+
+async def test_progress_成功收尾时那一格是100(
+    client: AsyncClient,
+    login: Login,
+    stub: Callable[..., StubExtractor],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """025 验收 3：`sync_jobs.progress` 第一次有写入点，而且写的是**事件帧里那两个数**的比值。
+
+    分工口径（metadata-model §2.8 决策 3）：序列真相在 `sync_job_event`，这一格只是同一份
+    `done`/`total` 折出来的派生百分比。所以断言是两半：这一格等于 100，**且**它与最后一帧
+    事件里的 counters 自洽——只断前一半的话，写死 100 也能过。
+    """
+    acct = await login(username="owner-prog-ok", role="member")
+    ds_id = await _register(client, acct)
+    stub()  # 单库单表：分母 1、跑完 done 也是 1
+
+    resp = await _sync(client, acct, ds_id)
+    assert resp.status_code == 202, resp.text
+    job_id = int(resp.json()["job_id"])
+    assert resp.json()["status"] == "success", resp.text
+
+    stored = await _scalar(
+        session_factory, 'select progress from "{s}".sync_jobs where id = :id', id=job_id
+    )
+    assert float(stored) == 100.0, stored
+    last = await _scalar(
+        session_factory,
+        'select counters from "{s}".sync_job_event where job_id = :id order by seq desc limit 1',
+        id=job_id,
+    )
+    assert last is not None and int(last["done"]) == int(last["total"]) == 1, last
+
+
+async def test_progress_中途有库失败时停在已提交的比例(
+    client: AsyncClient,
+    login: Login,
+    stub: Callable[..., StubExtractor],
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`partial` 收尾的百分比是 2/3 而不是 100 也不是 0：分母在 discover 就定死了。
+
+    手算口径来自桩件自己那份事实：shop 2 张 + warehouse 1 张 → `count_scope` 给 total=3，
+    warehouse 整库 rollback → `done` 只涨到 2，2/3 = 66.666… → `numeric(5,2)` 存 66.67。
+    这一条同时挡住两种写法：一是"全跑完才写"（partial 时永远停在 0，进度条说不上话），
+    二是"按提交过的库数折算"（2 个库里成了 1 个 → 50，而 §2.8 的进度是**对象级**的）。
+    """
+    acct = await login(username="owner-prog-partial", role="member")
+    ds_id = await _register(client, acct, include_schemas=["shop", "warehouse"])
+    stub(
+        catalogs=("shop", "warehouse"),
+        tables={"shop": ("orders", "users")},
+        fail_on="warehouse",
+    )
+
+    resp = await _sync(client, acct, ds_id)
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "partial", body
+    stored = await _scalar(
+        session_factory,
+        'select progress from "{s}".sync_jobs where id = :id',
+        id=int(body["job_id"]),
+    )
+    assert float(stored) == 66.67, stored
+
+
+async def test_progress_分母还没定出来时留在默认0(
+    client: AsyncClient,
+    login: Login,
+    stub: Callable[..., StubExtractor],
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """炸在 discover 之前的作业，`progress` 必须是 `DEFAULT 0` 那个 0，不是有人写进去的数。
+
+    和 `tests/unit/test_sync_progress.py::test_分母还没定出来时不写这一格` 各管一半：那边管
+    `progress_of` 在 `total<=0` 时回 None（一个数的产生规则），这里管**从没产生过任何一帧**时
+    读侧看见什么。注入点在 `decrypt_secret`（`sync_service.py:1009`），比 `count_scope` 早，
+    所以带 counters 的那一路一次都没走到，`progress` 全程没进过 `values`——这里的 0.0 是建表
+    默认值，不是谁写进去的 0.0。写成 0.0 的话，读侧看不出"抽了一半失败"和"连上都没连上"的区别。
+    """
+    acct = await login(username="owner-prog-zero", role="member")
+    ds_id = await _register(client, acct)
+    stub()
+    monkeypatch.setattr(
+        sync_service,
+        "decrypt_secret",
+        lambda blob: (_ for _ in ()).throw(AppError("源库口令解密失败：用例注入")),
+    )
+
+    resp = await _sync(client, acct, ds_id)
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["status"] == "failed", body
+    stored = await _scalar(
+        session_factory,
+        'select progress from "{s}".sync_jobs where id = :id',
+        id=int(body["job_id"]),
+    )
+    assert float(stored) == 0.0, stored
+    frames = await _scalar(
+        session_factory,
+        'select count(*) from "{s}".sync_job_event where job_id = :id',
+        id=int(body["job_id"]),
+    )
+    assert frames == 1, "只有收尾那一帧：注入点比第一帧还早，全程没有一帧带过 counters"
