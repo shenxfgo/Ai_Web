@@ -713,6 +713,60 @@ DELETE FROM aiweb.meta_relation
 > 4. 注入点是参数不是分支：`run_once(session, *, card_build_hook=…)` → `run_sync(card_build_hook=…)`
 >    → `sync_cards(card_build_hook=…)`，在每张表构建的**起点**用表全名调用。生产 `loop()` 不传，
 >    源码里 grep 不到"如果这是测试就抛错"。
+>
+> **as-built(P3-018 施工后)**（2026-09-30，工单 018；上面第 4 条与第 9 条落地，真跑见工单 018 交付记录）
+>
+> 1. **心跳是一个独立的并发任务，不是"跑完一个作业顺手刷一次"**。`loop()` 里 `beat_forever` 与
+>    主循环并行，共享的只有 `_Current` 那一格（这个进程**此刻**在跑哪个作业，由 `run_once` 的
+>    `on_claim` 在领取成功那一刻点上）。上面第 4 条说的"独立连接"落到代码上的形状是：
+>    心跳走 `create_engine(poolclass=NullPool)` 现开的第二条引擎——每次现开一条连接、还回去就关掉，
+>    与主会话**结构上不可能**共用一条连接，而不是"池子大概不会把同一条借出去"。
+>    为此 `core/db.py` 的 `create_engine` 补了一处配合：换了池型就把 `pool_size` / `max_overflow`
+>    摘掉，NullPool 收到 QueuePool 的两个尺寸参数会当场抛 `InvalidRequestError`。
+> 2. **一轮心跳做三件事，各自提交**：刷自己的钟 → 扫僵尸 → 清过期事件。刷钟不等回收，
+>    回收补的终局事件不等保留期；唯独**回收的 UPDATE 与它补的那条事件在同一个事务**——
+>    分开提交会留下"已改判 `failed`、读侧却永远等不到最后一帧"的窗口，而那正是 017 的流式读侧最怕的形状。
+> 3. **`pending` 在候选里，但判据是心跳而不是存在时长**：从没被领取的行 `heartbeat_at` 是 NULL，
+>    匹配不上 `< now() - interval` 这个比较，天然排除在"超时"之外。躺很久的排队行说明的是"没有 worker"，
+>    而起 worker 是运维动作，不是把别人的待办改判 `failed` 的理由。
+>    注意这条 WHERE 里**没有** `heartbeat_at IS NULL` 这个显式谓词：NULL 是被"小于比较匹配不上"
+>    排除掉的，所以它是三值逻辑给的，不是有人写下来的——改这条语句时别把那句当成已经写过了。
+> 4. **回收不认识"是我自己在跑"，靠的是钟而不是身份**：`reclaim_update_stmt` 里没有
+>    `id != own_job_id` 这一格，也没有 `errors` 的读改写。一个跑得很久的作业之所以不被自己的
+>    worker 判成僵尸，是因为每 10s 有人替它把钟推到"现在"。`RETURNING id` 让"我回收了哪些"由这条
+>    语句自己回答——两个 worker 同扫时后到的那个拿到空列表，终局事件不会被补写两遍。
+> 5. **补写终局事件走 017 的那个唯一入口**：`sync_service.append_terminal_event`（本片新增的公共
+>    helper，因为它在 `run_sync` 之外被调用）。`counters` 抄该作业**最后一帧**的账（一帧都没有才归零）——
+>    凭空写五个 0 会把"已经抽了 8 个对象"抹成"什么都没做"，而那一行正被进度条看着；
+>    粗档 `done` 仍由 `stage_of("done")` 现算，全仓第二次翻译没有发生。
+> 6. **三个阈值/间隔/天数全是入参**：`heartbeat_interval_s`(10) / `stale_job_reclaim_s`(180) /
+>    `retention_days`(30) 由 `loop()` 经 `run_worker.cadence(settings)` 一次翻成 `beat_forever`
+>    的三个入参——"哪个键喂给哪个参数"这件事全仓只住在那一个纯函数里，`test_worker_reclaim.py`
+>    钉它（实测过：把 `interval_s` 与 `stale_seconds` 两个键互换，整轮用例只红那一条），
+>    循环体和语句文本里都不出现这三个数（P2 那本"只剩定义点"的账，本片闭掉三条）。
+>    PG 的间隔写法是 `make_interval(secs => N)`：`func.make_interval(secs=N)` 会被 SQLAlchemy 当成
+>    函数构造选项直接 `TypeError`，`text()` 绑参又渲染不出 `literal_binds` 下的数字（单测断的正是
+>    "换一个入参、文本里的数跟着换"），所以走 `literal_column`。拼接前有一道**拒绝式**闸门：
+>    参数名必须落在 `make_interval` 那七个之内、值必须是 `int` 且不是 `bool`，否则当场抛。
+>    这里第一版写的是"一道 `int()` 闸门"，那句是错的、已实测纠正：`int()` 是**静默截断**
+>    （`secs=180.7` 编出 `make_interval(secs => 180)`，`secs=True` 编出 `1`），
+>    一个 float 阈值会悄悄少一秒——而这条语句的全部语义就是"差多少秒算僵尸"。
+> 7. **保留期的射程只有 `sync_job_event`**。上面第 9 条按原文落地：那条 DELETE 的目标表里不出现
+>    `sync_jobs`（删作业行是灭迹不是保留期），`data/results/` 的 csv 由用例做 mtime+size 清单快照
+>    断"回收前后逐字节相同"。结果文件自己的回收仍归 P8 下载端点那一片。
+> 8. **有一笔代价没被任何验收钉住，先记在纸上不动它**：第 7 条那条 DELETE 的谓词是
+>    `created_at < now() - interval`，而本表在 `created_at` 上**没有索引**——2026-09-30 在真 `aiweb`
+>    上查 `pg_indexes` 实测，只有 `pk_sync_job_event(id)` 与 `uq_sync_job_event_job_id_seq(job_id, seq)`
+>    两棵 b-tree，当前 7 行。所以它是**每轮心跳一次的全表扫描**，而 §2.8 第 3 条自己写着这张表
+>    "是全仓唯一一张确定会随时间线性增长的表"。今天它免费；不免费的时候付账的是 worker 里那条
+>    心跳任务，不是任何一个请求，所以它不会以"接口变慢"的形式被看见，只会以"worker 那一轮迟了几秒"
+>    的形式被看见。
+>    **当前形状不违反已定口径**（"同一轮顺手扫"要的主语就是这一轮），两条退路也都不该在没有观测
+>    之前预先走：(a) 补 `INDEX (created_at)` 要给写侧多一棵树，而 §2.8 ⑤ 刚以"多一份写放大换不到
+>    任何一次不同的扫描"为理由拒掉过同表的一条索引；(b) 把清理降频成"每天一次"需要一个跨轮次的
+>    记账点，018 里没有。**都不做，留这一条字。**真正会先疼的是 (c)：清理的频率不是清理自己
+>    要的，是搭刷钟那班车的（`heartbeat_interval_s`=10s），两件事同轮是 §6 as-built(P3-018) 第 2 条
+>    的拍板——于是这条扫描的次数被一个与它无关的常数绑住。
 
 ## 7. `SourceDialect` 抽象与中间结构
 

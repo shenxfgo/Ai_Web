@@ -45,6 +45,12 @@ def create_engine(**overrides: Any) -> AsyncEngine:
         "connect_args": pg.connect_args(),
     }
     kwargs.update(overrides)
+    if "poolclass" in kwargs:
+        # 换了池型就不再要 QueuePool 的那两个尺寸参数——NullPool 收到它们会直接抛
+        # InvalidRequestError。worker 的心跳引擎要走 NullPool（工单 018 的"独立连接"要的是
+        # 结构上不可能共用一条连接，而不是"池子大概不会借出同一条"）。
+        kwargs.pop("pool_size", None)
+        kwargs.pop("max_overflow", None)
     return create_async_engine(pg.dsn(), **kwargs)
 
 

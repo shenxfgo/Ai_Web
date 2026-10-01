@@ -659,6 +659,30 @@ async def _add_event(
     await session.execute(select(func.pg_notify(SYNC_EVENT_CHANNEL, str(job_id))))
 
 
+async def append_terminal_event(
+    session: AsyncSession, job_id: int, payload: dict[str, Any]
+) -> None:
+    """给一个**再没有人驱动**的作业补一条终局事件（工单 018 的僵尸回收路径）。
+
+    回收者改判的是别人开跑的那一行，它不知道中途进度，所以 `counters` 抄这个作业最后一帧的账
+    （一帧都没有才归零）——凭空写五个 0 会把"已经抽了 8 个对象"抹成"什么都没做"，而那一行
+    正在被读侧的进度条看着。粗档 `done` 仍由 `stage_of("done")` 现算，不在这之外再造第二次翻译。
+
+    走 `_add_event` 而不是自己 insert：工单 017 把那里定成全仓写 `sync_job_event` 的唯一入口，
+    `seq` 的算法、`UNIQUE (job_id, seq)` 的兜底和"与插入同事务的那一声 NOTIFY"都在里面；
+    回收正是叫醒读侧的时刻（前端要靠这一帧收尾，否则它永远停在最后一帧）。
+    """
+    last_counters = (
+        await session.execute(
+            select(_EVENT.c.counters)
+            .where(_EVENT.c.job_id == job_id)
+            .order_by(_EVENT.c.seq.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    await _add_event(session, job_id, "done", last_counters or _Progress().as_dict(), payload)
+
+
 async def _set_phase(
     session: AsyncSession,
     job_id: int,

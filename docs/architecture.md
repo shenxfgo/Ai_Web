@@ -298,6 +298,10 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > 但"空结论没有任何兜底或告警"是**真实的缺口**——012-B 认领的三档畸形返回管的是 ⑤ 的 SQL 正文，
 > ⑨ 的正文形状至今没有任何工单认领，已记入工单 014 的交付记录（连同"下载端点归 P8、
 > `RETENTION_DAYS` 清理作业无实现点"一起，是同一类"文档承诺了但没人认领"的洞）。
+> **as-built(P3-018)**：那句"`RETENTION_DAYS` 清理作业无实现点"到此闭掉一半——
+> `scripts/run_worker.py` 每轮心跳顺带按 `AIWEB_RESULT__RETENTION_DAYS`（30 天）删 `sync_job_event`
+> 的旧行。**结果 csv 的回收仍然是那个洞**：这一片的已定口径把它限死在事件表上，
+> 删文件不可逆，`data/results/` 里躺着 P2 验收 4/5 的现场证据（§6 as-built 第 9 条）。
 
 > **as-built(P2-011)**：⑦ 这一步落地为 `services/nl2sql/executor.execute_readonly(...)`（async），
 > 返回 `ExecutionResult(columns, rows, truncated, row_count, run_id, result_file)`。三个口径要记：
