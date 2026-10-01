@@ -179,11 +179,14 @@ async def test_NOTIFY_丢失时一条流最迟一个心跳周期仍读到那一�
         wake = await make_job_queue(session).subscribe(job_id)
         agen = stream_job_events(session, wake, job_id, 0, ping_after_s=0.05)
         try:
-            pull = asyncio.create_task(agen.__anext__())
-            await asyncio.sleep(0.02)  # 让生成器先进到 wait()，再去写那一行
-            await _write_event_without_notify(session_factory, job_id)
-            first = await asyncio.wait_for(pull, 10)
+            # 顺序靠结构而不是靠时长：先把第一轮逼完（此刻表里一行都没有，第一帧必定是心跳），
+            # 再写那一行。原来这里写的是 `create_task(__anext__())` + `sleep(0.02)` + 插行，
+            # 赌的是"生成器那次 `read_events` 已经跑完"——那是一次真往返，整轮闸里机器忙时
+            # 它排在 20ms 之后，于是那一行被第一轮直接读走，"第一帧只能是心跳"就假了
+            # （与 `679af99` 那条同一个根：拿墙钟余量当顺序保证）。
+            first = await asyncio.wait_for(agen.__anext__(), 10)
             assert first == ": ping\n\n", "叫醒确实被打掉了：第一帧只能是心跳"
+            await _write_event_without_notify(session_factory, job_id)
             second = await asyncio.wait_for(agen.__anext__(), 10)
         finally:
             await agen.aclose()
