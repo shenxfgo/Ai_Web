@@ -382,6 +382,268 @@ PG 侧最宽的 `product_stats_wide` 只有 25 列，过不了 kb-workflow §6 �
 本轮由一次性 psql 复验跑过、跑完即删，仓库里可复跑的那一份住在 `scripts/demo_pg.ps1` 的收尾复验里
 （§1.5.3 末条，"已建过"分支也会重跑一遍）。
 
+### 1.7 P3 同步链路真跑实录（工单 025 验收 4）
+
+§1.6.1 那一份对账数字来自 live 用例，而用例按工单 016 的已定口径**不真起子进程**（`run_once`
+在测试进程里代跑）。这一节补的就是那一条被让掉的路：**两条真进程 + 一次当场打断 + 一次自愈**，
+它是 roadmap §P3 验收 1/2/3/4 与"?force 开关""真分批"这五处的独立真相源。
+
+前置（缺一判定的方向就会反过来）：
+
+- API 按文档那条命令起：`dev.ps1 dev`（127.0.0.1:8000）。**本机跑它的字面是
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 dev`**——这台机器只装了
+  Windows PowerShell 5.1，PATH 上没有 `pwsh`（PowerShell 7 未安装），文档其余各处写 `pwsh` 的地方
+  在本机都要换成 `powershell`（Makefile 自己用的就是 `powershell`，见 roadmap §6 那行的差额账）。
+  这条命令的**前端那一半在本机是失败的**：`Start-Process -FilePath "npm"` 报 `%1 is not a valid Win32 application`
+  （`npm` 是 `.cmd` 垫片，`Start-Process` 不吃），后端那一半照常起来并常驻（`api.log` 里两件事挨着：
+  先是这条报错，紧接着 `Uvicorn running on http://127.0.0.1:8000`）。实录只需要 API，所以本轮没为它改脚本——
+  **记成无主项**（工单 025「不做新功能代码」），归下一次碰 `dev.ps1` 的那一片。
+  另：`api.log` 第 14 行有一次 `WatchFiles detected changes in 'app\services\sync_service.py'. Reloading...`，
+  就是抄录期间存盘触发的自动重启，落在 job 19 那一轮的时刻上。它不影响本节四格证据：入队与终局都在 PG 里，
+  worker 是脚本自己起的子进程、不经 uvicorn 的重启器；顺带把 §3 第 15 行说的那个"`--reload` 老形态"演了一次。
+  **worker 不在这里起**——实录脚本自己按 `backend/.venv/Scripts/python.exe scripts/run_worker.py`
+  起子进程并按 pid 杀（同一条命令、同一个入口文件，只是为了拿得到 pid）。
+  理由是验收 4 那句"kill 的对象是 worker 进程，不是 uvicorn"。
+- 凭证只在运行时读：应用账号 `backend/.setup/local_admin.txt`、源库口令 `backend/.setup/aiweb_ro.cnf`，
+  两者都只进请求体，不打进日志也不回显（登录行只打 token 长度）。
+- **全程零手工 SQL**：写侧只有 HTTP（`POST /api/datasources` / `POST /api/sync/jobs`），
+  元数据库侧一律 `SELECT`，一条 `UPDATE`/`INSERT`/DDL 都不发。僵尸行被回收、`enum_values` 被自清，
+  都是系统自己做的，不是脚本替它做的。
+- 用的源是新登记的 `demo-mysql-025`（请求体里 `include_schemas=["ai_web_demo"]`、`exclude_tables=["\\_%"]`）
+  → 抽取分母 **10**（9 张 `BASE TABLE` + 1 张 `VIEW`），与 §1.2 末注同口径。库里另一份 `demo-mysql`
+  （id=1）的库行配置相同（`out_probe_f.txt`：两行的 `include_schemas` 都是 `['ai_web_demo']`、
+  `exclude_tables` 都是 `['\\_%']`、`include_tables` 都是 `NULL`），只是它是 P2 时代就在的那一份。
+- **范围三列不在数据源接口的投影里**，这一条本节自己绕过过一次坑，写下来免得下次再踩：
+  `out_probe_f.txt` 同时打了 `GET /datasources` 与 `GET /datasources/{1,2}` 的响应原文，三个响应的键集合里
+  **都没有** `include_schemas`/`include_tables`/`exclude_tables`（这三个字段只挂在 `DataSourceCreate`
+  上（`schemas/datasource.py:29`/`:31`），读侧的 `DataSourceOut`（`:39` 起）里没有它们）。
+  早先那份 `ds.txt` 里 ds=1 的 `include_schemas: None` 是探针自己 `row.get(k)` 对一个**写死的键清单**
+  取不到时的默认值，不是库里的值——把它读成"这一列没配"就反了。所以"exclude 真的生效了"的证据
+  不是任何回读行，而是 discover 帧的 `total=10` 与 `meta_table` 里那 10 行（`_aiweb_demo_marker` 不在其中）。
+
+| # | 流程（`evidence/evidence025.py` 的第一个参数） | 期望证据 | 本轮 |
+|---|---|---|---|
+| 1 | `register` | 201 + `id`，随后 `GET /datasources` 里看得见这一行（范围三列**不在**响应里，见上面前置的第 4 条——所以 exclude 是否生效由第 4 行的分母背，不由回读行背） | `id=2`，`out_register.txt` |
+| 2 | `legacy` | 跑之前 `meta_column.enum_values` 仍是 JSON 字面 `'null'::jsonb` 的行数 **> 0**，一次 MySQL 同步之后 **= 0** | 125 → 0 |
+| 3 | `409` | 队列里有一行 pending、worker **还没起**，此时同库再发一次 → 409 `sync_already_running` | 挡住的是索引 |
+| 4 | `timeline <job_id>` | 后起的 worker 领走那一行：`retry: 3000` → 五帧 `event: progress`（`id` 1..5）→ `event: done`；库里 `progress=100.00` | 全帧序见下 |
+| 5 | `force <ds_id>` | worker 侧 `AIWEB_EXTRACT__MAX_TABLES=1`：不带 force 那次 `failed` + `errors[0].data.remedies` 三条原文；`force=true` 那次 `success` | job 19 / job 20 |
+| 6 | `killbatch <ds_id>` | 压 `BATCH_SIZE=3` + `HEARTBEAT_INTERVAL_S=3` + `STALE_JOB_RECLAIM_S=10`（两个 worker 这三个键相同），worker1 另加 `BATCH_INTERVAL_MS=5000` 好让它来得及在批间断气，跑到一半 `kill()` 掉它 → 僵尸在场时再发起仍 409 → 12s 后起 worker2（`BATCH_INTERVAL_MS=200`，为了这一轮别拖太久）→ 日志出现"回收 1 个僵尸 job" → 重新同步 `success` 且**批数是 4、形状 `[3,3,3,1]`** | job 21 → 23 |
+
+#### 1.7.1 实跑输出的枚举清单（逐字，四段）
+
+下面四段是从 `.scratch/p3-production-sync/evidence/` 的那几份原始文件**整段照抄**的：不转述、不加省略号、
+不合行、不把 `payload` 之类"看着是空的"容器删掉。原始文件是 CRLF 行尾，摘录只去掉了行尾的 `\r`，
+其余逐字符相同（要复核就把本节代码块跟那几个文件 `diff`）。工单 025 的口径那句"每条枚举清单与实跑输出
+逐字一致"落到这里就是这一条纪律——上一版本节把五帧压成五行可读摘要，读起来舒服，但**它不再是证据**：
+压缩掉的 `payload` 与 `event: progress` 恰好是 §2.1 那条帧形状用例钉的东西。
+
+`legacy`（验收 2 的自清那半，跑在 `demo-mysql` id=1 上）← `out_legacy.txt`：
+
+```
+[t+   0.26s] 登录 ok（token 长度 171，不打印内容）
+[t+   0.33s] 跑之前 meta_column.enum_values 是 JSON 字面 null 的行数 = 125
+[t+   0.38s] POST /api/sync/jobs datasource_id=1 force=False → 202 {"job_id":16}
+[t+   1.75s] job 16 终局 status=success counters={'cards': 12, 'tables': 10, 'batches': 1, 'columns': 133, 'indexes': 27, 'databases': 1, 'tables_stale': 0, 'tables_failed': 0, 'relations_inferred': 1, 'relations_extracted': 8}
+[t+   1.75s] 跑之后 JSON 字面 null 的行数 = 0
+```
+
+125 → 0 就是 024 那一修的**真效果**：`_COLUMN_SYNC_COLS` 是整列覆盖，所以一次正常同步把历史脏数据自己洗掉了，
+脚本一条 `UPDATE` 都没发（对照 `out_list.txt` 里跑前那一条 `= 125`，那是同一张 `meta_column` 的同一条件）。
+
+`409`（验收 3 的互斥那一半，跑在 ds=2 上）← `out_409.txt`：
+
+```
+[t+   0.27s] 登录 ok（token 长度 171，不打印内容）
+[t+   0.28s] POST /api/sync/jobs datasource_id=2 force=False → 202 {"job_id":17}
+[t+   0.36s] 入队后那一行（还没有 worker 在跑）：status=pending started_at=None progress=0.00
+[t+   0.36s] POST /api/sync/jobs datasource_id=2 force=False → 409 {"error":{"code":"sync_already_running","message":"该数据源已有一个未结束的同步任务","detail":null}}
+[t+   0.36s] 同库再发一次 → 409 {"error":{"code":"sync_already_running","message":"该数据源已有一个未结束的同步任务","detail":null}}
+[t+   0.36s] 此刻那一行仍是 ('pending', 'connect', Decimal('0.00'), None, None, None, {}, [], False)
+[t+   0.36s] （job_id=17 留给下一个流程消费：SSE 用 --job 17）
+PENDING_JOB=17
+```
+
+`started_at=None` 与 `status='pending'` 是同一条事实的两面（入队那条 `INSERT` 里不许出现 `running`，
+也不许顺手点上那两个钟，见 §2.1 的 `job_queue` 行）。连打的两行 `→ 409` 是**同一次请求的两条打印**
+（`_post()` 先报原始响应，流程再转述一次），不是发了两次；挡人的是 `ux_sync_running` 这个部分唯一索引，
+不是"有人在跑"——此刻库里一个 worker 都没有。
+最后那行元组是 `_row()` 直接 print 的 `sqlalchemy.Row`，`select(...)` 的列顺序是
+`(status, phase, progress, started_at, finished_at, heartbeat_at, counters, errors, force)`——
+那一格里三个 `None` 连排，正是"入队后谁都没跑过"的形状（两个钟都没点上、`counters`/`errors` 是空容器）。
+同理 `事件=[(1, 'extract', 'discover'), …]` 的三元组顺序是 `(seq, stage, phase)`。
+
+`timeline`（验收 1/2/3 的正跑那一半；job 17 就是 409 那一步留下的 pending，被这里后起的 worker 领走）
+← `out_timeline.txt`（`event: done` 那一帧的原始字节连 HTTP 头一起另存在同目录 `sse_17.txt`，
+里面有 `x-request-id: ec8576d7a5ca466e` 与 `content-type: text/event-stream; charset=utf-8`）：
+
+```
+[t+   0.25s] 登录 ok（token 长度 171，不打印内容）
+[t+   1.28s] worker 启动行：[worker] 开始消费同步队列（空转每 2s 扫一次，心跳每 10s 一次、回收阈值 180s、事件保留 30 天，Ctrl+C 退出）
+[t+   1.48s] retry: 3000
+[t+   1.48s] 
+[t+   1.51s] id: 1
+[t+   1.51s] event: progress
+[t+   1.51s] data: {"stage": "extract", "phase": "discover", "done": 0, "view": 1, "cards": 0, "total": 10, "base_table": 9, "payload": {}}
+[t+   1.51s] 
+[t+   1.51s] id: 2
+[t+   1.51s] event: progress
+[t+   1.51s] data: {"stage": "upsert", "phase": "tables", "done": 10, "view": 1, "cards": 0, "total": 10, "base_table": 9, "payload": {"schema": "ai_web_demo", "batches": [["category", "customer", "order_item", "order_main", "payment_record", "product", "product_stats_wide", "refund_record", "user_activity_log", "v_daily_sales"]]}}
+[t+   1.51s] 
+[t+   1.51s] id: 3
+[t+   1.51s] event: progress
+[t+   1.51s] data: {"stage": "card_build", "phase": "card_build", "done": 10, "view": 1, "cards": 0, "total": 10, "base_table": 9, "payload": {}}
+[t+   1.51s] 
+[t+   1.51s] id: 4
+[t+   1.51s] event: progress
+[t+   1.51s] data: {"stage": "embed", "phase": "embed", "done": 10, "view": 1, "cards": 12, "total": 10, "base_table": 9, "payload": {"code": "embedding_not_configured", "detail": "embedding 三键（base_url / api_key / model）为空，向量化归 P4", "skipped": true}}
+[t+   1.51s] 
+[t+   1.51s] id: 5
+[t+   1.51s] event: progress
+[t+   1.51s] data: {"stage": "done", "phase": "done", "done": 10, "view": 1, "cards": 12, "total": 10, "base_table": 9, "payload": {}}
+[t+   1.51s] 
+[t+   1.51s] event: done
+[t+   1.51s] data: {"job_id": 17, "status": "success", "counters": {"cards": 12, "tables": 10, "batches": 1, "columns": 133, "indexes": 27, "databases": 1, "tables_stale": 0, "tables_failed": 0, "relations_inferred": 1, "relations_extracted": 8}, "warnings": [], "errors": [], "duration_ms": 276}
+[t+   1.51s] 
+[t+   1.80s] job 17 终局（读库）：status=success phase=done progress=100.00
+[t+   1.80s]                 counters={'cards': 12, 'tables': 10, 'batches': 1, 'columns': 133, 'indexes': 27, 'databases': 1, 'tables_stale': 0, 'tables_failed': 0, 'relations_inferred': 1, 'relations_extracted': 8}
+[t+   1.80s]                 事件=[(1, 'extract', 'discover'), (2, 'upsert', 'tables'), (3, 'card_build', 'card_build'), (4, 'embed', 'embed'), (5, 'done', 'done')]
+[t+   1.80s] worker stdout：
+[worker] 开始消费同步队列（空转每 2s 扫一次，心跳每 10s 一次、回收阈值 180s、事件保留 30 天，Ctrl+C 退出）
+[job 17] status=success duration=234ms
+          counters={'databases': 1, 'tables': 10, 'columns': 133, 'indexes': 27, 'relations_extracted': 8, 'relations_inferred': 1, 'tables_stale': 0, 'tables_failed': 0, 'cards': 12, 'batches': 1}
+```
+
+这一段是"五帧对应库里五行 `seq`"的**唯一一份同时看得见两边**的记录：帧侧的 `id: 1..5` 与
+读库侧 `事件=[(1, 'extract', 'discover'), …, (5, 'done', 'done')]` 逐位相等，且
+`event: done` 收尾那一帧**没有 `id`**（游标只属于进度帧）。默认批大小 200 时 `batches` 是 1，
+名单十张全在同一个子数组里——这正是 §1.7.1 末段那个 `[3,3,3,1]` 的对照组。
+
+`force`（`force` 开关那半，worker 侧 `AIWEB_EXTRACT__MAX_TABLES=1`）← `out_force.txt`：
+
+```
+[t+   0.26s] 登录 ok（token 长度 171，不打印内容）
+[t+   1.31s] POST /api/sync/jobs datasource_id=2 force=False → 202 {"job_id":19}
+[t+   1.31s] worker 侧 AIWEB_EXTRACT__MAX_TABLES=1：不带 force 那次 → 202
+[t+   3.55s]   → job 19 status=failed force=False errors=[{'code': 'extract_scope_too_large', 'data': {'remedies': ['配 include_tables 白名单', '只同步部分 schema（include_schemas）', 'admin 用 ?force=true 覆盖上限'], 'max_tables': 1, 'table_count': 10}, 'detail': '抽取范围里有 10 张表，超过上限 1'}]
+[t+   3.56s] POST /api/sync/jobs datasource_id=2 force=True → 202 {"job_id":20}
+[t+   5.73s] force=true 那次 → job 20 status=success force=True progress=100.00 counters={'cards': 12, 'tables': 10, 'batches': 1, 'columns': 133, 'indexes': 27, 'databases': 1, 'tables_stale': 0, 'tables_failed': 0, 'relations_inferred': 1, 'relations_extracted': 8}
+[t+   5.73s] worker stdout：
+[worker] 开始消费同步队列（空转每 2s 扫一次，心跳每 10s 一次、回收阈值 180s、事件保留 30 天，Ctrl+C 退出）
+[job 19] 异常（终局已由 run_sync 写好）：ExtractScopeTooLarge: 抽取范围里有 10 张表，超过上限 1
+[job 20] status=success duration=187ms
+          counters={'databases': 1, 'tables': 10, 'columns': 133, 'indexes': 27, 'relations_extracted': 8, 'relations_inferred': 1, 'tables_stale': 0, 'tables_failed': 0, 'cards': 12, 'batches': 1}
+```
+
+三条出路里第三条的字面是 `admin 用 ?force=true 覆盖上限`（`SCOPE_REMEDIES` 原文，021 换回来的那一版），
+而**实装的形状是请求体** `{"force":true}`（`architecture.md` §7 那行的 as-built 记着为什么不二开
+查询参数入口）。措辞到本节为止统一：文档提这一档时写"`force` 开关（HTTP 请求体字段）"，
+`?force=true` 只作为 `remedies` 里的**被钉字面量**出现，不再当作调用写法。
+
+`killbatch`（验收 4 + "一批 200 表"那条的真分批）← `out_killbatch.txt`：
+
+```
+[t+   0.27s] 登录 ok（token 长度 171，不打印内容）
+[t+   0.28s] POST /api/sync/jobs datasource_id=2 force=False → 202 {"job_id":21}
+[t+   1.41s] 打断时：status=running phase=connect heartbeat=2026-10-01 13:11:03.688542+00:00 progress=0.00
+[t+   1.41s] SIGKILL worker1 pid=21092
+[t+   1.42s] POST /api/sync/jobs datasource_id=2 force=False → 409 {"error":{"code":"sync_already_running","message":"该数据源已有一个未结束的同步任务","detail":null}}
+[t+   1.42s] 僵尸在场时再发起 → 409 {"error":{"code":"sync_already_running","message":"该数据源已有一个未结束的同步任务","detail":null}}
+[t+  14.49s] worker2 启动行：[worker] 开始消费同步队列（空转每 2s 扫一次，心跳每 3s 一次、回收阈值 10s、事件保留 30 天，Ctrl+C 退出）
+[t+  15.49s] worker2 的回收日志：['[worker] 回收 1 个僵尸 job：[21]']
+[t+  15.50s] 回收后那一行：status=failed finished_at=2026-10-01 13:11:16.862941+00:00 errors=[{'code': 'reclaimed', 'detail': 'heartbeat 超时'}]
+[t+  15.50s] 回收补的事件：[(1, 'done', 'done')]
+[t+  15.52s] POST /api/sync/jobs datasource_id=2 force=False → 202 {"job_id":23}
+[t+  15.69s] retry: 3000
+[t+  16.58s] id: 1
+[t+  16.58s] event: progress
+[t+  16.58s] data: {"stage": "extract", "phase": "discover", "done": 0, "view": 1, "cards": 0, "total": 10, "base_table": 9, "payload": {}}
+[t+  17.27s] id: 2
+[t+  17.27s] event: progress
+[t+  17.27s] data: {"stage": "upsert", "phase": "tables", "done": 10, "view": 1, "cards": 0, "total": 10, "base_table": 9, "payload": {"schema": "ai_web_demo", "batches": [["category", "customer", "order_item"], ["order_main", "payment_record", "product"], ["product_stats_wide", "refund_record", "user_activity_log"], ["v_daily_sales"]]}}
+[t+  17.27s] id: 3
+[t+  17.27s] event: progress
+[t+  17.27s] data: {"stage": "card_build", "phase": "card_build", "done": 10, "view": 1, "cards": 0, "total": 10, "base_table": 9, "payload": {}}
+[t+  17.33s] id: 4
+[t+  17.33s] event: progress
+[t+  17.33s] data: {"stage": "embed", "phase": "embed", "done": 10, "view": 1, "cards": 12, "total": 10, "base_table": 9, "payload": {"code": "embedding_not_configured", "detail": "embedding 三键（base_url / api_key / model）为空，向量化归 P4", "skipped": true}}
+[t+  17.33s] id: 5
+[t+  17.33s] event: progress
+[t+  17.33s] data: {"stage": "done", "phase": "done", "done": 10, "view": 1, "cards": 12, "total": 10, "base_table": 9, "payload": {}}
+[t+  17.33s] event: done
+[t+  17.33s] data: {"job_id": 23, "status": "success", "counters": {"cards": 12, "tables": 10, "batches": 4, "columns": 133, "indexes": 27, "databases": 1, "tables_stale": 0, "tables_failed": 0, "relations_inferred": 1, "relations_extracted": 8}, "warnings": [], "errors": [], "duration_ms": 886}
+[t+  17.56s] 重新同步 job 23：status=success progress=100.00 counters={'cards': 12, 'tables': 10, 'batches': 4, 'columns': 133, 'indexes': 27, 'databases': 1, 'tables_stale': 0, 'tables_failed': 0, 'relations_inferred': 1, 'relations_extracted': 8}
+[t+  17.58s] tables 帧的 payload.batches = {'schema': 'ai_web_demo', 'batches': [['category', 'customer', 'order_item'], ['order_main', 'payment_record', 'product'], ['product_stats_wide', 'refund_record', 'user_activity_log'], ['v_daily_sales']]}
+[t+  17.58s] 批数=4 每批大小=[3, 3, 3, 1]
+[t+  17.58s] worker2 stdout：
+[worker] 开始消费同步队列（空转每 2s 扫一次，心跳每 3s 一次、回收阈值 10s、事件保留 30 天，Ctrl+C 退出）
+[worker] 回收 1 个僵尸 job：[21]
+[job 23] status=success duration=843ms
+          counters={'databases': 1, 'tables': 10, 'columns': 133, 'indexes': 27, 'relations_extracted': 8, 'relations_inferred': 1, 'tables_stale': 0, 'tables_failed': 0, 'cards': 12, 'batches': 4}
+```
+
+**这一份与 `out_timeline.txt` 有一处形状差别，差别是记录方式不是系统行为**：`_stream()` 是按行 echo 的，
+空行也照打（timeline 那份里每帧后面都有一行 `[t+ …] ` 加一个空格），而 killbatch 这一轮我在抄录时把
+那些空白行省了。原始文件 `out_killbatch.txt` 里它们**在**（第 13、17、21、25、29、33、36 行），
+所以本节这一段严格说是"逐字但跳空白行"。要连空白行一起对账就读原文件；留下的理由是一屏放不下两屏空行。
+
+这一段一次答出四件事：**僵尸判的是心跳不是排队时长**（13:11:03 那一记 `heartbeat_at` 是它，
+`STALE_JOB_RECLAIM_S=10` 到点就改判，`errors[0].code` 是 `reclaimed`）、**回收住在心跳循环里而不是启动钩子里**
+（worker2 的启动行落在 `t+14.49s`，回收那一行落在 `t+15.49s`——整整晚一轮；"不必等重启也能改判"那一格
+本节证不了，它由 `test_worker_heartbeat_pg.py` 的"一轮循环改判 + 补终局事件"那条背着）、
+**没消费掉的 `ux_sync_running` 仍挡新作业**（打断后 1ms 内再发就是 409）、
+**默认 200 走不到的分批路径真的走到了**（`batches=4` + `[3,3,3,1]`）。
+
+**这一节的证据边界**：证到的是"真 HTTP → 真队列 → **真子进程 worker** → 真 MySQL → 真元数据库"。
+进程边界本身不是本节才第一次跨——工单 017 的 `tests/integration/test_sync_events_live.py`
+就同时子进程 worker + 子进程 API + 真流式读（那里讲的理由是 `ASGITransport` 攒完 body 才返回，
+"首帧在作业结束之前到达"在那条传输上没有对应事实）。本节的增量是那一条用例**没有**的四格：
+**当场 `kill()` 之后系统自己 recover**（017 的用例不杀进程）、**批大小压到 3 的真跑**
+（默认 200 时那条路径永远走不到）、**`force` 的两面**（超限拒绝 + 覆盖成功各一次）、
+**历史脏数据被一次正常同步自清**（`enum_values` 125→0），而且跑的是开发者手头那两条命令的形状
+（`dev.ps1 dev` 起的常驻 API，不是测试临时起的端口）。没证到的是**界面**——P3 前端只有"系统状态"一页
+（`frontend/src/layouts/nav.ts` 的"数据源""表结构"两个入口至今 `routeName` 为空、标 P3 交付但未接），
+所以 §1.6 第 4~8 步那种"打开页面看一眼"在本节一律是"库里的行 + HTTP 响应"证到的，
+`GET /sync/jobs`（列表）与 `/sync/jobs/{id}`（详情）两个端点也没有实现（roadmap §P3 明确不做，挂账见
+metadata-model §6 末 as-built(P3 收口)）。批大小压到 3 时抽取分母是 **10** 不是 `SHOW FULL TABLES`
+的 11 行（`exclude_tables=["\\_%"]` 把建库脚本自己的 `_aiweb_demo_marker` 排掉了），
+所以刀口是 `[3,3,3,1]` 而不是 `[3,3,3,2]`——两个数的关系同 §1.2 末注。
+
+#### 1.7.2 闸（工单 025 验收 6）
+
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 check` 整轮全绿。原始文件
+`.scratch/p3-production-sync/evidence/gate025.txt`（`.scratch/` 是 gitignored 的，所以结论数字抄在这里而不是只给路径）。
+下面抄的是**每步的命令回显行 + 结论行**，中间省略的是 pytest 那十几行 `[ 7%]` 进度点与 npm 的两行脚本回显——
+省略的都在原文件里，要连进度点一起对账就读原件：
+
+```
++ uv run ruff check app scripts tests alembic  (backend)
+All checks passed!
++ npm run typecheck  (frontend)
++ uv run python -m pytest  (backend)
+980 passed, 2 skipped, 1 warning in 171.30s (0:02:51)
+```
+
+`dev.ps1 check` 只有 `lint` + `typecheck` + `test` 三步，**格式与类型两步不在它里面**——`ruff format --check`
+从来不是目标（`fmt` 是**写**的 `ruff format`，不是 `--check`），`mypy` 也不是：roadmap §6 的 `lint` 那一行写着
+`ruff check . && mypy app`，而 Makefile 与 `dev.ps1` 两边的 `lint` 都只到 `ruff check` 为止，
+**今天没有任何闸目标背 `mypy`**（§2 的"CI 形态"那行把它列成 CI 的一步，属 P10 落地）。本轮手工补的是下面这两条，
+同样逐字，命令回显行连后面的方括号一起抄自原文件：
+
+```
++ uv run ruff format --check app scripts tests alembic  (backend)  [dev.ps1 无此目标，025 手工补]
+166 files already formatted
++ python -m mypy app  (backend)  [dev.ps1 无此目标，025 手工补]
+Success: no issues found in 54 source files
+```
+
+对照基线：工单 014 交付时是 **677 passed / 2 skipped**，本轮 **980 passed / 2 skipped**（收集 982 = 980 + 2），
+高出的 303 条是 P3 那十片加进来的。**两个 skip 没有变多**，仍在 `tests/guard/test_corpus_mutation.py:61`
+——那是守卫变异语料（nl2sql-safety §8.3 那五种变异）的两个空靶，来历见该文 §7 末注"闸从 629/3 变成 631/2"
+那一句，与 DB 介质无关。"闸含 live"这一条本轮也复核过：`-m "pg or live"`
+选得出 **185 条**且全部真跑，也就是 roadmap §6 差额账里那句"换一台没配 DSN 的机器就是 185 条 skip"的
+反面——本机这轮属于"配齐"那一支。
+
 ## 2. 测试分层
 
 ### 2.1 单元测试重点（纯函数，不碰 DB / 不碰网络）
@@ -403,6 +665,7 @@ PG 侧最宽的 `product_stats_wide` 只有 25 列，过不了 kb-workflow §6 �
 | `run_worker` 一轮心跳的三条语句（as-built(P3-018)：`scripts/run_worker.py` 的 `heartbeat_update_stmt` / `reclaim_update_stmt` / `retention_delete_stmt`） | 同一套手法：编译成 PG 方言文本比对，**不执行**。三条口径全是"语句长什么样"的事——心跳只动 `heartbeat_at` 那一格、回收往 `errors`（`jsonb`，**没有 `error` 这一列**）里**追加**、保留期只删 `sync_job_event`——写错一个谓词或把追加写成覆盖，在真库上照样可能绿（`tests/unit/test_worker_reclaim.py`，7 条） | ① 刷钟那条里 `finished_at`/`errors`/`failed` 一个字都不许出现（它是"我还活着"的声明不是终局），且带 `status IN ('pending','running')` 守卫：收尾先落定时这一句必须打不中；② 回收那条逐字对上 §6 表格原句——`errors = (errors || CAST('[{"code":"reclaimed","detail":"heartbeat 超时"}]' AS JSONB))`、`heartbeat_at < now() - make_interval(secs => N)`、`RETURNING id` 三者缺一不可，条目常量 `RECLAIM_ENTRY_JSON` 直接抄文档字面量（`json.loads` 比回去只能证明序列化没变形，证明不了那两个词没被改写）；③ **阈值是入参不是字面量**：换 42 重编译，文本里必须出现 42 且不出现 180；④ 保留期那条编译文本里只许出现 `sync_job_event`，出现 `sync_jobs` 就是灭迹。⑤ **三个键各喂给哪个参数**：`cadence(settings)` 是那条映射的唯一住处（`loop()` 里不出现第二个 `settings.extract.*`），用例拿三个互不相同的数（11/181/31）断它——这条是补上来的：把 `interval_s` 与 `stale_seconds` 互换后跑完整轮，**只有这一条红**（真效果是刷钟 181s、回收阈值 11s，正在跑的作业被自己的 worker 判成僵尸）。⑥ **阈值不是整数就当场抛**：`180.7` / `True` / `"7; DROP TABLE x"` / `None` 四种都从**公共** builder 驱动，期望 `(TypeError, ValueError)`；同一用例再断 `180` 正常编译，否则"全拒"和"没生效"分不开。理由是实测：`int()` 式闸门会把 180.7 悄悄截成 180，而 `make_interval` 那条语句的全部语义就是"差多少秒算僵尸"。行为侧五条在 `tests/integration/test_worker_heartbeat_pg.py`：主事务未提交时换连接已可见、一轮循环改判 + 补终局事件、NOTIFY 丢失时最迟一个心跳周期仍读到、179s 不动 / 181s 判失败 / `pending@NULL` 不杀、保留期删 31 天那行且 `data/results/` 清单快照逐字节相同 |
 | MySQL 读侧的**发送切片**（as-built(P3-020)：`app/extractor/mysql.py` 的 `slice_names` + `collect()` 的批循环 + `SourceManifest.batches`） | 切片是纯函数、批是编排，两层分开钉：`collect` 的批语义钉在**假连接**上（`_rows` 是方言层唯一的 I/O 出口，同 §2.1 `test_extract_mysql_client` 那条理由），真库那一份钉在拦下来的语句清单上。为什么必须两层：假件看得见"第 k 条昂贵查询收到哪几个表名"，真库只看得见条数与顺序，而这两件都不是"总共发了几条" | 单测 11 条在 `tests/unit/test_extract_mysql_batching.py`：① 验收 2 那三个边界各一条（整除无空末批 / 末批只剩 1 张 / `batch>N` 退化成一批，外加空名单回 `[]` 而不是 `[[]]`——`collect` 靠"没有表就不发 C/D/E"躲开 `IN ()` 这个语法错误）；② `batch_size` 非正整数当场抛（`0` 会让切片要么死循环要么空清单）；③ 三条昂贵查询各 4 发、**每发各自的名单**——那四刀是手写的字面量，不写 `slice_names(VISIBLE, 3)`：用被测的那把刀去算刀口，红了也只是"刀和期望一起改错"；④ 反注入两条一起断（占位符 `:tbl_0..n` 与这一批的表名**逐一对应**，且语句文本里一个真表名都不出现——只断前者的话"`IN (:` + 拼接"那种形状照样过）；⑤ 退化路径与分批前同形（默认 200 在 10 个对象上必须退回"一 schema 四条"，防"分批把自己变成永远多发"）；⑥ 分批不改归并结果（批大小 3 与 200 抽出的列/索引逐个相同）；⑦ `MAX_TABLES` 仍在昂贵查询**之前**判（断的是 IS 语句**条数**==1，不是错误码——把门槛挪到 C/D/E 之后也照样抛同一个错）；⑧ 批间隔用耗时下限钉（120ms×3 个间隔 → `>=0.36`，并留 `<0.6` 的上限排除"每批之前都睡"）。live 两条在 `tests/integration/test_extract_mysql_live_batches.py`（验收 1/3/4/5/7）：批名单同时出现在事件负载与那三条昂贵查询的 `IN` 清单里，两边逐批相等；间隔 250ms 时 4 批之间三个间隙各 `>=0.25s`（实测同一份源：间隔 0 那一轮 `duration=1125ms`、间隔 250 那一轮 `1985ms`，差出来的就是那三次让气）。名单**不硬写"第一批是哪三张"**——§8.1 B 没有 `ORDER BY`，交付顺序不是源库的承诺；断的是每批的成员（批大小逐个钉 3/3/3/1、批间不重叠、并起来正好是 §1 那份 10 个对象的名单）。**验收 5 比的是另一次真跑而不是 008 的 golden**——那七份快照喂的是手工摆出来的 `meta_*` 输入（见上面卡片 golden 行），拿它对演示库等于比两件本来不该相等的事；做法是先按 200 跑一轮、再按 3 跑一轮，比五张 `meta_*` 行数与全部卡片 `text_md` 逐字符，只放行 `counters.batches` 那一格变化。**同一轮还比索引那条链的形状**（验收 7"P3 只补'分批后每批都还读到'那一格"）：两侧各取一份按 `(表名, 索引名, SEQ_IN_INDEX)` 排序的 `(列名, SUB_PART, cardinality 是否非空)` 清单逐位相等，再对分批那一次断每一行 `cardinality` 都非空、且全库唯一那处前缀索引 `product.name(32)` 仍在场。比"非空"而不比**数值**：`CARDINALITY` 是 InnoDB 的采样估算，两次真跑之间它可以合法地变，把"分批没改变结果"钉在它上面就变成看运气发红。这跟 007 那条 `test_sync_live.py::test_验收2_cardinality_与_sub_part_真的有非空值` 不互替——那一条走的是默认批大小（10 个对象一批装完），证的是链通着；"切成四批后每批还读得到"只有走分批那条路才答得出。实测变异：D 条投影换成 `NULL AS CARDINALITY, NULL AS SUB_PART` 后这条 live 用例红在 `has_cardinality` 那一行（007 那条同步变红，两个靶心各自独立）。**两个键都走真配置通道**（`monkeypatch.setenv` + `get_settings.cache_clear()`，同 021 的 `max_tables_one`）：桩掉 `get_settings` 的话"`run_sync` 有没有把配置传给方言"就永远验不到。实测过——把 `sync_service.py:989` 那行换成硬编码 `200`：`test_sync_events_pg.py` 只红 `test_分批的两个配置键真有读取点_每批的表名随_tables_帧交回` 那一条，live 两条**一起红**（`counters.batches` 变成 1），而方言层那 11 条单测全绿——它们自己传 `batch_size`，本来就不该替编排层背书 |
 | PG 抽取器的**两半**（as-built(P3-024)：不连库那半是 `app/extractor/postgres.py` 的五条 §8.2 SQL 与行→`Raw*` 映射，加上 `sync_service` 的方言驱动表 `_DIALECTS`；live 那半是 §1.6 那份对账清单） | SQL 文本与映射钉在**假连接**上（`_rows` 仍是方言层唯一的 I/O 出口，同上面 020 那行的理由），501 分发与"列写法跟着 kind"钉在纯函数 + 真 `run_sync` 上 | **30 条不连库单测分两张**：`tests/unit/test_extract_pg_map.py` 14 条吃 §8.2 那条查询**自己的别名**当行键（假件与真 SQL 同形才有意义），钉的是 serial 与 identity 分得开（`default_value` 是 `nextval(...)` 那一串）、`_text[]`/`numeric(10,2)[]` 走 023 的归一而 `raw_data_type` 留原文、`modifiers` 白名单只认 `varchar`/`bpchar`/`numeric` 且数组一律 `NULL`、表达式索引那一位的 `column_name` 是 `NULL`（§8.2 D 的分支）、视图 `last_analyze_at` 恒 `NULL` 而表取 `last_analyze`/`last_autoanalyze` **较晚者**（§2.4 注④ 的 PG 半边）、`idx_scan` 只进 `cardinality_hint` 不进 `cardinality`（单位不同）。`tests/unit/test_extract_pg_client.py` 16 条把编排钉在同一颗桩上：`probe` 的三值 + **只有 42704 才降级**（`OperationalError` 且 `sqlstate is None` 不许被吞——那是连不上，不是版本不支持）、`discover` 排除三个系统 schema 与 `pg\_temp%`/`pg\_toast%`、四条查询的发出顺序 `pg_class → pg_index → pg_attribute → pg_constraint`、空范围**不发 `IN ()`**、`MAX_TABLES` 仍在昂贵查询之前判且三条出路原文到达、PG 侧永不产出 `CHARSET_SUSPECT`（那一格的原料是 MySQL 的会话变量）、020 的批形状在 PG 上同形（10 对象/批 3 → 4 批、昂贵查询 12 发、`:tbl_N` 与名单逐一对应、表名不拼进文本）、以及"方言层不许发写语句"——那条用**词边界正则**而不是子串禁（`AS ON_UPDATE` 里的 `ON ` 会被子串 ban 误杀，误杀一次就没人再敢加别名）。**驱动表 10 条**在 `tests/unit/test_sync_dialect_dispatch.py`，钉工单 024 验收 2 的两面：`kind='postgres'` 不再命中 `NotImplementedSource`（只构造不连接，所以演示源没建时这条不会 skip——skip 掉的正好是要钉的那一句），而 `oracle`/`mssql`/`MySQL`/`""` 仍抛且 `code=='not_implemented'`（不许顺手放宽）；另有一条配对断言，把 `table_scope_filter(ds, column=该格的 scope_column)` 渲染出的片段拿去断它**逐字出现在该方言的 B 查询里**（构造器由测试自己按 kind 查表，不从 `_DIALECTS` 拿——从被测那张表读出的构造器去验同一张表，红了只是两格一起改错）。**接线那一条是集成用例**：`test_sync_pg.py::test_postgres_源的范围条件按_pg_的列写法下发`——`kind='postgres'` 的源跑真 `run_sync`，形状桩件把收到的 `table_sql` 原样记下（桩件自己不渲染口径）。实测变异：把编排里那一行换回硬编码 `t.table_name` 之后**只有这一条红**，上面 40 条全绿（它们都不经过 `run_sync`），红了的内容是"PG 源带着 MySQL 的别名出发了"，而那一句本来要等源库报 42703/1054 才看得见。**as-built(P3-024 live 半边)：那条 SQL 已经在真 `ai_web_demo_pg` 上跑过**——`tests/integration/test_extract_pg_live.py` 四条（验收 1/3/4/5），走真 `POST /api/datasources` → `POST /api/sync/jobs`（202）→ worker 循环体 → 回读元数据库，源库与账号都是真的，逐字对账清单与"证到哪一格"写在 §1.6/§1.6.1；仍没证到的那一组（枚举数组形状、`relkind` 的 `'p'/'m'/'f'`、④ 的"两枚时间戳同时在场时取较晚那枚"、③ 的"每批重取 FK 会不会落两次"）**逐条只列在 metadata-model §8.2 末注"证到哪一步"那一份里**，本行不复述清单以免两处各漂一次。live 另钉到一个**缺口**而不是未证项：表达式索引的文本有列可存（§2.4 `meta_index.funcdef`），但 `RawIndexColumn` 不搬它，所以当前恒空。live 抓出两个**不在 PG 抽取器里**的缺陷并已修：① `inferred_rows` 把表 id 的查找键写死成 `_key("", …)`（MySQL 的 catalog 恒空串惯例），PG 侧每条推断边都查不到而**静默丢弃**（`relations_inferred` 报 0），修法是让 `InferredRelation` 带上它本来就该带的 `catalog_name`，`tests/unit/test_sync_rows.py` 补一条纯函数用例钉住（变异验过：换回 `""` 只有这条红）；② `meta_column.enum_values` 落的不是 SQL NULL 而是 JSON `null`（SQLAlchemy 的 JSON 类型默认 `none_as_null=False`，把 Python `None` 序列成 `'null'::jsonb`，于是 `IS NOT NULL` 成立、82 列全都"有枚举值域"），修法是 `enum_values`/`sample_values` 两格显式 `JSONB(none_as_null=True)`——只改绑定值不动 DDL，而 `_COLUMN_SYNC_COLS` 是整列覆盖，重跑一次同步就自清。**验收 6（MySQL 侧回归不变）在两个修复之后随整轮闸重跑**：被搬动的 `slice_names`/`in_list`/`apply_index_flags` 那三样正对着 MySQL 链，细节记在 roadmap §P3 验收 6 的 as-built |
+| `sync_jobs.progress` 那一格（as-built(P3-025)：`app/services/sync_service.py` 的 `progress_of()`，唯一调用点在 `_set_phase` 写事件帧的同一条 `UPDATE`） | 纯函数手算 + 一条真链路 | 这是 §2.5 那列 `numeric(5,2)` 自 0004 建表（`alembic/versions/0004_meta.py:65`）以来**第一次**有写入点。三条口径各钉一次：① 只有 `{done,total}` 参与折算，`base_table`/`view`/`cards` 是三本不同的账，把它们算进百分比会得到一个"看着像进度"的数；② `total<=0` **回 None**，调用方据此**不写那一格**——discover 之前分母还没定出来，写 `0.0` 等于替 `DEFAULT 0` 宣布"我确定现在是 0%"，而真话是"还不知道"（这一支最容易写错成"回 0.0"，因为两种写法在终局那一帧上都显示 100）；③ 值的来源是**事件帧里那一份** counters，不是另算一次——同一个数有两条产生路径就是 §2.8 决策 3（序列真相在 `sync_job_event`）要堵的东西。用例 `tests/unit/test_sync_progress.py`；真效果在 §1.7.1 的两处实录里：`timeline` 段末行 `progress=100.00` 与 `killbatch` 段打断那一行的 `progress=0.00`（那一轮 `heartbeat_at` 有了、`started_at` 有了，而 discover 还没交回分母，正是 ② 那一支的真实现场） |
 
 配置层的已落地单测：嵌套 `__` 解析、DSN 凭据转义（`u@site` / `p@ss#w/1` → `%40`/`%23`/`%2F`）、
 `masked_dsn` 不出明文、embedding 维度 >2000 被拒、部分配置时 `configured=False`、
@@ -491,7 +754,9 @@ PG 侧最宽的 `product_stats_wide` 只有 25 列，过不了 kb-workflow §6 �
 | 3 | `uv run python scripts/seed_admin.py` | 建 admin；**第二次运行幂等且不重置口令**；库里存的是 argon2 hash |
 | 4 | 前端登录 → 首登强制改密 | 旧 token 立即失效（as-built 005：只有 `users.token_version`（令牌里的 `tv`），没有 `pwd_ver` 那一种） |
 | 5 | 新建数据源 `demo-mysql` → 测试连接 | 返回"连接成功 / 9 表 1 视图 / 只读能力=OK / MySQL 5.7.x / max_execution_time 支持=yes"。要拿到 9/1 必须在**排除表**里填 `_%`（源原生 LIKE 里 `\_` 才是字面下划线）：库里可见的是 11 张，多出来的 `_aiweb_demo_marker`/`_numbers` 这类是脚本内部表，口径见 §1.2 的 as-built 注 |
-| 6 | 立即同步 | SSE 进度到 100%；`sync_jobs.status=success`；phase 序列完整。**as-built(P3-016)**：本机从此**两条命令**——`dev.ps1 dev` 起 API，`dev.ps1 worker` 起执行体（`make worker` 同义）。只起一条时这一行的表现是"202 拿到了、那一行永远停在 `pending`、`started_at` 为 NULL"，那是缺消费者不是缺索引；SSE 那一半归 017，此步现在能看的只有库里那一行 |
+| 6 | 立即同步 | SSE 进度到 100%；`sync_jobs.status=success`；phase 序列完整。**as-built(P3-016)**：本机从此**两条命令**——`dev.ps1 dev` 起 API，`dev.ps1 worker` 起执行体（`make worker` 同义）。只起一条时这一行的表现是"202 拿到了、那一行永远停在 `pending`、`started_at` 为 NULL"，那是缺消费者不是缺索引；SSE 那一半归 017，此步现在能看的只有库里那一行。**as-built(P3 收口)**：这一行今天整条成立，
+逐字实录在 §1.7.1（五帧 `event: progress` + `event: done`，库里 `progress=100.00`——那格从 025 起才有写入点，
+此前它一直是 `DEFAULT 0`）|
 | 7 | 元数据浏览 → 打开 `order_main` | 字段列表含中文注释；索引含复合索引两列顺序正确；关系显示指向 `customer`/`order_item`；卡片文本可复制 |
 | 8 | 知识库检索预览（调参页）输入"各区域每月回款金额" | 返回 `payment_record`/`order_main`/`customer` 三表且带 `vector_rank`/`keyword_rank`/`rrf_score` 三列排名；把 `final_tables` 改成 2 后第三表消失。**as-built(0009)**：这一行是**向量启用后**的完整形态。009 交付的是接口层 `POST /api/kb/search`（没有调参页 UI，也没有 `vector_rank`/`keyword_rank`/`rrf_score` 三列——P2 只有关键词一路，融合排名无从谈起），P2 侧的可人肉验证证据是 `tests/integration/test_kb_search_live.py` 三条 live 用例（问订单总金额 → `order_main` 头名、`payment_record` 进前 5；问客户手机号 → `customer` 头名且理由三元组齐；二次同步后候选不漂移）。调参页 UI 与三列排名归引入向量那一张工单 |
 | 9 | Chat 问"2025 年每个渠道的总回款金额，按金额降序取前 5" | SSE 顺序完整；`guard.verdict=pass`；SQL 引用的表 ⊆ 第 8 步命中集合。**as-built(P2-012)**：这一行是**端点与前端就位后**（P8）的形态——012 不开端点（口径见 architecture §4.1 ⑦ 的拍板块）。P2 侧等价证据是命令行示踪弹：`uv run python scripts/demo_ask.py "2025 年每个渠道的总回款金额，按金额降序取前 5"`，它打印 `retrieved_tables / sql_raw / guard_verdict / sql_final / rows / chart_spec / conclusion` 与各步耗时，其中"SQL 引用的表 ⊆ 命中集合"由守卫的 `allowed` 集在链路内强制（越界即 `SqlGuardError`），不是靠人眼比 |
@@ -500,7 +765,7 @@ PG 侧最宽的 `product_stats_wide` 只有 25 列，过不了 kb-workflow §6 �
 | 12 | 结论卡片 + 反馈"采纳为示例" | `few_shot` 新增行；结论里的数字能在结果表格里找到出处（抽查一处，防模型编数） |
 | 13 | 换一个措辞再问（"看下去年各支付通道收了多少钱"） | `retrieval` 帧含 `few_shot_hit=true`，生成 SQL 与第 9 步结构高度相似；`done.latency_ms` 下降 |
 | 14 | （反向）member 账号问 `user_activity_log` 之外的未授权表 | 403/无相关数据，且日志无该表名泄露 |
-| 15 | （健壮）同步进行中重启服务 → 重启后僵尸 job 被回收、可重新同步 | 日志 + `sync_jobs` 状态变化 |
+| 15 | （健壮）同步进行中重启服务 → 重启后僵尸 job 被回收、可重新同步 | 日志 + `sync_jobs` 状态变化。**as-built(P3 收口)**：这一行的原句有两处按实现改了口径——① kill 的对象是 **worker**，不是 API（`--reload` 存一次盘就是这条的老形态，ADR-0011 拆进程之后已经不存在这个触发面）；② 回收**不必等重启**，心跳循环每轮扫一次，所以"重启后"只是最快看得见的那条路。逐字实录（真子进程 + 当场 `kill()` + 自愈 + 重新同步 `success`）在 §1.7.1 的 `killbatch` 段 |
 
 第 10 步是整套手测里最有价值的一步：**界面数字必须能被源库原样复现**，否则前面全绿也没意义。
 

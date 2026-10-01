@@ -134,8 +134,21 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 要点：MySQL 侧手写 `information_schema` 批量 SQL（`COLUMNS`/`STATISTICS`/`KEY_COLUMN_USAGE`/
 `REFERENTIAL_CONSTRAINTS`/`TABLES`，各自 `WHERE table_schema=%s AND table_name IN (...)`，
 一批 200 表）；PG 侧 `pg_attribute`+`pg_description`+`pg_index`+`pg_constraint`
-（`indkey::int[]` 与 `unnest` 保序，`atttypmod` 归一）。批内一事务、`progress` 累计、
+（`unnest(i.indkey) WITH ORDINALITY` 保序，`atttypmod` 归一）。批内一事务、`progress` 累计、
 每 10s `heartbeat_at`、启动回收僵尸、`(datasource_id) WHERE status='running'` 部分唯一索引。
+
+> **as-built(P3 收口)**：上面这一行要点里有四处与最终交付的口径不同，逐条在此更正（细节住在
+> metadata-model §6 的 as-built 链，不重复论证）：
+> ① **"批内一事务"不成立**——批是**发送切片**，提交粒度仍是"每库一事务"（§6 拍板第 5 条；
+> `slice_names` 只切 `IN (...)` 的名单，020）。② **`progress` 不是"累计"出来的**，它由
+> `progress_of(counters)` 从**事件帧里那一份** `{done,total}` 折算，`total<=0` 时根本不写那一格
+> （025，见 verification §2.1 的 `sync_jobs.progress` 行）。③ **回收不在启动钩子里**：僵尸判定住在
+> worker 心跳循环的每一轮，"只在启动扫一次"被否掉（§6 拍板第 4 条；真跑侧的时间线见 §1.7.1 的
+> `killbatch` 段——启动行落在 14.49s、回收落在 15.49s，差一整轮）。④ **索引的 WHERE 含 `pending`**：
+> 实装是 `status IN ('pending','running')`，所以排队中的作业也挡新作业（§6 施工后第 2 条）。
+> 另更正一处字面：要点原写 `indkey::int[]`，而 SQL 原文与落地版用的都是不带转换的
+> `unnest(i.indkey)`，那个显式转换至今没在 live 上证过（spec 故事 21 交给 024 判定的那一格，
+> 判定与依据写在 metadata-model §8.2 那句保序的 as-built 里）。
 
 验收：
 1. `POST /api/sync/jobs` → 返回 job id；
@@ -286,6 +299,82 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 
 踩坑预警：① 5.7 的 `STATISTICS` 对 MyISAM/视图语义不同，视图要单独分支（列注释全空 → 卡片降级模板）；
 ② 别把源库读和元数据库写混在一个 session；③ `heartbeat_at` 必须在**独立连接**上更新。
+
+#### P3 验收收口（as-built(P3 交付)，工单 025）
+
+上面七条逐条从"拍板过的话"变成"跑出来的证据"。每条给的都必须是**独立真相源**——
+一个数、一份 golden、一段实跑输出——"用例绿了"不算（P2 数过四类假绿，模式都是形状测试原理上看不见）。
+本轮整轮闸的输出（`dev.ps1 check` 全绿 = **980 passed / 2 skipped**，另手工补 `ruff format --check` 与
+`mypy app` 两条）逐字在 verification §1.7.2，基线对照与"两个 skip 没变多"的账也在那里。
+
+| 验收 | 结论 | 独立真相源（用例文件 + 真跑输出） |
+|---|---|---|
+| 1 `POST` 回 job id | 交付（016） | 键：`tests/integration/test_sync_enqueue_pg.py::test_发起同步立刻回_202_而那一轮还没开始跑`（响应体只带 `job_id` + 库里 `pending`/`started_at IS NULL` + 抽取器零调用）。实录：verification §1.7.1 `409` 段前两行 |
+| 2 SSE 帧序 + `total=10` | 交付（017/020） | 键：`tests/unit/test_sync_stage_vocabulary.py`（9 值→5 档穷举）、`tests/integration/test_sync_events_sse_pg.py`（帧内容、游标补读、鉴权、叫醒）、`test_sync_events_live.py`（跨进程进入方式 + 真分母）。实录：§1.7.1 `timeline` 段五帧 `id` 1..5、首帧 `total=10, base_table=9, view=1`（**不是** `SHOW FULL TABLES` 的 11） |
+| 3 再发一次 409 | 交付（016） | 键：`test_sync_enqueue_pg.py::test_排队中的_pending_行也挡住新作业`（把 `ux_sync_running` 的 WHERE 只剩 `running` 即红）。实录：§1.7.1 `409` 段——**worker 还没起**，挡人的只能是索引不是代码 race |
+| 4 kill 后回收 + 重新同步 success | 交付（018） | 键：`tests/unit/test_worker_reclaim.py`、`tests/integration/test_worker_heartbeat_pg.py`。实录：§1.7.1 `killbatch` 段，`[worker] 回收 1 个僵尸 job：[21]` → `errors=[{'code':'reclaimed','detail':'heartbeat 超时'}]` → job 23 `status=success progress=100.00`。全程零手工 SQL、worker 是真子进程且**被当场 `kill()`**（这一格用例给不了：用例不杀自己起的进程） |
+| 5 三表抛错 → `partial` | 交付（019） | 键：`tests/integration/test_sync_card_isolation_pg.py::test_注入三张表卡片构建抛错_终局partial_errors含三张表名_其余五张在场`（注入钩子走真 HTTP→真入队→`run_once` 真跑；同文件另有"排在后面的表失败时前面已提交的卡片仍查得到"与"注入前后 `meta_*` 行数一行不差"两条，钉的就是逐表提交与"失败隔离不漏到元数据侧"）。口径提醒：抛错点在 `card_build`（本机 embedding 三键全空，`embed` 档是 `skipped`），元数据侧仍每库一事务。原验收那句"其余 **6** 张"是 019 之前的夹具形状，如今这条用例的账是 3 失败 + 5 在场 |
+| 6 PG 数据源跑通 + 类型归一化 | 交付（023/024） | 键：`tests/unit/test_pg_type_normalize.py`（七类原料）、`tests/unit/test_extract_pg_map.py`/`test_extract_pg_client.py`、`test_sync_dialect_dispatch.py`（未知 kind 才抛 501）、`tests/integration/test_extract_pg_live.py` 4 条。实录：计数与逐位清单见 verification §1.6.1（10 对象 / 82 列 / 14 索引 / 15 索引列 / 6+2 关系 / 10 卡片）。**未证到的那一组只有 §8.2 末注"证到哪一步"一份**，别处只指它 |
+| 7 `CARDINALITY`/`SUB_PART` 非空 | 交付（007 通、020 补分批那格） | **键（这一条的正身）**：`test_extract_mysql_live_batches.py` 的两次真跑比形状——按 `(表名, 索引名, SEQ_IN_INDEX)` 排序的 `(列名, SUB_PART, cardinality 是否非空)` 清单逐位相等，再对分批那一次断每行非空。**实录给的是快照，给不了"每批都读到"**：`out_probe_b.txt` 抓的是 21:04 那一刻
+ds=2 的 `meta_index` 现值（27 棵全非空 + 唯一那处前缀索引 `product.idx_product_name(name(32))` 的
+`sub_part=32`），而 §1.7.1 那个 `batches=4` 的 `killbatch` 轮次到 21:11 才跑——**这份快照里那 27 行是
+默认批大小那一次（job 17/20）写进去的**。所以它背的是"落库的形状对"，"切成四批后每批还读得到"只有那条
+live 用例答得出，两件事实不互替。同一份探针另有一格
+`funcdef_rows=0`，正是 024 末注那个"表达式索引的文本有列可存但 `RawIndexColumn` 不搬它"的缺口 |
+
+三条不在表里、但收口时必须一起写的账：
+
+1. **`sync_jobs.progress` 从此有写入点**（工单 001 起就悬着的那格）：`sync_service.progress_of()`
+   把事件帧里的 `{done,total}` 折成百分比，唯一调用点在 `_set_phase` 写那一行的同一条 `UPDATE` 里；
+   `total<=0` 时**不写这一格**（分母还没定出来，写 0.0 等于替 `DEFAULT 0` 撒一次谎）。
+   钉子 `tests/unit/test_sync_progress.py`；上面第 2、4 行实录里的 `progress=100.00` 就是它写进去的。
+   `pending` 的写入点归 016（见第 1 行）。**`cancelled` 仍然一个写入点都没有**——`cancel` 整块挂 [P8]，
+   本节不许把它算成已闭。
+2. **`AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 这一键从未落地**：spec 故事 24 与本节 as-built 那句
+   "只新增 `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键"是要 P3 加的，`app/settings.py` 的 `ExtractGroup`
+   里没有它、`.env.example` 与 roadmap §4 分组清单里也只是文档字面。收口判**不补**：
+   补一个没有读取点的键正是 P2 那张账抱怨的东西，它该和 NDV 采样三步一起在 P4 一次落地。
+   已记进 metadata-model §6 末 as-built(P3 收口) 的九键清单。
+3. **`?force=true` 的写法与实装不一致，本轮统一措辞**：`SCOPE_REMEDIES` 第三条文案
+   （`admin 用 ?force=true 覆盖上限`）是被钉的字面量，不改；文档提这一档时改说
+   "`force` 开关（HTTP 请求体字段）"，不为文案另开一条查询参数入口（两条通道并存是本项目禁止的）。
+   见 verification §1.7.1 的 `force` 段末注与 `architecture.md` §7 那行的 as-built。
+
+#### P3 用户故事对账（spec 的 24 条逐条，工单 025 验收 5 的规格轴）
+
+上面七行是 roadmap 的验收，这一张是 spec `docs/specs/2026-09-30-p3-production-sync.md` §3 的用户故事——
+两套编号**不是一一对应**（故事 3/4/5/15/17 在七条验收里没有自己的格子）。列在这里的唯一目的是
+让"哪条故事只有用例、没有真跑"这件事在收口时看得见。**"实录"那一栏空着就是空着**，不拿用例绿了填。
+
+| 故事 | 用例 | 实录（§1.7.1）或"没有" |
+|---|---|---|
+| 1 202 + `pending` + 响应先回 | `test_sync_enqueue_pg.py::test_发起同步立刻回_202_而那一轮还没开始跑` | `409` 段第 2、3 行 |
+| 2 409 判据是索引 | 同上 `::test_排队中的_pending_行也挡住新作业`（改索引 WHERE 即红） | `409` 段那两行 `→ 409`（此刻**零 worker**） |
+| 3 claim 唯一 + 领最老 | `::test_同一个作业不会被两个_worker_领走`、`::test_claim_领走最老的_pending_并把这一轮的钟点上`、`::test_claim_出来的顺序就是入队的顺序` | **没有**：本机同一时刻只常驻一个 worker，两个 worker 各拿一件只在用例里发生过（`明确不做`那条"不开多个 worker"是本机运行形态，不是队列语义） |
+| 4 worker 不吃 token，终局写在 `finally` | `::test_worker_跑完之后终局那三样都对`；`sync_service.py:1158-1166` 那条 `finally` | `force` 段：job 19 抛 `ExtractScopeTooLarge`，worker 打"异常（终局已由 run_sync 写好）"而库里那一行仍是 `failed` + `errors` 在场。worker 进程从头到尾没有登录步骤（实录里只有 API 侧登录，worker 子进程的环境变量只有 DB 连接串与 `MAX_TABLES`） |
+| 5 `force` 覆盖上限 + 三处文案一起动 | `test_extract_mysql_client.py` 的 `SCOPE_REMEDIES` 字面 + 021 的端点透传用例 | `force` 段整段（`failed` 与 `success` 各一次，`errors[0].data.remedies` 三条原文可见） |
+| 6 每次状态变化一行事件、`seq` 单调、`NOTIFY` 只带 `job_id` | `test_sync_events_pg.py::test_一次同步把每一步落成事件行_stage_序列单调不倒退`、`test_sync_events_sse_pg.py::test_NOTIFY_叫醒不必等心跳就把那一帧送出来` | `timeline` 段的 `id: 1..5` 与读库那行 `事件=[…]` |
+| 7 SSE 帧序与 `total=10` | `test_事件流把每一行推成一帧_五键齐在场_收尾是_done`、`test_事件_counters_带全五键_分母来自带_scope_的那次计数` | `timeline` 段首帧 `total=10, base_table=9, view=1` |
+| 8 游标续读一条不丢 | `test_重连按游标续读_一条不丢也不重复` | **没有**：实录是一次连到底，没演过断开重连 |
+| 9 每 15s 一帧 `: ping` | `test_没有新事件时每窗吐一帧_ping`（把 `ping_after_s` 设成 0.02 逼出来）+ 常量 `PING_INTERVAL_S == 15.0` 单钉一次 | **没有**：实录里作业 0.03s 就结束了，永远等不到 ping 窗口 |
+| 10 细/粗词表只有一个映射函数 | `test_sync_stage_vocabulary.py`（9 值穷举、逐条写死）。"grep 不到第二处"本轮真 grep 过：`stage_of` 全仓只有定义 `sync_vocabulary.py:36` 与**一个**调用点 `sync_service.py:675`，其余出现是 DDL 的 `CHECK` 字面（`models/meta.py:349`）和写细值的 `phase` 实参 | `timeline` 段每帧的 `stage`/`phase` 成对（`extract`/`discover`、`upsert`/`tables`…） |
+| 11 `embed` 档 `skipped=true` 而作业仍 `success` | `test_embed_档未配置时以_skipped_出现_作业终局仍是_success` | `timeline` 段 `id: 4` 那一帧与紧随的 `event: done` `status: "success"` |
+| 12 心跳在独立连接、主事务未提交即可见 | `test_worker_heartbeat_pg.py::test_主事务未提交时心跳换个连接就已可见` | `killbatch` 段打断那一行的 `heartbeat=…13:11:03.688542+00:00`（另一条连接读到的） |
+| 13 每轮扫僵尸：`failed` + `errors` 追加 `reclaimed` | `test_worker_reclaim.py`（谓词与条目字面对上文档）+ `::test_一轮循环把心跳超时的_running_改判_failed_并补上终局事件`、`::test_边界_179秒不动_181秒判失败_pending_也算僵尸候选` | `killbatch` 段的回收日志与 `errors=[{'code':'reclaimed',…}]` + `回收补的事件：[(1,'done','done')]` |
+| 14 杀 worker → 重启 → 重新同步 `success`，零手工 SQL | 用例给不了这一格（用例不杀自己起的进程） | `killbatch` 段整段：`kill()` 真子进程 → 409 → 12s 后 worker2 回收 → job 23 `success` |
+| 15 保留期删 `sync_job_event` 旧行，csv 一个字节不动 | `::test_保留期删过期事件行_未过期不删_结果csv逐字节不动` + `test_worker_reclaim.py::test_保留期只删事件表_天数走参数` | **没有**：30 天窗口在演示库上造不出历史行（脚本也不写库），这一格只有用例背书 |
+| 16 `BATCH_SIZE=3` 在真库跑出 4 批、批数从事件流里断 | `test_extract_mysql_batching.py`（11 条）+ `test_extract_mysql_live_batches.py`（2 条）+ `test_sync_events_pg.py::test_分批的两个配置键真有读取点_每批的表名随_tables_帧交回` | `killbatch` 段 `batches=4`、`[3, 3, 3, 1]`。**偏离**：故事原写"11 个对象"，实测分母是 10（`exclude_tables=["\\_%"]` 排掉标记表），所以末批是 1 不是 2 |
+| 17 元数据侧仍"每库一事务"，粒度不许放宽 | `test_sync_cache_pg.py::test_部分失败只清提交完的那个库`/`::test_一个库都没写成时一个键都不清` + `test_sync_events_pg.py::test_upsert_事件与元数据同事务_失败的库一条事件都不留` | 没有也不需要：本机演示只有 1 个 schema，多库那一面由那三条用例自己在元数据库里造出来 |
+| 18 注入 3 张表 `card_build` 抛错 → `partial`、其余在场 | `test_sync_card_isolation_pg.py::test_注入三张表卡片构建抛错_终局partial_errors含三张表名_其余五张在场` + `::test_卡片失败隔离不漏到元数据侧_注入前后meta行数一行不差` | 无实录（019 的口径是"注入钩子走真 HTTP→真入队→`run_once`"，但那仍在测试进程里） |
+| 19 已提交的卡片不在回滚射程内 | `::test_排在后面的表失败_前面已提交的卡片仍查得到` | 同上 |
+| 20 PG 演示源开通 → 登记 → 同步跑通 | `test_extract_pg_live.py` 4 条（真登记、真入队 202、真 SQL、回读元数据库） | 开通那一轮由用户以超管跑 `scripts/demo_pg.ps1`（verification §1.5/§1.5.4 的 34 行 PASS），对账数字在 §1.6/§1.6.1 |
+| 21 五条 SQL 照 §8.2 原文 + 保序那件真跑事项 | `test_extract_pg_map.py`（14）/`test_extract_pg_client.py`（16）+ live 的复合索引对位断言 | §1.6.1。故事点名的 `indkey::int[]` 那一格按它给的二选一收口：**没证到**，所以 §8.2 的表述已改成与 SQL 原文一致（见 metadata-model §8.2 保序那句的 as-built(P3 收口)） |
+| 22 PG 类型归一落抽取层 | `test_pg_type_normalize.py` + `test_type_domain.py`（两方言共享的断言表） | §1.6.1 的 `data_type`/`raw_data_type` 逐列对账 |
+| 23 MySQL 侧同片归一 + 8 份 golden 重录 | `test_mysql_type_normalize.py` + `test_kb_card_golden.py` | 真跑侧在 `test_sync_live.py` 最后一张（演示库每列过共享值域 + 八列点名成对比）；golden 的重录差异由 023 交付记录背书 |
+| 24 `CREATE_TIME`/`UPDATE_TIME` → `last_analyze_at` | MySQL 半边 022、PG 半边 024（`test_extract_pg_map.py` 的"取较晚者"）。**PG 那一支的真库样本是零**：本轮只读实测 7 张只有 `last_autoanalyze`、3 张两枚都空、0 张同时在场（metadata-model §8.2 末注"证到哪一步"） | §1.6.1 逐张比 `meta_table.last_analyze_at` == 源库两枚里较晚的一枚 |
+
+最后一栏里有四格写的是"**没有**"（故事 3、8、9、15），这是本节的结论而不是遗漏：那四格的断言在形状上或时序上需要"两个 worker""中途断开""等满 15 秒""30 天前的行"，而一次开发者手测给不了
+其中的两个。它们都有用例钉着，收口不把它们写成"真跑过"。
 
 ### P4｜pgvector 混合检索完整版 + index profile 原子切换（5 人日）
 
@@ -671,9 +760,11 @@ LLM 探活、embedding 维度实测），`make check-env` / `dev.ps1 check-env` 
 | `migrate-new m="..."` | `alembic revision -m` + 手工填；**新迁移必须 import pgvector、必须带 down** |
 | `seed-admin` | `uv run python scripts/seed_admin.py` |
 | `demo-db` | 探测 `SHOW DATABASES LIKE 'ai_web_demo'` → 不存在才 pipe `init_demo_mysql.sql`（建库账号口令读 `backend/.setup/my_login.cnf`，见 verification.md §1.2 末） |
+| `demo-db-pg` | 同上形状建 PG 演示源库 `ai_web_demo_pg`（P3 验收 6 的原料，口令读 `backend/.setup/pg_login.env`，见 verification.md §1.5.3）。**as-built(P3 收口)：只有 `make` 侧有这一条**，`scripts/dev.ps1` 的 `demo-db` 旁边还没有 `demo-db-pg` 分支——Windows 上要么用 `make demo-db-pg`，要么直接 `powershell -ExecutionPolicy Bypass -File scripts/demo_pg.ps1`（**本机的命令名是 `powershell` 不是 `pwsh`**：这台机器没装 PowerShell 7，PATH 上没有 `pwsh`——本节其余写 `pwsh` 的入口在本机都要换字面，Makefile 自己用的就是 `powershell`） |
 | `dev-backend` / `dev-frontend` | 分别起 uvicorn / vite（`--loop asyncio`） |
 | `dev` | ps1 版用 `Start-Process`/`Start-Job` 并行两个；Makefile 版提示开两个终端（不引 `concurrently`） |
-| `lint` / `fmt` / `typecheck` | `ruff check . && mypy app` / `ruff format .` / `npm run typecheck` |
+| `worker` | `uv run python scripts/run_worker.py`——同步作业的执行体，**常驻第二个进程**（ADR-0011）。`dev` 里不含它：只起 API 时同步会永远停在 `pending`，那是缺消费者不是缺索引。**as-built(P3 收口)**：本表原本没有这一行，而两套脚本都已落地（`make worker` / `dev.ps1 worker`），是 roadmap 落后于脚本 |
+| `lint` / `fmt` / `typecheck` | `ruff check . && mypy app` / `ruff format .` / `npm run typecheck`。**as-built(P3 收口)**：这一行两处比脚本超前——`lint` 两边（Makefile 与 `dev.ps1`）都**只跑 `ruff check`，没有 `mypy`**，所以 `mypy app` 至今没有闸目标背它；`fmt` 是**写式**的 `ruff format`（还带 `--fix`），仓库里没有 `ruff format --check` 这个目标。这两格今天靠提交前手工跑，本轮输出见 verification §1.7.2；把它们接进 `check` 归 P10 的 CI 那一片（§2 的"CI 形态"行本来就列了 `ruff format --check` 与 `mypy app`） |
 | `test` | `uv run pytest`（自动 skip pg/live） |
 | `test-guard` | `uv run pytest tests/guard -q`（每次改动必跑，<5s） |
 | `test-pg` | `AIWEB_PG_TEST_DSN=... AIWEB_REQUIRE_PG_TESTS=1 uv run pytest -m pg` |
@@ -684,8 +775,29 @@ LLM 探活、embedding 维度实测），`make check-env` / `dev.ps1 check-env` 
 | `clean` | 清 `.venv/.pytest_cache/.ruff_cache/dist/logs`（**只清构建产物，绝不动数据库**） |
 
 已落地版本（根 `Makefile` + `scripts/dev.ps1`）目标名为
-`bootstrap / check-env / migrate / dev / dev-backend / dev-frontend / lint / fmt / typecheck / test / check / clean`，
-`demo-db`、`ask`、`sse-smoke`、`e2e` 随对应阶段（P2/P8/P10）补齐。
+`bootstrap / check-env / migrate / seed-admin / demo-db / dev / dev-backend / dev-frontend / worker /
+lint / fmt / typecheck / test / check / clean`（P3 收口时按两套脚本各自的 target 清单重数过一遍，
+原句漏了 `seed-admin`/`demo-db`/`worker` 三个已经在那儿的，又把 `demo-db` 算成"待补"）。
+差额两处一并写清：`demo-db-pg` **只有 `make` 侧有**（`dev.ps1` 的 `demo-db` 旁边缺这一支），
+而本表设计过却**两边都没有**的是
+`migrate-new m="..."`、`test-guard`、`test-pg`、`ask`、`sse-smoke`、`e2e`——
+`test-pg` 这一格尤其要说清：`make test`/`dev.ps1 test` 就是 `pytest`，pg 与 live 用例到底跑没跑
+取决于环境里有没有 `AIWEB_PG_TEST_DSN`（读的是 `backend/.env`）。本轮整轮 **982 条**里
+`-m "pg or live"` 选得出 **185 条**且全部真跑（唯一两个 skip 在 `tests/guard/test_corpus_mutation.py`，
+与介质无关），所以"闸含 live"在本机成立；换一台没配 DSN 的机器就是 185 条 skip，
+而 `test` 目标的输出不会为此多说什么——这是缺一个 `test-pg` 目标的真实代价，不是假绿。
+`ask`、`sse-smoke`、`e2e` 仍随 P8/P10 补齐。
+
+**as-built(P3 收口)：差额还有第三处，是脚本缺陷不是目标缺失**。两套脚本的目标名本轮逐个核过（`dev.ps1 help`
+那三行与 Makefile 的 `.PHONY` 一致，`worker` 两边都在），但 **`dev` 这一条在本机只跑得起后端**：
+`dev.ps1` 的 `Start-Process -FilePath "npm"` 报 `%1 is not a valid Win32 application`（`npm` 是 `.cmd` 垫片，
+`Start-Process` 要的是 `npm.cmd`），而 `$ErrorActionPreference='Stop'` 让脚本在这一句就地抛出——后端那一行
+在它前面已经 `Start-Process` 成功，所以进程还在、`Wait-Process` 没跑到。verification §1.7 的那一轮实录
+就是这个形状（`api.log` 前两行是这条报错，紧接着 `Uvicorn running on http://127.0.0.1:8000`），
+因为同步链路只要 API 与 worker。同处还有一个命令名字面要改：本机只装了 Windows PowerShell 5.1，
+**PATH 上没有 `pwsh`**，所以本文件与 verification 里"`pwsh -ExecutionPolicy Bypass -File scripts/xxx.ps1`"
+那种写法，在本机都得换成 `powershell`（Makefile 自己用的就是 `powershell`，两套脚本在这里本来也不一致）。
+025 判**不当场修**（本片不动代码），两条一起挂下一次碰 `dev.ps1` 的工单。
 
 ## 7. 安装与运行命令（确切）
 

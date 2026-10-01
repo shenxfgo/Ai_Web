@@ -262,7 +262,8 @@ UNIQUE (datasource_id, source_kind, from_table_id, from_column_name, to_table_id
 id bigserial PK / datasource_id FK / triggered_by FK users
 status text CHECK ('pending','running','success','partial','failed','cancelled')
 phase  text CHECK ('connect','discover','tables','columns','indexes','fks','card_build','embed','done')
-progress numeric(5,2) DEFAULT 0
+progress numeric(5,2) DEFAULT 0  -- as-built(P3 收口)：这一格从此有写入点，公式 done/total（§6 末第 5 条）；
+                                 -- 在那之前 P3 全程停在 DEFAULT 0，那不是"有人写了 0"
 counters jsonb DEFAULT '{}'   -- 交付的键（sync_service._Tally）：
                                -- {databases,tables,columns,indexes,relations_extracted,
                                --  relations_inferred,tables_stale,tables_failed,cards,batches}
@@ -448,6 +449,9 @@ INDEX (job_id, seq)             -- as-built(P3-017)：不单独建，见下方 �
 
 只追加、不改写：一行代表"作业状态发生过一次可对外说明的变化"。它是 P3 进度的**唯一真相**，
 而 `sync_jobs.progress` 只是一个百分比（`numeric(5,2)`），两者不互相代替。
+**as-built(P3 收口)**：`progress` 那一格从此有写入点（`sync_service.progress_of`，公式与三条接线用例见 §6 末
+第 5 条），但它的原料正是**同一个事务里写进本表 `counters` 的那一份** `done/total`（`_set_phase` 的
+`event_counters` 一个参数喂两处）——所以它是可重算的快照，不是第二本账；序列真相依旧只在这里。
 
 > ① **`stage` 与 `phase` 并存是有意的**（ADR-0010）：粗粒度给 SSE 与前端进度条，细粒度给排障。
 >    两套词表之间的映射**只许住在一个纯函数里**，任何第二处重复它的位置都是 bug——
@@ -853,6 +857,46 @@ DELETE FROM aiweb.meta_relation
 >     `supports_max_execution_time` 这个**探测**（probe 阶段问源库支不支持），没有任何地方真的发过
 >     `SET`。本行不是 020 的承诺（工单的已定口径与验收 1~7 都没提它），记在这里是为了让"抽取把源库
 >     拖垮"这一格不被误读成整行已交付：现在真正保护源库的只有批大小与批间隔两条。
+>
+> **as-built(P3 收口)**（2026-10-01，工单 025；本片不新增功能代码，只把上面这些拍板涉及的那**九个配置键**
+> 逐条结清——行号与读取点本轮真读，不引用旧账）
+>
+> 1. **闭的五个**（定义点 + 读取点 + 用例三样齐）：
+>
+>    | 键 | 定义点 | 读取点（全仓唯一） | 用例 | 真跑 |
+>    |---|---|---|---|---|
+>    | `extract.batch_size` | `settings.py:146` | `sync_service.py:1044` → `collect(batch_size=)` | `unit/test_extract_mysql_batching.py`（11 条）+ `unit/test_extract_pg_client.py` | verification §1.7.1 的压批那一轮：`[3,3,3,1]`、`counters.batches=4` |
+>    | `extract.batch_interval_ms` | `:147` | `sync_service.py:1045` | 同上（耗时下限那条）+ `integration/test_extract_mysql_live_batches.py` | 真跑在**两处**、都不是 §1.7.1 那一轮的读数：一是那条 live 用例（间隔 250ms、4 批之间三个间隙各 `>=0.25s`，同轮对照间隔 0 的 `1125ms` vs 间隔 250 的 `1985ms`）；二是 §1.7.1 的 `killbatch`——worker1 被压到 5000ms 正是为了"来得及在批之间被 `kill()`"，worker2 再回到 200ms |
+>    | `extract.heartbeat_interval_s` | `:148` | `run_worker.py:177`（经 `cadence()`） | `unit/test_worker_reclaim.py`（⑤ 三键各喂哪个参数）+ `integration/test_worker_heartbeat_pg.py` | §1.7.1 的杀 worker 那一轮： worker 重启后按周期刷钟并判出僵尸 |
+>    | `extract.stale_job_reclaim_s` | `:149` | `run_worker.py:178` | 同上（阈值不是整数当场抛 + 边界 179/181） | §1.7.1：`[worker] 回收 1 个僵尸 job：[21]` |
+>    | `result.retention_days` | `:191` | `run_worker.py:179` | `integration/test_worker_heartbeat_pg.py::test_保留期删过期事件行_未过期不删_结果csv逐字节不动` | **没有**：30 天窗口在演示库上造不出历史行，这一格只有用例背书 |
+>
+>    `max_tables`（`:145`，读于 `sync_service.py:1041` 与 `check_env.py:350`）和
+>    `card_template_version`（`:156`，读于 `kb_service.py:328`）本来就有读取点，不进这份账。
+> 2. **仍无主的四个**（键在 `settings.py:150-153`，都不是 P3 该闭的格）：`min_mysql_version` 全仓
+>    **零读取点**（连 `check_env.py` 都没用它，`.env.example` 里那行 `AIWEB_EXTRACT__MIN_MYSQL_VERSION`
+>    只是把默认值抄给部署的人看）；`min_pg_version` 唯一的
+>    读取点是 `check_env.py:110` 的**部署前自检**，不是抽取侧的版本闸门——上面**拍板第 4 条**末句
+>    （"上表第 1 行那条 `UNSUPPORTED_VERSION`…**本片仍不接**"）到收口仍然成立；`sample_distinct` 的唯一读取点是
+>    `unit/test_settings.py:86`（断的是默认值本身，不是功能路径）；`sample_distinct_max_distinct` 零读取点。
+>    归属照旧：两个版本闸门写 **P6/P10**（roadmap §P6 的源库兼容矩阵、§P10 的部署闸门），
+>    两个采样键写 **P4**（NDV 采样整块）。
+> 3. **上面第 10 条那句"新增 `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键"从未落地**：`ExtractGroup`
+>    里没有这个字段，`.env.example` 里也没有这行。收口判**不补**——一个没有读取点的键比没有这个键更坏
+>    （它会让"NDV 采样已配置"这句假话进配置文件）。这条与 `kb-workflow §8` 把它当已有键在讲的那处口径
+>    冲突一并记在 roadmap §P3 的收口账里，归 P4 与采样三步一起出生。
+> 4. **`status='cancelled'` 继续没有写入点**：上面第 8 条那句话到收口仍然成立，`sync_jobs` 至今没有
+>    `cancel_requested` 列，`cancel` 整块挂 [P8]。**这一格不许算成已闭**。
+> 5. **`progress` 那一列从此有写入点**（顺带把 §2.5 那行 `progress numeric(5,2) DEFAULT 0` 的账补齐）：
+>    P3 前半段它一直是默认值 0——`_set_phase` 写 `phase`/`status`/`counters`/`warnings`/`errors`/`finished_at`，
+>    唯独没碰这一格。收口补的是 `sync_service.progress_of(counters)`（`done / total × 100` 取两位，
+>    `total<=0` 回 `None`）与 `_set_phase` 里"只有带 `event_counters` 的那几次才写、回 `None` 时那一格
+>    干脆不进 `values`（留在原值上，'还不知道分母'不等于'0%'）"这一条边——**序列的真相仍在事件表**
+>    （上面第 3 条不变），`progress` 只是一个可重算的百分比快照。
+>    钉它的是 `tests/unit/test_sync_progress.py`（值域、两位小数、`total<=0` 回 `None`），接线在
+>    `tests/integration/test_sync_pg.py` 那三条：`test_progress_成功收尾时那一格是100`、
+>    `test_progress_中途有库失败时停在已提交的比例`（2/3 → 66.67，同时挡"全跑完才写"和
+>    "按提交过的库数折算"两种写法）、`test_progress_分母还没定出来时留在默认0`。
 
 ## 7. `SourceDialect` 抽象与中间结构
 
@@ -1153,8 +1197,15 @@ JOIN pg_attribute ta ON ta.attrelid=rt.oid AND ta.attnum=x.refid
 WHERE con.contype='f' AND sn.nspname = ANY(%s);
 ```
 
-PG 侧 `indkey::int[]` 与 `unnest ... WITH ORDINALITY` 用来**保序**，`atttypmod` 用来归一
-`numeric(10,2)` / `varchar(n)`。
+PG 侧 `unnest(i.indkey) WITH ORDINALITY` 用来**保序**（上面 D 条原文就是这个写法，`indkey` 是
+`int2vector`，`unnest` 直接吃它），`atttypmod` 用来归一 `numeric(10,2)` / `varchar(n)`。
+
+> **as-built(P3 收口)：这一句原本写作"`indkey::int[]` 与 `unnest ... WITH ORDINALITY` 用来保序"。**
+> 那个显式数组转换**从未在 live 上证过**，而 SQL 原文与落地版（`postgres.py:219`）用的都是不带转换的
+> `unnest(i.indkey)`——`init_demo_pg.sql:561` 的自检注释还把"不用它"写成了理由（verification §1.5.4
+> 的 `expression_index=1` 那一行抄着它）。工单 spec 故事 21 给的二选一里"证明 `::int[]` 可行"那一支
+> 没有发生（024 的四条 live 用例跑的是原文写法），所以走另一支：**表述改成与 SQL 一致**。
+> 保序这件事本身已被真库证到——`test_extract_pg_live.py` 的复合索引第二位对位断言（`:363`）。
 
 > **as-built(P3-024)：本节五条 SQL 的落地版在 `app/extractor/postgres.py`，与原文有八处出入。**
 > 逐条理由写在那个模块的 docstring（它是目录）——那边只编到 7，因为它的偏离 2（CASE 搬出 SQL）

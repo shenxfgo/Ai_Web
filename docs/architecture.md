@@ -712,12 +712,17 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 执行体是独立 worker 进程而非请求内跑完，理由与后果见 ADR-0011。**as-built(P3-016 已交付)**：202 +
 `{job_id}` 与 worker 骨架落地（`app/services/job_queue.py` 的 `enqueue`/`claim` + `scripts/run_worker.py`，
 本机另开 `dev.ps1 worker`），终局只能从 `GET /sync/jobs/{id}` 那一行读、而它还没实现（下面两行仍挂无主账），
-所以 `sync_jobs.errors[].data` 成了结构化出路到前端的唯一一跳。**as-built(P3-021 已交付)**：
+所以 `sync_jobs.errors[].data` 成了结构化出路到前端的唯一一跳。**as-built(P3-017 已交付)：这一句的"唯一一跳"
+已被换掉**——本表倒数第二行那条 SSE 的收尾 `event: done` 帧，负载就是 `GET /sync/jobs/{id}` 那一行的字段集
+（`endpoints/sync.py._outcome()` 从作业行现取，不另算），所以终局的读出点从此是**流**而不是那两条未实现的端点；
+`errors[].data` 是它的上一跳（worker 写进列，`_outcome()` 原样带出）。下面两行至今无实现点。**as-built(P3-021 已交付)**：
 `force` 这半接通——请求体收 `{"force":true}`（strict 布尔，非布尔 422），`enqueue` 落
 `sync_jobs.force`，`claim` 经 `ClaimedJob.force` 随行带回，`run_worker` 透传 `run_sync(force=)`，
 真时不传 `MAX_TABLES`（只此一档，scope 过滤与删除差分不变）。实装形状是**请求体**而
 §6 文案字面是 `?force=true`：不为此开查询参数第二条入口（两条通道并存是本项目禁止的），
-措辞统一归 025 收口；`SyncJobAccepted` 仍只回 `{job_id}` |
+措辞统一归 025 收口。**as-built(P3 收口)**：收口收的是**措辞**而不是入口形状——`?force=true` 这个字面
+只作为 `SCOPE_REMEDIES` 第三条的**被钉字面量**存在（`core/errors.py:136`，用例逐字钉它），文档提这一档时
+一律写"请求体 `{"force":true}`"，见 verification §1.7.1 与 roadmap §P3 收口账第 3 条；`SyncJobAccepted` 仍只回 `{job_id}` |
 | GET | `/sync/jobs` | user | `?datasource_id&status&cursor` | 列表 |
 | GET | `/sync/jobs/{id}` | 同 ds 权 | — | `{status,phase,progress,counters,warnings,errors,started_at,finished_at}` |
 | POST | `/sync/jobs/{id}/cancel` | 同 ds 权 | — | 置 `cancel_requested`，worker 批间检查。**as-built(P3 开工前拍板)：挂 [P8]** —— `sync_jobs` 至今没有 `cancel_requested` 列（metadata-model §2.5 那份列清单里没有），加列与批间检查点等 P8 前端的"停止同步"按钮一起做；`status='cancelled'` 因此继续没有写入点 |
