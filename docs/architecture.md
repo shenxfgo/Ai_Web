@@ -797,16 +797,33 @@ Chat 单条 assistant 消息的分区（都是可折叠 panel，默认按阶段�
 | 源 PG（问数执行） | psycopg3 `AsyncConnection` | 与抽取共用驱动，减依赖面 |
 
 > **as-built(P3 切工时证实)**：上表有两格与本机现状不符，动 PG 抽取（工单 024）前先看这段。
-> ① `:760` 那句括号"psycopg3 的 async 方言在 SA 2.0 不可用"**已过时**——本机 SQLAlchemy 2.0.54 的
+> ① "应用业务库（PG）"那格里那句括号"psycopg3 的 async 方言在 SA 2.0 不可用"**已过时**——本机 SQLAlchemy 2.0.54 的
 > `dialects/postgresql/psycopg.py` 模块文档里就写着 `create_async_engine("postgresql+psycopg://…")`
 > 的用法，并且定义了 `AsyncAdapt_psycopg`。元数据库这一格**继续用 `asyncpg` 不改**（001 起所有开通
 > SQL、迁移与用例都对着 asyncpg 验过，换驱动零收益）。
-> ② `:763` 那格"源 PG（抽取）用 psycopg 同步"至今**没落地**：`psycopg` 根本不在依赖里
+> ② "源 PG（抽取）"那格"用 psycopg 同步"至今**没落地**：`psycopg` 根本不在依赖里
 > （`uv run python -c "import psycopg"` → `ModuleNotFoundError`），而 `source_manager.py:23` 早已把
 > `kind='postgres'` 映射到 `postgresql+psycopg`——今天登记一个 PG 源、点测试连接就会在方言加载处失败
 > （实机复现：`create_async_engine('postgresql+psycopg://…')` → `ModuleNotFoundError: No module
-> named 'psycopg'`）。024 据此选路：补 `psycopg[binary]` 依赖、走异步方言，`:763` 的"同步 + to_thread"
+> named 'psycopg'`）。024 据此选路：补 `psycopg[binary]` 依赖、走异步方言，那一格的"同步 + to_thread"
 > 口径作废，届时回写本表。
+>
+> **as-built(P3-024)：上面 ② 末句的选路（"走异步方言、同步口径作废"）已被推翻，落地的是同步。**
+> 依赖那半照做了（`psycopg[binary]` 3.3.6 进了 `pyproject.toml`，`import psycopg` 不再 ModuleNotFound，
+> 于是 `source_manager` 那条 `postgresql+psycopg` 映射也第一次有了对应驱动）；方言那半回到"源 PG（抽取）"那格
+> 原文的**同步 + `asyncio.to_thread`**，因为本轮在实测上撞了两层：
+> ① `psycopg.AsyncConnection.connect()` 在 Windows 默认环流下当场抛
+> `psycopg.InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run in async mode…`
+> （本机 psycopg 3.3.6 + Python 3.12.10，`sqlstate=None`；换成 `SelectorEventLoop` 之后同一段代码
+> 走到的是连接超时，说明挡路的只是环流种类）；
+> ② API 进程正是那个不可用的环流——`uvicorn.loops.auto.auto_loop_factory()` 在本机返回
+> `asyncio.windows_events.ProactorEventLoop`（uvicorn 0.53.0，uvloop 未装）。
+> worker 侧 `scripts/run_worker.py:40` 已把策略切成 `WindowsSelectorEventLoopPolicy`，异步理论上能跑，
+> 但同步这一路在两种环流下都不踩那个坑，而且与 `mysql.py`/`pymysql` 同形（`_rows` 是唯一 I/O 出口，
+> 编排因此能在不连库的情况下被单测钉住），所以选它。元数据库那一格继续 `asyncpg`，与 ① 的结论不变。
+> **仍未证的**：`postgres.py` 的五条 SQL 没有连过 §1.5 的 `ai_web_demo_pg`（那个库还没建），
+> 本表的最终结论"PG 源抽取跑通"要等工单 024 的 live 半边；已证的边界写在 metadata-model §8.2
+> 末注 as-built(P3-024)。
 
 - **不用 SQLAlchemy 的 `inspect()` 做远端反射**：MySQL 方言没有 `get_multi_*` 批量覆写，会逐表
   `SHOW CREATE TABLE` 正则解析（2000 表 = 2000+ 次往返），且丢 `STATISTICS.CARDINALITY`、`SUB_PART`、

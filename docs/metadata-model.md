@@ -196,6 +196,10 @@ UNIQUE (datasource_id, catalog_name, schema_name, table_name)
 > ④ **PG 侧预留**（落地归 024，本片不做——PG 抽取器今天还不存在）：原料是 §8.2 B 里
 > `LEFT JOIN pg_catalog.pg_stat_user_tables` 带出的 `s.last_analyze, s.last_autoanalyze`，
 > 两个值**取较晚者，都为 NULL 则 NULL**。
+> as-built(P3-024)：这一档已经落地（`app/extractor/postgres.py::rows_to_tables` 走 `_later()`，
+> 视图恒 NULL 与注② 同口径），注③ 那套时区 attach **PG 侧不需要**——`timestamptz` 回来的就是
+> aware `datetime`（本机 PG 18.6 + psycopg 3.3.6 实测带 `ZoneInfo('Asia/Shanghai')`），
+> 没有隐式转换可防。未在 `ai_web_demo_pg` 上证过。
 
 **`aiweb.meta_column`**
 
@@ -1134,6 +1138,56 @@ WHERE con.contype='f' AND sn.nspname = ANY(%s);
 
 PG 侧 `indkey::int[]` 与 `unnest ... WITH ORDINALITY` 用来**保序**，`atttypmod` 用来归一
 `numeric(10,2)` / `varchar(n)`。
+
+> **as-built(P3-024)：本节五条 SQL 的落地版在 `app/extractor/postgres.py`，与原文有七处出入。**
+> 逐条理由写在那个模块的 docstring（它是目录），这里只留两处**照抄原文就会报错**的坑和口径摘要：
+>
+> ① `= ANY(%s)` 换成 `= :schema` + `IN (:tbl_N)`。020 的按批形状要具名绑定参数，而表名是用户填的，
+> 拼进语句文本就是注入面（与 §8.1 注② 同一口径）。
+> ② C 条的 `facts.numeric_scale`：本节 C 的 FROM 里**没有 `facts` 这个别名**——原文笔误，照抄报
+> 42P01 `undefined_table`（这是按 PG 的错误码分类给的判定，不是本轮实测项）。那条 CASE 的判定与取值范围原样搬进 `postgres_types.modifiers()`（白名单
+> `varchar`/`bpchar`/`numeric`，数组一律 NULL，因为数组的 typname 是 `_varchar` 那一形）。
+> ③ E 条除 schema 之外再按表名过滤：否则每一批都会重取整个 schema 的外键，同一关系落库两次。
+> ④ D 条的 `s.idx_scan` **不进** `RawIndex.cardinality`：它数的是"这个索引被扫过多少次"，不是
+> "这组列有多少不同值"，原文自己叫它 `cardinality_hint`。PG 侧那一格留 NULL，要补的原料是
+> `pg_stats.n_distinct`。
+> ⑤ B 条 `relkind` 收在 `('r','p','v')`，少了原文的 `'m'`/`'f'`：§2.4 的 `meta_table` 有
+> `CHECK (table_type IN ('BASE TABLE','VIEW'))`，物化视图/外部表落库必撞那道约束；这与 §8.1 B 的
+> `TABLE_TYPE IN ('BASE TABLE','VIEW')` 是同一个口径。
+> ⑥ `pg_total_relation_size`（表+索引+TOAST 合计）在 §2.4 没有落点——只有 `data_bytes`/`index_bytes`
+> 两格，把合计塞进 `data_bytes` 会让跨方言求和时把索引再数一遍，所以 `data_bytes`/`index_bytes` 都 NULL。
+> 同理 A 条拿不到 MySQL A 条那种汇总（§8.1 注③ 的 `visible_table_count`），PG 侧
+> `meta_database.table_count`/`approx_rows`/`approx_size_bytes` 落 NULL（三列都可空，写路径不炸）。
+> ⑦ B 条的 `COALESCE(s.reltuples::bigint, c.reltuples::bigint)`：**`pg_stat_user_tables` 没有
+> `reltuples` 这一列**（本机 PG 18.6 实测 42703 UndefinedColumn），左支不存在。落地版只取
+> `c.reltuples::bigint`——它是"上次 ANALYZE/VACUUM 时的行数估算"，与 MySQL 侧
+> `information_schema.TABLES.TABLE_ROWS` 的引擎估算同一档。
+> ⑧ 四条 C 的 `modifiers` 那一格在 Python（`postgres_types.modifiers()`）而 A/B/D/E 都照原文留在
+> SQL 里——这是**全节唯一一处"SQL 文本 ≠ 落地查询文本"**：② 把那条 CASE 搬出 SQL 之后，A/B/D/E
+> 的差别只有绑定参数写法与新增的表名过滤，C 却还少了整整一段投影。所以比对别拿本节原文去 diff
+> `build_sql_columns()`，会误判成漏了字段。
+>
+> 三处原料在 §2.4 没有落点、因此不硬造语义：表达式索引的那位 `column_name` 是 NULL（索引**文本**
+> 没有列可存）、部分索引的谓词 `indpred` 没有列、以及 ⑥ 的合计尺寸。
+>
+> **证到哪一步（诚实边界）**：①③④⑦ 有执行结果做凭——五条 SQL 都真发过、真回了行，但发往的是
+> **本机那台 PG 服务上的元数据库**（只读 SELECT/SHOW，不落一行、不发 DDL），**不是** §1.5 的
+> `ai_web_demo_pg`（它还没建）；②⑤⑥⑧ 是读原文与 §2.4/DDL 得出的判定（⑧ 那格另说：它改的是
+> SQL 文本本身，本轮既没在真库上证过搬走 CASE 后的 C 条、也证不到"`jsonb_agg` 回来是 Python
+> `list`"——元数据库里一个枚举类型都没有，那一段 CASE 本机全部回 NULL）。所以"这四条查询语法能跑、
+> 返回形状如此"是证过的，"演示源的 10/9/1/11 抽得出来、七个类型原料归一对"还没证——那半在
+> 工单 024 的 live 用例里，等 `demo_pg.ps1` 跑完。
+> **那次取证本身是一处已记偏离**：工单 024 的已定口径写着"元数据库 `aiweb` 与 `aiweb_test`
+> 一个都不许当源库抽取"，而"拿 §8.2 的五条 SQL 去问一台真 PG"按字面就是越了这条界。减害是
+> 只读、不建结构、不落 `meta_*` 行、且没走"登记数据源"那条路（连接参数取自应用侧连元数据库的那份
+> 设置，不是源库账号 `demo_pg_ro`）；`aiweb_test` 那一次未被触碰。这条写在 024 交付记录的
+> 「记下的偏离」里等追认，不因为只读就当作没发生。
+> **本片不猜的一格**：C 条的枚举取值段按列**自己**的 `t.typtype='e'` 判，元素类型才是枚举的
+> 数组列（`typname` 是 `_order_status` 那一形）会不会命中，本轮无从验证——§1.5 的演示库里
+> 根本没有 `CREATE TYPE`。若它不命中，`normalize` 会把未知基名原样放行，`data_type` 就成了
+> 值域之外的 `order_status[]`。这一格连同"要不要改判元素类型"一起留给 live 半边。
+> 类型归一在 PG 侧的接线（023 留的那半）也落了：`build_sql_columns` 把 `format_type(...)` 的原文
+> 交给 `postgres_types.normalize()`，`data_type` 存归一值、`raw_data_type` 存原文。
 
 ## 9. 类型归一化
 

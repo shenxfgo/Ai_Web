@@ -206,6 +206,26 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   **注意**：`MIN_PG_VERSION` / `MIN_MYSQL_VERSION` 的 probe 版本闸门**本片不接**（连同
 >   `SCHEMA_PARTIALLY_VISIBLE` + `known_complete` 门控、`manifest_digest` 短路一起转 P6/P10）——
 >   "PG 抽取器落地而不做版本判定"是明示的偏离，不是遗漏。
+>   **as-built(P3-024，代码半边已交付)**：`app/extractor/postgres.py` 落地（§8.2 五条 SQL +
+>   行→`Raw*` 映射 + 020 的批形状 + 022 的新鲜度 + 023 的归一接线），`psycopg[binary]` 进依赖，
+>   `sync_service` 的 501 判定改成按 kind 分发（**工单 024 的**验收 2 的两面由
+>   `tests/unit/test_sync_dialect_dispatch.py` 钉，"列写法跟着 kind 走"那半由
+>   `test_sync_pg.py::test_postgres_源的范围条件按_pg_的列写法下发` 钉）。
+>   与本轮选路有关的两个事实写进 architecture §9 末注（psycopg3 async 在 Windows Proactor 下
+>   `InterfaceError`，因此抽取侧是**同步 + `to_thread`**，不是"改走异步方言"）；
+>   §8.2 原文两处照抄必报错的坑（`facts` 别名不存在、`pg_stat_user_tables` 没有 `reltuples`）
+>   连同八处偏离记在 metadata-model §8.2 末注（这一份是**第八处**的目录：C 的 `modifiers` 搬到
+>   Python，因此 C 是五条里唯一"文档原文 ≠ 落地查询文本"的那条，见 §8.2 末注 ⑧）。
+>   **仍未交付的是 live 半边**：工单 024 的验收 1/3/4/5/7 要等用户以超管跑一次 `scripts/demo_pg.ps1`，
+>   五条 SQL 至今没在 `ai_web_demo_pg` 上跑过（已证边界见 §8.2 末注那句"证到哪一步"）。
+>   **验收 6（MySQL 侧回归不变）不阻塞在那上面，本轮已跑**：`test_sync_live.py` + `test_extract_mysql_live_batches.py`
+>   + `test_kb_cards_live.py` + `test_sync_card_isolation_pg.py` 四张 19 条全绿（10 对象那一条是
+>   `test_sync_live.py::test_验收1_十个对象落进_meta_table_且宽表_68_列带中文注释`）。为什么这条必须单独记：
+>   本片把 `mysql.py` 的 `slice_names`/`in_list`/`in_params` 与 `apply_index_flags` 搬进了
+>   `batching.py`/`base.py`，MySQL 那条链的回归面正是被搬动的地方，"PG 没建库"不是跳过它的理由。
+>   一句限定：卡片那半的 golden 逐字符比较（`test_sync_card_isolation_pg.py`）喂的是手工摆出来的
+>   `meta_*` 输入，它钉的是模板与逐表提交路径；"真抽取出来的文本没被搬动改坏"那半在
+>   `test_extract_mysql_live_batches.py` 的两次真跑对比里。
 > - **验收 7**：`CARDINALITY`/`SUB_PART` 早在 007 就通了（`mysql.py:121` 读、`:259`/`:265` 映射、
 >   `sync_service.py:433`/`:444` 落库），P3 只补"分批后每批都还读到"这一格。
 >   **as-built(P3-020)：这一格补上了，补法是"两次真跑比形状"**——`test_extract_mysql_live_batches.py`
