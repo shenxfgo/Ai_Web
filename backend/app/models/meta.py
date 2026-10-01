@@ -164,9 +164,13 @@ class MetaColumn(Base):
     is_unique: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     is_indexed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     # 中文枚举值直接决定 where 条件能否命中（'已完成' → status='completed'）
-    enum_values: Mapped[list[str] | None] = mapped_column(JSONB)
+    # 这两格必须 `none_as_null=True`：SQLAlchemy 的 JSON 类型默认把 Python None 序列成 JSON 字面
+    # `null`（落库后 `IS NOT NULL` 成立），而 §2.4 说的"没有值域"是 **SQL** NULL。判定范围就限在
+    # "这一格会被 SQL 的 NULL 谓词读"——`chat_messages` 那几格可空 JSONB 今天没有 SQL 级判读，
+    # 所以那边没跟着改（工单 024 交付记录里记为待议，不是漏）。
+    enum_values: Mapped[list[str] | None] = mapped_column(JSONB(none_as_null=True))
     # 低基数 distinct 值采样，默认关（§1 的 sample_distinct）
-    sample_values: Mapped[list[Any] | None] = mapped_column(JSONB)
+    sample_values: Mapped[list[Any] | None] = mapped_column(JSONB(none_as_null=True))
     char_length: Mapped[int | None] = mapped_column(Integer)
     numeric_precision: Mapped[int | None] = mapped_column(Integer)
     numeric_scale: Mapped[int | None] = mapped_column(Integer)

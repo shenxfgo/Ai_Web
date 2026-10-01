@@ -146,6 +146,7 @@ def infer_relations(
                 noun_matches = _singular(noun) == _singular(target)
                 edges.append(
                     InferredRelation(
+                        catalog_name=column.catalog_name,
                         schema_name=column.schema_name,
                         table_name=column.table_name,
                         column_name=column.column_name,

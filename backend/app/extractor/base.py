@@ -157,8 +157,13 @@ class RawForeignKey:
 
 @dataclass(slots=True, frozen=True)
 class InferredRelation:
-    """按命名约定推出来的候选关系（§4：`source_kind='inferred'`，只有打分没有真 FK）。"""
+    """按命名约定推出来的候选关系（§4：`source_kind='inferred'`，只有打分没有真 FK）。
 
+    `catalog_name` 跟着**发起侧那一列**走，而不是留空：§1 的规范化列里 MySQL 的 catalog
+    恒空串、PG 的是目标库名，落库时两边都要靠它拼出 `meta_table` 的三元组查找键。
+    """
+
+    catalog_name: str
     schema_name: str
     table_name: str
     column_name: str

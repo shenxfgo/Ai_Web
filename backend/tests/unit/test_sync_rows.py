@@ -8,7 +8,14 @@ failed，而把人工列写进行字典会让 upsert 的 INSERT 分支拿 NULL �
 
 from __future__ import annotations
 
-from app.extractor.base import RawColumn, RawForeignKey, RawIndex, RawIndexColumn, RawTable
+from app.extractor.base import (
+    InferredRelation,
+    RawColumn,
+    RawForeignKey,
+    RawIndex,
+    RawIndexColumn,
+    RawTable,
+)
 from app.services import sync_service as ss
 
 K = ("", "ai_web_demo", "order_item")
@@ -72,6 +79,20 @@ def _fk(from_table: str, col: str, to_table: str, to_schema: str | None) -> RawF
     )
 
 
+def _edge(
+    schema: str, table: str, to_table: str, *, catalog: str = "", col: str = "product_id"
+) -> InferredRelation:
+    return InferredRelation(
+        catalog_name=catalog,
+        schema_name=schema,
+        table_name=table,
+        column_name=col,
+        to_table_name=to_table,
+        to_column_name="id",
+        confidence=1.0,
+    )
+
+
 def test_表行不带任何人工列也不带生成列() -> None:
     """§3 + ADR-0005：人工列与生成列都必须缺席本批字典。
 
@@ -119,6 +140,32 @@ def test_悬空外键变成_warning_而不是悬空行() -> None:
     assert all(r["source_kind"] == "extracted" for r in rows)
     assert [w["code"] for w in skipped] == ["RELATION_OUT_OF_SCOPE"]
     assert "warehouse" in skipped[0]["detail"]
+
+
+def test_推断行的表id查找带catalog_pg侧那是真库名() -> None:
+    """§1/§2.2 的规范化列：`meta_table.catalog_name` 在 MySQL 侧是空串、在 PG 侧是目标库名。
+
+    `inferred_rows` 查 `_table_ids` 那张三元组表时不许把前者当成两方言共同的键位：写死
+    `""` 的结果是 PG 侧的推断边**全部**查不到表 id 而被跳过。跳过是不报错的，用户看到的
+    只是"跨表问答退化成单表"，而工单 024 的 live 真跑第一次撞上的正是这一格
+    （`counters.relations_inferred` 报 0，而该库里真有两张表按 §5.3 该连边）。
+    """
+    ids = {
+        ("", "ai_web_demo", "user_activity_log"): 7,
+        ("", "ai_web_demo", "product"): 8,
+        ("ai_web_demo_pg", "demo", "user_activity_log"): 17,
+        ("ai_web_demo_pg", "demo", "product"): 18,
+    }
+    rows = ss.inferred_rows(
+        1,
+        ids,
+        [
+            _edge("ai_web_demo", "user_activity_log", "product"),
+            _edge("demo", "user_activity_log", "product", catalog="ai_web_demo_pg"),
+        ],
+    )
+    assert [(r["from_table_id"], r["to_table_id"]) for r in rows] == [(7, 8), (17, 18)]
+    assert all(r["source_kind"] == "inferred" for r in rows)
 
 
 def test_索引子行的自然键回填成_index_id() -> None:

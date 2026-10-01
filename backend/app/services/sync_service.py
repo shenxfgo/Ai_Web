@@ -529,8 +529,10 @@ def inferred_rows(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for edge in edges:
-        from_id = table_id.get(_key("", edge.schema_name, edge.table_name))
-        to_id = table_id.get(_key("", edge.schema_name, edge.to_table_name))
+        # 查找键带 catalog（与 `relation_rows`/`column_rows` 同一条规则）：MySQL 侧那一格
+        # 是空串、PG 侧是目标库名（§1），写死 `""` 会让 PG 的推断边整批查不到表 id 而静默丢弃。
+        from_id = table_id.get(_key(edge.catalog_name, edge.schema_name, edge.table_name))
+        to_id = table_id.get(_key(edge.catalog_name, edge.schema_name, edge.to_table_name))
         if from_id is None or to_id is None:
             continue
         rows.append(
