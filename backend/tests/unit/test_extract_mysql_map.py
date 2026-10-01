@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+from app.extractor.base import apply_index_flags
 from app.extractor.mysql import (
-    apply_index_flags,
     comment_charset_suspect,
     rows_to_columns,
     rows_to_fks,

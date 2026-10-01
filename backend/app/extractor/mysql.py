@@ -15,7 +15,6 @@ import datetime as dt
 import os
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
 from typing import Final
 from zoneinfo import ZoneInfo
 
@@ -24,7 +23,6 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 
-from app.core.errors import SCOPE_REMEDIES, ExtractScopeTooLarge
 from app.extractor.base import (
     ConnectionSpec,
     ExtractWarning,
@@ -38,7 +36,10 @@ from app.extractor.base import (
     ScopeCounts,
     ServerInfo,
     SourceManifest,
+    apply_index_flags,
+    ensure_within_max_tables,
 )
+from app.extractor.batching import in_list, in_params, slice_names
 
 # 系统库永远不该进元数据：它们的信息是实例级的，且会把 60+ 张表灌进卡片库（§8.1 A）
 SYSTEM_SCHEMAS: Final = ("information_schema", "mysql", "performance_schema", "sys")
@@ -53,34 +54,6 @@ LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA = s.SCHEMA_NAME
 WHERE s.SCHEMA_NAME NOT IN {SYSTEM_SCHEMAS}
 GROUP BY s.SCHEMA_NAME, s.DEFAULT_CHARACTER_SET_NAME, s.DEFAULT_COLLATION_NAME
 """
-
-
-def _in_params(tables: Sequence[str], schema: str) -> dict[str, object]:
-    if not tables:
-        # `IN ()` 在 MySQL 里是语法错误；空范围必须由调用方（sync_service）提前短路，
-        # 而不是让这条 SQL 发到源库去换一个 1064。
-        raise ValueError("抽取范围里没有表：不该发这条查询")
-    params: dict[str, object] = {"schema": schema}
-    params.update({f"tbl_{i}": name for i, name in enumerate(tables)})
-    return params
-
-
-def _in_list(tables: Sequence[str], column: str) -> str:
-    return f"{column} IN ({', '.join(f':tbl_{i}' for i in range(len(tables)))})"
-
-
-def slice_names(names: Sequence[str], batch_size: int) -> list[list[str]]:
-    """把抽取范围内的表名切成"每批一次 `IN`"的那几刀（工单 020 验收 2）。
-
-    单列成函数是因为那三个边界跟"发几条 SQL"无关：整除时不许有空末批、末批只剩一张也要
-    单独成批、`batch_size > N` 退化成一批。混在 `collect` 里就得靠假连接才看得见。
-
-    空名单回**空列表**而不是 `[[]]`：`collect` 靠"没有表就不发 C/D/E"躲开 `IN ()` 这个
-    语法错误（见 `_in_params`），一个空批会把它推回那条路上。
-    """
-    if batch_size < 1:
-        raise ValueError(f"batch_size 至少是 1，收到 {batch_size}")
-    return [list(names[i : i + batch_size]) for i in range(0, len(names), batch_size)]
 
 
 def _tables_from(
@@ -158,10 +131,10 @@ SELECT c.TABLE_NAME, c.COLUMN_NAME, c.ORDINAL_POSITION, c.DATA_TYPE, c.COLUMN_TY
        c.COLLATION_NAME,
        CASE WHEN c.DATA_TYPE='enum' OR c.DATA_TYPE='set' THEN c.COLUMN_TYPE END AS enum_def
 FROM information_schema.COLUMNS c
-WHERE c.TABLE_SCHEMA = :schema AND {_in_list(tables, "c.TABLE_NAME")}
+WHERE c.TABLE_SCHEMA = :schema AND {in_list(tables, "c.TABLE_NAME")}
 ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
 """
-    return sql, _in_params(tables, schema)
+    return sql, in_params(tables, schema)
 
 
 def build_sql_indexes(schema: str, tables: Sequence[str]) -> tuple[str, dict[str, object]]:
@@ -181,10 +154,10 @@ FROM information_schema.STATISTICS s
 LEFT JOIN information_schema.STATISTICS it
        ON it.TABLE_SCHEMA=s.TABLE_SCHEMA AND it.TABLE_NAME=s.TABLE_NAME
       AND it.INDEX_NAME=s.INDEX_NAME AND it.SEQ_IN_INDEX=1
-WHERE s.TABLE_SCHEMA = :schema AND {_in_list(tables, "s.TABLE_NAME")}
+WHERE s.TABLE_SCHEMA = :schema AND {in_list(tables, "s.TABLE_NAME")}
 ORDER BY s.TABLE_NAME, s.INDEX_NAME, s.SEQ_IN_INDEX
 """
-    return sql, _in_params(tables, schema)
+    return sql, in_params(tables, schema)
 
 
 def build_sql_foreign_keys(schema: str, tables: Sequence[str]) -> tuple[str, dict[str, object]]:
@@ -197,9 +170,9 @@ FROM information_schema.KEY_COLUMN_USAGE k
 JOIN information_schema.REFERENTIAL_CONSTRAINTS r
   ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME
 WHERE k.TABLE_SCHEMA = :schema AND k.REFERENCED_TABLE_NAME IS NOT NULL
-  AND {_in_list(tables, "k.TABLE_NAME")}
+  AND {in_list(tables, "k.TABLE_NAME")}
 """
-    return sql, _in_params(tables, schema)
+    return sql, in_params(tables, schema)
 
 
 # ---------------------------------------------------------------------------
@@ -387,32 +360,6 @@ def rows_to_indexes(rows: Sequence[Row], *, schema_name: str = "") -> list[RawIn
     return out
 
 
-def apply_index_flags(columns: Sequence[RawColumn], indexes: Sequence[RawIndex]) -> list[RawColumn]:
-    """把 STATISTICS 的结论回填到列上（§7：`is_primary_key` 来自索引，不是 COLUMN_KEY）。"""
-    # (表名, 列名) → (主键, 唯一, 被索引)；一个列同时出现在 PRIMARY 和 uk_x 时取"或"
-    flags: dict[tuple[str, str], tuple[bool, bool, bool]] = {}
-    for index in indexes:
-        for key_column in index.columns:
-            if key_column.column_name is None:
-                continue
-            key = (index.table_name, key_column.column_name)
-            primary, unique, _ = flags.get(key, (False, False, False))
-            flags[key] = (primary or index.is_primary, unique or index.is_unique, True)
-
-    def flags_of(column: RawColumn) -> tuple[bool, bool, bool]:
-        return flags.get((column.table_name, column.column_name), (False, False, False))
-
-    return [
-        replace(
-            column,
-            is_primary_key=flags_of(column)[0],
-            is_unique=flags_of(column)[1],
-            is_indexed=flags_of(column)[2],
-        )
-        for column in columns
-    ]
-
-
 def rows_to_fks(rows: Sequence[Row], *, schema_name: str = "") -> list[RawForeignKey]:
     return [
         RawForeignKey(
@@ -578,15 +525,7 @@ class MySQLExtractor:
             tables.extend(found)
             if found:
                 names_by_schema[catalog.schema_name] = [t.table_name for t in found]
-        if max_tables is not None and len(tables) > max_tables:
-            raise ExtractScopeTooLarge(
-                f"抽取范围里有 {len(tables)} 张表，超过上限 {max_tables}",
-                detail={
-                    "table_count": len(tables),
-                    "max_tables": max_tables,
-                    "remedies": list(SCOPE_REMEDIES),
-                },
-            )
+        ensure_within_max_tables(len(tables), max_tables)
 
         columns: list[RawColumn] = []
         indexes: list[RawIndex] = []

@@ -37,7 +37,7 @@ from app.extractor.base import (
     ServerInfo,
     SourceManifest,
 )
-from app.extractor.mysql import slice_names
+from app.extractor.batching import slice_names
 from app.services import sync_service
 from tests.conftest import load_script
 from tests.integration.conftest import Account
@@ -218,6 +218,9 @@ class StubExtractor:
         self._id_is_pk = id_is_pk
         self._extra_column = extra_column
         self.calls: list[str] = []
+        # 编排层下发的那段范围条件（`table_sql`）原样记下：桩件自己不渲染口径，
+        # 所以"PG 源有没有拿到 PG 的列写法"这件事只有在这里看得见。
+        self.scope_sqls: list[str | None] = []
         self.closed = 0
 
     @property
@@ -265,6 +268,7 @@ class StubExtractor:
     ) -> SourceManifest:
         name = catalogs[0].schema_name
         self.calls.append(name)
+        self.scope_sqls.append(table_sql)
         if self._fail_on == name:
             raise RuntimeError(f"抽取 {name} 时源库断了")
         tables, views = self._objects(name)
@@ -726,3 +730,36 @@ async def test_泛列只出告警不丢边(
 
     # org 自己那条是自环，被减法规则收走（008 之前就钉过），所以是 9 而不是 10。
     assert body["counters"]["relations_inferred"] == 9, body["counters"]
+
+
+async def test_postgres_源的范围条件按_pg_的列写法下发(
+    client: AsyncClient,
+    login: Login,
+    stub: Callable[..., StubExtractor],
+) -> None:
+    """真 `run_sync` 的范围条件列写法跟着 `ds.kind` 走，不再是代码记忆里的那一个（验收 2）。
+
+    `tests/unit/test_sync_dialect_dispatch.py` 钉的是驱动表里"工厂 + 列写法"成不成对；这一条钉的
+    是**编排层真的去取了它**——桩件把收到的 `table_sql` 原样记下（它自己不渲染口径），红了就是
+    "PG 源带着 MySQL 的别名出发了"，而那一句要等源库报 42703/1054 才看得见。
+    这里用形状桩件而不是真 PG 抽取器：被验的是编排那一次分发，方言自己的 SQL 在单测与 live 里。
+    """
+    acct = await login(username="owner-pg-col", role="member")
+    ds_id = await _register(
+        client,
+        acct,
+        kind="postgres",
+        port=5432,
+        catalog_name="ai_web_demo_pg",
+        include_schemas=["demo"],
+        exclude_tables=["\\_%"],
+    )
+    extractor = stub(catalogs=("demo",), tables={"demo": ("orders",)})
+
+    resp = await _sync(client, acct, ds_id)
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["status"] == "success", resp.text
+    assert extractor.scope_sqls, "桩件一次都没被问到范围条件"
+    for sql in extractor.scope_sqls:
+        assert sql is not None and "c.relname" in sql, sql
+        assert "t.table_name" not in sql, sql

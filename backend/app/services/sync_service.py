@@ -14,7 +14,7 @@ import datetime as dt
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from time import monotonic
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from sqlalchemy import Table, bindparam, delete, func, insert, literal_column, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -42,6 +42,7 @@ from app.extractor.base import (
     SourceManifest,
 )
 from app.extractor.mysql import MySQLExtractor
+from app.extractor.postgres import PostgresExtractor
 from app.models.datasource import DataSource
 from app.models.meta import (
     MetaColumn,
@@ -774,15 +775,42 @@ def _error_entry(exc: BaseException, *, fallback_code: str = "sync_failed") -> d
     return entry
 
 
-def _extractor_for(ds: DataSource, spec: ConnectionSpec) -> Extractor:
-    """§9 的驱动表：抽取这一路 MySQL 用 pymysql 同步方言，PG 侧还没做。
+@dataclass(frozen=True)
+class _SourceDialect:
+    """抽取器工厂 + 它那条 B 查询里"表名"列的写法。
+
+    成对放而不是两个 dict：`scope_column` 必须是**这个**抽取器自己声明的别名（MySQL 的
+    `information_schema.tables t` 对 `t.table_name`，PG 的 `pg_catalog.pg_class c` 对
+    `c.relname`）。分成两张表的话，加一种源只改一处的概率就上来了，而"006 探测报 9 表 1 视图、
+    007 同步抽出 11 张"这类分叉正是从这种地方长出来的（verification §1.2 as-built 注）。
+    """
+
+    factory: Callable[[ConnectionSpec], Extractor]
+    scope_column: str
+
+
+_DIALECTS: Final[dict[str, _SourceDialect]] = {
+    # 键取自 §2.2 的 `kind` 列，与 `source_manager` 那套驱动映射同名。
+    "mysql": _SourceDialect(MySQLExtractor, "t.table_name"),
+    "postgres": _SourceDialect(PostgresExtractor, "c.relname"),
+}
+
+
+def _dialect_for(kind: str) -> _SourceDialect:
+    """§9 的驱动表：一个源类型在同步这一路上绑定的两样东西。
 
     没实现的一种要回 501 而不是 500——"这个源类型我们还不支持"是可自救的信息，
     而 `KeyError` 到了前端只是一个"数据访问失败"。
     """
-    if ds.kind == "mysql":
-        return MySQLExtractor(spec)
-    raise NotImplementedSource(f"kind={ds.kind} 的元数据抽取尚未实现")
+    dialect = _DIALECTS.get(kind)
+    if dialect is None:
+        raise NotImplementedSource(f"kind={kind} 的元数据抽取尚未实现")
+    return dialect
+
+
+def _extractor_for(ds: DataSource, spec: ConnectionSpec) -> Extractor:
+    """`run_sync` 取方言的唯一入口——用例把这个名字换掉就能在真 `run_sync` 上放桩件。"""
+    return _dialect_for(ds.kind).factory(spec)
 
 
 async def _table_ids(
@@ -968,7 +996,9 @@ async def run_sync(
         catalogs = await extractor.discover()
         wanted = set(ds.include_schemas or [])
         catalogs = [c for c in catalogs if not wanted or c.schema_name in wanted]
-        scope_sql, scope_params = table_scope_filter(ds, column="t.table_name")
+        # 列写法跟着方言走（工单 024）：PG 的 B 条里 `pg_class` 的别名是 `c`、列叫 `relname`，
+        # 这里继续写死 `t.table_name` 的话，PG 源会在源库报 1054/42703 而不是在这里报错。
+        scope_sql, scope_params = table_scope_filter(ds, column=_dialect_for(ds.kind).scope_column)
         # 分母先于第一帧（2026-09-30 拍板）：SSE 每一帧都要能说出"x/y"，而 `collect` 的
         # manifest 要到第一个库抽完才拿到手。这一条只发 B 那条的分组计数，昂贵的 C/D/E 一条不发。
         counts = await extractor.count_scope(

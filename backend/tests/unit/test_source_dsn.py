@@ -5,14 +5,16 @@
 - `docs/roadmap.md` 分组 2 踩坑预警：DSN 必须对 user/password 做 quote_plus，
   否则 `p@ss` 里的那个 `@` 会被当成"用户名与主机之间的分隔符"
 - `docs/metadata-model.md` §2.2 末注：MySQL 没有 catalog_name，库在 include_schemas 里
+- 工单 024 依赖层：`postgresql+psycopg` 不只是一个名字—— psycopg3 得真装在 `pyproject.toml` 里，
+  SQLAlchemy 在 create_engine 那一刻才 import 它
 """
 
 from __future__ import annotations
 
-from sqlalchemy import make_url
+from sqlalchemy import NullPool, create_engine, make_url
 
 from app.models.datasource import DataSource
-from app.services.source_manager import source_connect_args, source_url
+from app.services.source_manager import create_source_engine, source_connect_args, source_url
 
 
 def _row(**overrides: object) -> DataSource:
@@ -40,6 +42,35 @@ def test_mysql走asyncmy_pg走psycopg() -> None:
     assert make_url(_dsn(_row(kind="postgres", catalog_name="warehouse"))).drivername == (
         "postgresql+psycopg"
     )
+
+
+def test_postgres的两种方言都真的解析得动() -> None:
+    """上面那条只比字符串，包没装它照样绿——SQLAlchemy 是在 create_engine 里才 import DBAPI。
+
+    缺包时抛的是 `ModuleNotFoundError: No module named 'psycopg'`：它不是 SQLAlchemyError，
+    `datasource_service` 那套错误号映射接不住，用户看到的是裸 500。工单 024 的依赖层补的就是
+    这一格（`pyproject.toml` 当时只有 asyncpg / asyncmy / pymysql）。
+
+    两种形状都要在场：async 那条是 `source_manager` 现成的路（连通性测试、只读执行），
+    sync 那条是抽取器要走的路（镜像 `mysql.py`：pymysql 同步 + `asyncio.to_thread`，
+    psycopg3 一份包同时给这两种模式）。
+    """
+    row = _row(kind="postgres", catalog_name="warehouse")
+
+    async_engine = create_source_engine(row, "口令", timeout_ms=5_000)
+    async_dialect = async_engine.sync_engine.dialect
+    assert async_dialect.driver == "psycopg"
+    assert async_dialect.dbapi.__name__ == "psycopg", "dialect 没真 import 到 psycopg 包"
+
+    sync_engine = create_engine(source_url(row, "口令"), poolclass=NullPool)
+    assert sync_engine.dialect.driver == "psycopg"
+
+    # 建 engine 不发握手（连接是 lazy 的），而 NullPool 建不出可复用的池——所以这个用例
+    # 一次都没连过库，它钉的只有"驱动装上了、方言解析得动"这一件事。
+    assert type(async_engine.sync_engine.pool).__name__ == "NullPool"
+    assert type(sync_engine.pool).__name__ == "NullPool"
+    sync_engine.dispose()
+    async_engine.sync_engine.dispose()
 
 
 def test_库名对mysql是schema对pg才是database() -> None:

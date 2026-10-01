@@ -4,14 +4,20 @@
 `sync_service` 只负责把 `Raw*` 变成 `meta_*` 行。加第三种源库不动 service，改卡片模板不动方言。
 
 冻结（`frozen=True`）+ `slots=True`：抽取一批可能有几千条，路径上没人应该偷偷改上游对象。
+
+唯一的例外是文件末尾的 `apply_index_flags`：它只吃这些 dataclass、不碰任何源库方言，
+两个抽取器都要调它。放这里而不是留在 `mysql.py`，是为了不让 PG 那一侧出现
+"方言模块之间互相 import"这条边——`batching.py` 消掉的是同一条边。
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
+
+from app.core.errors import SCOPE_REMEDIES, ExtractScopeTooLarge
 
 # 源库返回的一行：列名 → 值。抽取层只按这个形状取数，不认识任何 ORM。
 Row = Mapping[str, object]
@@ -203,6 +209,54 @@ class ScopeCounts:
     total: int = 0
     base_table: int = 0
     view: int = 0
+
+
+def ensure_within_max_tables(table_count: int, max_tables: int | None) -> None:
+    """范围上限只在**昂贵查询之前**判一次：两方言这条门槛是同一条，报错的字面也因此同字。
+
+    020 的批形状把 B 条按库发、C/D/E 按批发，判定若挪到后面就等于先把最贵的那几条发出去、
+    再告诉调用方"范围太大"。`max_tables is None` 是"这道门槛关掉"，不是"上限为零"。
+    """
+    if max_tables is not None and table_count > max_tables:
+        raise ExtractScopeTooLarge(
+            f"抽取范围里有 {table_count} 张表，超过上限 {max_tables}",
+            detail={
+                "table_count": table_count,
+                "max_tables": max_tables,
+                "remedies": list(SCOPE_REMEDIES),
+            },
+        )
+
+
+def apply_index_flags(columns: Sequence[RawColumn], indexes: Sequence[RawIndex]) -> list[RawColumn]:
+    """把索引的结论回填到列上（§7：`is_primary_key` 来自索引，不是列上的旗标）。
+
+    两方言共用：MySQL 读 `information_schema.STATISTICS`（§8.1 D），PG 读 `pg_index`
+    （§8.2 D），归一后的 `RawIndex` 形状一样，回填规则因此也一样。表达式索引那一位的
+    `column_name` 是 None，没有列可以打标，所以跳过。
+    """
+    # (表名, 列名) → (主键, 唯一, 被索引)；一个列同时出现在主键和唯一索引时取"或"
+    flags: dict[tuple[str, str], tuple[bool, bool, bool]] = {}
+    for index in indexes:
+        for key_column in index.columns:
+            if key_column.column_name is None:
+                continue
+            key = (index.table_name, key_column.column_name)
+            primary, unique, _ = flags.get(key, (False, False, False))
+            flags[key] = (primary or index.is_primary, unique or index.is_unique, True)
+
+    def flags_of(column: RawColumn) -> tuple[bool, bool, bool]:
+        return flags.get((column.table_name, column.column_name), (False, False, False))
+
+    return [
+        replace(
+            column,
+            is_primary_key=flags_of(column)[0],
+            is_unique=flags_of(column)[1],
+            is_indexed=flags_of(column)[2],
+        )
+        for column in columns
+    ]
 
 
 @runtime_checkable

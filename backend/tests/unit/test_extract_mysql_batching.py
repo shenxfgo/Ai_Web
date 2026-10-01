@@ -21,10 +21,8 @@ import pytest
 
 from app.core.errors import ExtractScopeTooLarge
 from app.extractor.base import ConnectionSpec, SourceManifest
-from app.extractor.mysql import (
-    MySQLExtractor,
-    slice_names,
-)
+from app.extractor.batching import slice_names
+from app.extractor.mysql import MySQLExtractor
 from tests.unit.test_extract_mysql_client import _catalog, _column_row, _index_row, _table_row
 
 # 演示库排除下划线前缀后**可见的 10 个业务对象**，名单按 `docs/verification.md` §1/§1.2 的
