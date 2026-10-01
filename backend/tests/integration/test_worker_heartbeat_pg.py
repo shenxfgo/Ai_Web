@@ -290,6 +290,22 @@ async def test_边界_179秒不动_181秒判失败_pending_也算僵尸候选(
         session_factory, ids[4], heartbeat="now() - interval '181 seconds'"
     )
 
+    # 紧贴 tick 重摆 179 那一行的钟。它的余量只有 1 秒，而"再摆四行 + 建 worker 工厂"本身
+    # 就要花掉一秒量级的墙钟——不重摆，这一行会在慢机器上自己漂成僵尸（2026-10-01 一次性探针
+    # 实测：回收前该行的 `now() - heartbeat_at` 已是 180.15 秒，用例因此间歇性红）。重摆之后
+    # 余量的消耗只剩"这条 UPDATE → 回收语句里那个 now()"的一次往返。另外四行不需要重摆：
+    # kill_* 越漂越该收，fresh 漂几秒仍远在 180 之外，NULL 不参与比较。
+    schema = os.environ["AIWEB_PG__SCHEMA_NAME"]
+    async with session_factory() as session:
+        await session.execute(
+            text(
+                f'update "{schema}".sync_jobs '
+                "set heartbeat_at = now() - interval '179 seconds' where id = :j"
+            ),
+            {"j": keep_179},
+        )
+        await session.commit()
+
     hb_factory, hb_engine = _worker_factory()
     try:
         report = await RUN_WORKER.heartbeat_tick(
