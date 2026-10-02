@@ -419,7 +419,7 @@ status text NOT NULL DEFAULT 'draft'   -- as-built(P4-026，迁移 0008)：三�
 >    `EMBEDDING_PROVIDER` 常量三个都不在场，`grep` 全 `app/` 拿不到第二处：那条"按 settings 算一套、
 >    库里没有就建一套"的路径**没有留兜底**（工单 027 已定口径）。于是此刻**应用侧（`grep` 全 `app/`）
 >    没有任何代码路径**往 `kb_index_profile` 插行——插入这件事在 Product 代码里只剩 ORM 类定义，
->    出生入口归 029 的 reindex。剩下七处插入点全在测试里，那是**用例自己摆基准行**（关掉后门之后
+>    出生入口归 029 的 reindex。剩下六处构造点全在测试里，那是**用例自己摆基准行**（关掉后门之后
 >    要卡片在场就只剩这一条路），不是产品行为，别拿它们当"还有第二个写入点"的证据。
 >    上面 ②③④ 那三条讲的仍是"这一行长什么样"，只是造它的人换了。
 > 2. **读 active 的尺子全仓只有一处**：`kb_service.read_active_profile()`（`kb_service.py:376`，
