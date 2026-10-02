@@ -396,9 +396,12 @@ aiweb.kb_index_profile   -- 把"embedding 模型 + 维度 + 卡片模板版本"�
 id / name UNIQUE('text-embedding-3-small@1536@tplv1')
 provider text / model text / dimensions int
 card_template_version int / distance_fn text DEFAULT 'cosine'
-is_active bool / created_at / built_at
+created_at / built_at
                              -- as-built(P4-029)：`built_at` 有写入点了（`mark_profile_built()`，
                              -- 只由 reindex 那颗作业在 `success`/`partial` 时盖）；见本节末注第 2 条
+                             -- as-built(P4-031)：这一行原本还挂着 `is_active bool`，那一列已由
+                             -- 收缩迁移 0009 从库里删除（026 的双写口径到此收口，读写两侧的尺子
+                             -- 只剩下面那一行 `status`）；见本节末注 as-built(P4-031) 第 1 条
 status text NOT NULL DEFAULT 'draft'   -- as-built(P4-026，迁移 0008)：三态词表 draft|active|retired
   CHECK (status IN ('draft','active','retired'))
   UNIQUE WHERE status = 'active'       -- partial unique（表达式键 (status='active')），"至多一枚 active"由库背书
@@ -560,6 +563,30 @@ status text NOT NULL DEFAULT 'draft'   -- as-built(P4-026，迁移 0008)：三�
 >    031 落地后这一格要补回真口径，不是本片欠着不认。
 > 7. **不发事件、不入队**（ADR-0010）：`sync_job_event` 是作业进度的真相，一次切换不是作业进度。
 >    审计走这张表自己的 `status` + 日志，不新建表。
+>
+> **as-built(P4-031)**（2026-10-03，工单 031；上面 030 那块第 1 条的"仍然不删（删列归 031 的收缩迁移）"
+> 与第 6 条欠的那格，在这一片一起收掉）
+>
+> 1. **收缩迁移 0009 已落**：`kb_index_profile.is_active` 从**库与 ORM 两侧**一起摘掉，这张表的状态
+>    从此只有 `status` 一把尺子（026 定的扩展-收缩第三段）。`upgrade` 在真库跑过（`aiweb` 现在
+>    `0009 (head)`），`downgrade` **只在测试自建的临时 schema 里跑**——
+>    `tests/integration/test_kb_is_active_shrink_pg.py` 走 `0007 → 插两行（is_active 一真一假）→ 0008 →
+>    head → downgrade 0008 → head`，钉的是"列没了 + 回滚能把内容按 `status` 恢复回来"。
+>    真 `aiweb` 上没往回退过：那会把活数据留在身后。
+> 2. **读侧的两处尺子都换完了**（工单涉及层点名的 `_active_profile_id()` 与 `load_schema_tables()`）：
+>    两处现在都只是 `kb_service.read_active_profile()` 的投影，全仓再没有第二处自己写
+>    "哪一行在服务"的谓词。031 能一处收完靠的就是 027 起留下的那一层投影。
+> 3. **"维度→列名"那一个纯函数现在两侧共用**（029 写在侧、031 读在用）：
+>    `HybridRetriever` 的向量路把 active 档案那一行的 `dimensions` 交给 `vector_target_for()`，
+>    未预置的第三维（比如档案写 768）**当场抬 `VectorColumnMissing`**，错误信息点得出维度数与
+>    "库里只有 1536/1024 两列"这两个事实——不猜第一列、不静默回落（工单验收 6）。回落的代价不是
+>    报错而是"拿 1536 的列去比 768 的向量"，两列宽度兼容时返回一份看起来正常的错结果。
+> 4. **030 第 6 条欠的真口径在这一片补回了**：
+>    `tests/integration/test_kb_search_hybrid_pg.py::test_激活换到另一维之后向量路读的就是那一维的那一列`
+>    ——A(1536) 在服务时三张卡按 `_FIRST` 摆在 `embedding`，给同一批表在 B(1024) 下再建一批卡、
+>    把 `embedding_1024` 摆成**反过来**的次序，激活 B 后向量路的名次必须整体反过来，
+>    再激活回 A 必须恢复原次序（spec 故事 6"可回滚"在检索侧的样子）。两列摆成同一次序的话，
+>    读错列照样绿，所以次序是反着摆的。
 
 ### 2.7 问答
 

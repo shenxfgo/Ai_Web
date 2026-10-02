@@ -301,8 +301,13 @@ roadmap §P4 这一片要的是"向量能真跑、档案能原子切换"。今�
 
 ## 7. 补充说明
 
-- **迁移只有一条**：`0008_embedding_columns`（`kb_index_profile.status` CHECK + partial unique、
-  `kb_card.embedding_1024 vector(1024)` + 其 HNSW 索引）。`alembic check`（ORM ↔ 迁移漂移）
+- **迁移两条：0008 扩 + 0009 收**（工单 031 验收 8 的订正，原句"迁移只有一条"在收缩段落地后就不成立了）：
+  `0008_embedding_columns`（`kb_index_profile.status` CHECK + partial unique、
+  `kb_card.embedding_1024 vector(1024)` + 其 HNSW 索引、`sync_jobs.reindex_profile_id`）是**扩**那一条；
+  `0009_drop_profile_is_active` 是**收**那一条（摘掉 `kb_index_profile.is_active` 那根镜像列，读侧尺子从此只有
+  `status` 一把）。as-built(P4-031)：两条都在真库跑过 `upgrade`（`aiweb` 现在 `0009 (head)`），`downgrade`
+  只在测试自建的临时 schema 里跑（见 `backend/tests/integration/test_kb_is_active_shrink_pg.py`）——
+  在真 `aiweb` 上往回退会把活数据留在身后。`alembic check`（ORM ↔ 迁移漂移）
   **仍没接线**，所以这条要人工与 `app/models/kb.py` 比对一次。编号接现有最新的迁移文件（0007）之后；
   **真库 `alembic_version` 停在哪儿不算已知**——P3 spec 写过"停在 0002"，而 0007 的
   `sync_job_event` 又在 025 的真跑里被用过，这两句话有一句是过期的，开工第一件事是 `alembic current`
