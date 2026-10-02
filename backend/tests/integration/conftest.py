@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import configparser
 import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +69,99 @@ def account() -> DbAccount:
     return DbAccount(
         c["user"], c["password"], c.get("host", "127.0.0.1"), int(c.get("port", "3306"))
     )
+
+
+# ================================================== 闸内伪向量替身（工单 028 / ADR-0015）
+#
+# 需要 embedding 客户端的用例**全部**走这里：ADR-0015 拍板"只 subprocess 一层"，所以没有
+# 第二条路（transport 注入）可走。这份 helper 住在这里而不是每个用例文件各抄一遍，是因为
+# 029 的 reindex 与 031 的向量路都要起同一个替身——那时"端口怎么读、僵尸怎么杀"就是三处口径。
+
+
+@dataclass
+class FakeEmbedding:
+    """替身的一次运行：`base_url` 交给客户端，`terminate()` 交给 `finally`。
+
+    `host`/`port` 单独留着只有一个用途：验收 6 要在杀完之后再探一次端口，证明下一条用例
+    不可能连到上一条的僵尸。
+    """
+
+    proc: subprocess.Popen[str]
+    host: str
+    port: int
+
+    @property
+    def base_url(self) -> str:
+        """OpenAI 兼容的 base_url，**带版本段**：`check_env.py:204` 那条探针拼的是
+        `{base_url}/embeddings`，版本段必须由 base_url 自带。验收 4 要的就是客户端与探针
+        用同一个 base_url 拼法。
+        """
+        return f"http://{self.host}:{self.port}/v1"
+
+    @property
+    def health_url(self) -> str:
+        return f"http://{self.host}:{self.port}/health"
+
+    def terminate(self) -> None:
+        """活着就 terminate，10s 内不退再 kill；之后关掉管道，别让解释器等一个没人写的 fd。"""
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=10)
+        if self.proc.stdout is not None:
+            self.proc.stdout.close()
+
+
+def spawn_fake_embedding() -> FakeEmbedding:
+    """起一份替身并**等它把端口打出来**。
+
+    为什么读 stdout 而不是自己挑端口：`--port 0` 让 OS 分配，两份 pytest 并行时固定端口
+    一定被人占着（同 `test_sync_events_live.py` 的 `_free_port` 那条理由）；而"看到了
+    LISTENING 这一行"就是就绪信号——它在 `server_bind()` 之后才打印，比"睡一秒再试"诚实。
+
+    `-u` 不是可选项：子进程的 stdout 连着管道时 Python 默认**块缓冲**，那一行会一直躺在
+    缓冲区里，调用方就红成"读不到端口"。
+    """
+    stub = BACKEND / "scripts" / "fake_embedding_server.py"
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(stub), "--port", "0"],
+        cwd=str(BACKEND),
+        # cp936 控制台上子进程一打印中文就炸在解码里，真正的启动错误反而看不见
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        stdout=subprocess.PIPE,
+        # 并进同一根管道：不接 PIPE 的 stderr 没人读，缓冲区满时替身会卡在写日志上。
+        # 替身自己不打印请求日志（`log_message` 已静音），所以这里进来的只有 traceback。
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+    )
+    assert proc.stdout is not None
+    seen: list[str] = []
+    for line in proc.stdout:
+        seen.append(line.rstrip())
+        if line.startswith("LISTENING "):
+            _, host, port = line.split()
+            return FakeEmbedding(proc=proc, host=host, port=int(port))
+    # 管道 EOF = 进程已经死了。把看到的原文倒出来，否则红测只留下一句"没读到端口"。
+    raise RuntimeError(f"替身没起来（退出码 {proc.poll()}）：\n" + "\n".join(seen))
+
+
+@pytest.fixture
+def fake_embedding() -> Iterator[FakeEmbedding]:
+    """一条用例一份替身，结束杀干净（工单 028 验收 6）。
+
+    为什么是 function 作用域而不是 session：验收 7 要在同一个文件里**杀掉一份再去连它**，
+    共用一份就没法这么干；而起的成本只是一次解释器启动。029 的 reindex 若嫌慢，那时再来
+    谈作用域，别现在为不存在的耗时预付。
+    """
+    handle = spawn_fake_embedding()
+    try:
+        yield handle
+    finally:
+        handle.terminate()
 
 
 @pytest.fixture
