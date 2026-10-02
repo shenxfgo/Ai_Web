@@ -83,7 +83,7 @@ def test_app_defaults_are_local_dev() -> None:
     settings = Settings(_env_file=None)
     assert settings.app.host == "127.0.0.1"
     assert settings.query.allow_sql_edit == "admin"
-    assert settings.extract.sample_distinct is True
+    assert settings.extract.sample_distinct is False  # 真相源：roadmap 分组 7「扫源库数据，默认关」
 
 
 def test_card_template_version_is_int_defaulting_to_1(monkeypatch: pytest.MonkeyPatch) -> None:

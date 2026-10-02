@@ -1,9 +1,11 @@
 """kb_card / kb_index_profile 的建表 DDL 契约（schema-only 断言，不碰数据库）。
 
 口径来源：
-- `docs/metadata-model.md` §2.6（卡片表 + profile 表 + 四条索引）
-- ADR-0003 + `docs/roadmap.md` §配置语义：`embedding vector(dim)` 的 dim 取自
-  `AIWEB_EMBEDDING__DIMENSION`，迁移与 ORM 都不硬编码
+- `docs/metadata-model.md` §2.6（卡片表 + profile 表 + 五条索引）
+- ADR-0003 + `docs/roadmap.md` §配置语义：**第一列** `embedding vector(dim)` 的 dim 取自
+  `AIWEB_EMBEDDING__DIMENSION`。0008 起"不硬编码"只对这一列成立——第二列按 ADR-0012
+  把维度写进列名，宽度是字面量（那条 ADR 明码标价的一次翻案）。
+- ADR-0013 + 工单 026：profile 的三态词表与"至多一行 active"的库里背书
 - `docs/verification.md` §2.2 第 2 项：无 PG 时对编译出的 DDL 字符串做断言
 
 期望值全部来自上面这些文档原文，不是从模型代码里反过来算的。
@@ -42,6 +44,24 @@ def _index_ddls(table_name: str) -> str:
     return "\n".join(
         str(CreateIndex(ix).compile(dialect=postgresql.dialect())) for ix in table.indexes
     )
+
+
+def _index_ddl(table_name: str, index_name: str) -> str:
+    """按索引名取那条 DDL。
+
+    不能用 `_line(_index_ddls(...), "ix_kb_card_emb")`：`table.indexes` 是无序集合，而且
+    `ix_kb_card_emb` 是 `ix_kb_card_emb_1024` 的前缀，按子串取行会随会话随机拿到另一条。
+    """
+    table = Base.metadata.tables[f"{Base.metadata.schema}.{table_name}"]
+    for ix in table.indexes:
+        if ix.name == index_name:
+            return str(CreateIndex(ix).compile(dialect=postgresql.dialect()))
+    raise AssertionError(f"{table_name} 没有名为 {index_name!r} 的索引")
+
+
+def _constraint_names(table_name: str) -> list[str]:
+    table = Base.metadata.tables[f"{Base.metadata.schema}.{table_name}"]
+    return sorted(str(c.name or "") for c in table.constraints)
 
 
 def test_卡片表与_index_profile_表都在元数据_schema_里() -> None:
@@ -138,20 +158,73 @@ def test_卡片带着同步与向量化的时间戳() -> None:
     assert "TIMESTAMP WITH TIME ZONE" in updated and "NOT NULL" in updated
 
 
-def test_四条索引各自守着一条检索路() -> None:
-    """§2.6 的 SQL 块 + verification §2.2 的 DDL 字面：向量、trgm、FTS、软删后的源内过滤。
+def test_五条索引各自守着一条检索路() -> None:
+    """§2.6 的 SQL 块 + ADR-0012 的第二向量列 + verification §2.2 的 DDL 字面。
+
+    覆盖：两套维度的向量、trgm 模糊、FTS、软删后的源内过滤。
 
     HNSW 的 `WITH (m=16, ef_construction=64)` 是文档给的固定调参，不是"随便建的默认值"；
     FTS 必须走 `to_tsvector('simple', …)`——默认配置会把中文按词干规则切碎。
+    第二列的索引调参与第一列**逐字同调**：两批向量共存时，检索侧只该在"读哪一列"上分岔。
     """
-    ddl = _index_ddls("kb_card")
-    # 索引名是 §2.6 给的，schema 前缀随测试会话变，所以按名字取行再比片段
-    emb = _line(ddl, "ix_kb_card_emb")
+    emb = _index_ddl("kb_card", "ix_kb_card_emb")
     assert "USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)" in emb
-    trgm = _line(ddl, "ix_kb_card_search_trgm")
+    emb1024 = _index_ddl("kb_card", "ix_kb_card_emb_1024")
+    assert (
+        "USING hnsw (embedding_1024 vector_cosine_ops) WITH (m = 16, ef_construction = 64)"
+        in emb1024
+    )
+    trgm = _index_ddl("kb_card", "ix_kb_card_search_trgm")
     assert "USING gin (search_text gin_trgm_ops)" in trgm
-    fts = _line(ddl, "ix_kb_card_search_fts")
+    fts = _index_ddl("kb_card", "ix_kb_card_search_fts")
     assert "USING gin (to_tsvector('simple', search_text))" in fts
-    ds_kind = _line(ddl, "ix_kb_card_ds_kind")
+    ds_kind = _index_ddl("kb_card", "ix_kb_card_ds_kind")
     assert "(datasource_id, kind) WHERE deleted_at IS NULL" in ds_kind
     assert "UNIQUE" not in ds_kind
+
+
+def test_第二向量列是_embedding_1024_与第一列一样可空() -> None:
+    """ADR-0012：换维度 = 同一张表再加一列，列名带维度。
+
+    "旧向量仍在（可回滚）"是 roadmap §P4 验收 5 的原话，它的物理前提就是两列**同时在场**；
+    而两列同时在场又要求都可空——只有 1536 批向量的卡片，那一行的 1024 就是 NULL，反之亦然。
+    列宽 1024 在这里是**字面量**，这是 ADR-0012 明写的那条翻案：
+    `AIWEB_EMBEDDING__DIMENSION` 的角色从"决定列宽"降为"声明当前用哪一维"。
+    """
+    line = _line(_ddl("kb_card").upper(), "EMBEDDING_1024 VECTOR(")
+    assert "EMBEDDING_1024 VECTOR(1024)" in line, line
+    assert "NOT NULL" not in line, "两套维度共存期，另一套的卡在这一列上就是空"
+
+
+def test_index_profile_的_status_是三态_CHECK_就是那份词表() -> None:
+    """ADR-0013：`status TEXT CHECK IN ('draft','active','retired')` NOT NULL。
+
+    为什么不能靠 `is_active` + `built_at` 推导三态：「建好待切」与「已退役」在库里同形
+    （都是 `NOT is_active` 且 `built_at NOT NULL`），推不出来的那一态只能是一列。
+    字面来自 ADR-0013 与 spec 故事 1，不是从模型代码反推的。
+    """
+    ddl = _ddl("kb_index_profile")
+    status = _col(ddl, "status")
+    assert "TEXT" in status, status
+    assert "NOT NULL" in status, "可空的 status 会让「没写过」变成第四态"
+    assert "CHECK (status IN ('draft','active','retired'))" in ddl.replace("\n", " "), ddl
+    assert "ck_kb_index_profile_status_allowed" in _constraint_names("kb_index_profile"), (
+        "约束名要能被反查（与 ck_sync_job_event_stage_allowed 同纪律）"
+    )
+
+
+def test_只有一个_active_由库里那条_partial_unique_索引背书() -> None:
+    """ADR-0013：`CREATE UNIQUE INDEX … WHERE status = 'active'`。
+
+    为什么键是一列表达式而不是某个真列：这条不变式是「全表至多一行 active」，它没有自然键列。
+    PG 的 unique 索引至少要一个键，于是拿 `(status = 'active')` 这个表达式当键——命中谓词的行
+    全取同一个值 `true`，第二行 active 因此撞唯一约束。判据「只有一个 active」住在库里，
+    不在代码的 `WHERE … LIMIT 1` 里（那是 spec §1 问题 2 那条安静任选的老路）。
+    """
+    ddl = _index_ddls("kb_index_profile")
+    line = _index_ddl("kb_index_profile", "ux_kb_index_profile_active")
+    assert "UNIQUE" in line, line
+    assert "WHERE" in line and "status = 'active'" in line, line
+    # 表里不能有第二条同谓词的索引：两条索引只会让"第二行 active 撞哪一条"变成实现细节。
+    # 数的是**谓词**而不是索引名——第二条同谓词的索引换个名字照样在场，按名字数等于没数。
+    assert ddl.count("WHERE status = 'active'") == 1, ddl

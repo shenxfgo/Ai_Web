@@ -1,7 +1,9 @@
 """知识库接口：卡片读取 + 检索预览。
 
-`/kb/rebuild`、`/kb/status` 都在 architecture §7 的端点表里，但分属 P4（重建/术语卡），
-这里不放空壳——一个返回 501 的端点只会让前端以为功能存在。
+`/kb/reindex` 与 `/kb/profiles/{id}/activate` 在 architecture §7 的端点表里（本文件原写
+`/kb/rebuild`——P4 决策 ⑥ 把那个旧名废弃了，不留别名），分属工单 029/030。
+`/kb/status` 也是 §7 承诺项，但至今无工单认领（P3 收口记进无主账，P4 spec 不接手）。
+这里都不放空壳——一个返回 501 的端点只会让前端以为功能存在。
 """
 
 from __future__ import annotations

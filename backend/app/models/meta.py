@@ -323,6 +323,14 @@ class SyncJob(Base):
     force: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false"), default=False
     )
+    # 工单 029 的载体：这颗 reindex 作业是给哪套 draft 档案建卡的。理由与 force 逐字相同——
+    # 执行体在另一个进程里读不到请求（ADR-0011），所以"改哪套档案"必须在入队时落到行上。
+    # NULL = 普通同步（它只服务当前 active 档案，不换档案）。
+    # SET NULL：档案被删（必须先摘卡才能删，见 kb_card 的 RESTRICT）时作业行不该跟着消失，
+    # 它是历史事实。
+    reindex_profile_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("kb_index_profile.id", ondelete="SET NULL")
+    )
     # 僵尸回收依据：主事务未提交时靠独立连接更新它，前端进度才动得起来
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

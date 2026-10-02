@@ -1,7 +1,8 @@
-"""`sync_job_event` 的建表契约（§2.8）与 `sync_jobs.force`（§2.5 + 工单 021 的载体列）。
+"""`sync_job_event` 的建表契约（§2.8）与 `sync_jobs` 的两根载体列（§2.5）。
 
 口径来源：`docs/metadata-model.md` §2.8 的 DDL 块原文、§6 as-built(P3) 第 3 条（进度真相在
-事件表）、工单 021 的"force 并进迁移 0007，不为一个布尔单开一次迁移"。
+事件表）、工单 021 的"force 并进迁移 0007，不为一个布尔单开一次迁移"、工单 026/029 的
+"reindex 的目标档案同理由 ADR-0011 只能落在行上"。
 期望值全部是文档字面，不是从模型代码反推的。无 PG 时也要验迁移（verification §2.2 第 2 项）。
 """
 
@@ -87,3 +88,20 @@ def test_sync_jobs_多了_force_一列_默认_false() -> None:
     """
     ddl = _ddl("sync_jobs")
     assert "force BOOLEAN DEFAULT false NOT NULL" in ddl, ddl
+
+
+def test_sync_jobs_多了_reindex_的载体列_可空且删档案不抹作业() -> None:
+    """工单 029 的载体，理由与上一列逐字相同（ADR-0011）：执行体在另一个进程里读不到请求，
+    所以"这颗作业是给哪套 draft 档案建卡"必须在**入队时**落到行上。
+
+    可空是"普通同步不换档案"的库侧证据——0008 之前入队的每一行都该是 NULL（验收 5）。
+    `ON DELETE SET NULL`：档案行被删时作业行不该跟着消失，它是历史事实；而 `kb_card` 对
+    同一个 profile 是 RESTRICT，两处方向不同是有意的（卡是档案的产物，作业是发生过的事）。
+    """
+    ddl = _ddl("sync_jobs")
+    assert "reindex_profile_id BIGINT" in ddl, ddl
+    assert "reindex_profile_id BIGINT NOT NULL" not in ddl, "NULL = 普通同步，这列不能是必填"
+    fks = [fk for fk in _table("sync_jobs").foreign_keys if fk.parent.name == "reindex_profile_id"]
+    assert [fk.target_fullname for fk in fks] == ["kb_index_profile.id"], fks
+    assert [fk.ondelete for fk in fks] == ["SET NULL"], fks
+    assert "fk_sync_jobs_reindex_profile_id" in _constraints("sync_jobs"), "约束名要能被反查"

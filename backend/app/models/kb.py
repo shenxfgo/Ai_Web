@@ -35,7 +35,21 @@ from app.settings import get_settings
 
 class KbIndexProfile(Base):
     __tablename__ = "kb_index_profile"
-    __table_args__ = (UniqueConstraint("name", name="uq_kb_index_profile_name"),)
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_kb_index_profile_name"),
+        # 三态词表的库内落点（ADR-0013）。不能靠 is_active + built_at 推导：「建好待切」与
+        # 「已退役」在库里同形（都是 NOT is_active 且 built_at NOT NULL），
+        # 推不出来的那一态只能是一列。
+        CheckConstraint("status IN ('draft','active','retired')", name="status_allowed"),
+        # 「全表至多一行 active」没有自然键列，所以键是表达式本身：命中谓词的行全取同一个值 true，
+        # 第二行 active 当场撞唯一约束。见 ADR-0013。
+        Index(
+            "ux_kb_index_profile_active",
+            text("(status = 'active')"),
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
     # 形如 `text-embedding-3-small@1536@tplv1`：一眼能看出这批卡是谁生成的
@@ -46,6 +60,9 @@ class KbIndexProfile(Base):
     dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
     card_template_version: Mapped[int] = mapped_column(Integer, nullable=False)
     distance_fn: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'cosine'"))
+    # 档案的状态机（ADR-0013）。`is_active` 从此只是它的镜像、不是第二真相——但双写还没接上：
+    # 027 关 `profile_row(is_active=True)` 那条后门，031 换读侧的尺子并把 `is_active` 删掉。
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'draft'"))
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false"), default=False
     )
@@ -61,7 +78,8 @@ class KbCard(Base):
     __table_args__ = (
         CheckConstraint("kind IN ('table','table_columns','term')", name="kind_allowed"),
         UniqueConstraint("doc_uid", name="uq_kb_card_doc_uid"),
-        # 四条索引各守一条检索路（§2.6）：向量 / trgm 模糊 / simple FTS / 源内软删过滤。
+        # 五条索引各守一条检索路（§2.6 + ADR-0012）：两套维度的向量 / trgm 模糊 / simple FTS /
+        # 源内软删过滤。
         # HNSW 选它而不是 IVFFlat 的硬理由：IVFFlat 要先有数据训练、空表建不了，
         # 而同步是"先建空卡再灌"的流程。WITH 里的两个数是文档给的固定调参。
         Index(
@@ -69,6 +87,15 @@ class KbCard(Base):
             "embedding",
             postgresql_using="hnsw",
             postgresql_ops={"embedding": "vector_cosine_ops"},
+            postgresql_with={"m": 16, "ef_construction": 64},
+        ),
+        # 第二套维度的向量（ADR-0012）：调参与 ix_kb_card_emb 逐字同调，两条索引互不干扰。
+        # 1024 这个字面在本片只出现在 ORM 与迁移两处——"维度→列名"的映射归 031 那个唯一纯函数。
+        Index(
+            "ix_kb_card_emb_1024",
+            "embedding_1024",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding_1024": "vector_cosine_ops"},
             postgresql_with={"m": 16, "ef_construction": 64},
         ),
         Index(
@@ -140,6 +167,9 @@ class KbCard(Base):
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(get_settings().embedding.dimension)
     )
+    # 第二套维度（ADR-0012）：换 embedding 模型时新旧两批向量必须同时在场，激活与回滚才走得通。
+    # 读哪一列由 active profile 的 dimensions 决定，而这层映射只住在一个纯函数里（031）。
+    embedding_1024: Mapped[list[float] | None] = mapped_column(Vector(1024))
 
 
 __all__ = ["KbCard", "KbIndexProfile"]

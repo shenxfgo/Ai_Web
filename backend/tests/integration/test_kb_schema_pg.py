@@ -1,7 +1,7 @@
-"""0005 落进真库之后的事：列齐、`vector(1536)` 真的是那个类型、四条索引真的建得起来。
+"""0005/0008 落进真库之后的事：列齐、两列 `vector` 真的是那个类型、五条索引真的建得起来。
 
 期望值口径：
-- `docs/metadata-model.md` §2.6（列 + 四条索引 + profile）
+- `docs/metadata-model.md` §2.6（列 + 五条索引 + profile）与 ADR-0012 的第二向量列
 - ADR-0003 的"可插拔边界"：**建库期**依赖 `vector` 类型，**运行期**不依赖 embedding 端点，
   所以"未配 embedding 时卡片照常入库、embedding 为 NULL"必须是真库里的行为
 - `docs/verification.md` §2.2：HNSW 真能建、trgm 可用这类 10% 只能在真 PG 上验
@@ -41,6 +41,7 @@ _CARD_COLUMNS = {
     "meta",
     "index_profile_id",
     "embedding",
+    "embedding_1024",
     "embedded_at",
     "sync_job_id",
     "created_at",
@@ -55,6 +56,7 @@ _PROFILE_COLUMNS = {
     "dimensions",
     "card_template_version",
     "distance_fn",
+    "status",
     "is_active",
     "created_at",
     "built_at",
@@ -177,10 +179,12 @@ async def test_embedding_列在真库里就是_vector_带维度(session_factory)
     assert got == "vector(1536)"
 
 
-async def test_四条索引在真库里各自成形(session_factory) -> None:
-    """§2.6 的 SQL 块；这条用例是"HNSW 真的建在空表上"的唯一证据。
+async def test_五条索引在真库里各自成形(session_factory) -> None:
+    """§2.6 的 SQL 块 + 0008 的第二向量列；这条用例是"HNSW 真的建在空表上"的唯一证据。
 
     选 HNSW 而非 IVFFlat 的确定理由就是空表能建（同步是先建空卡再灌），只有真 PG 能验。
+    第二列的索引在**零张 1024 卡片**时就必须存在——否则第一次真跑换维度会卡在
+    "往没有索引的列上灌向量"，而那是最贵的一步。
     """
     async with session_factory() as session:
         rows = (
@@ -201,11 +205,33 @@ async def test_四条索引在真库里各自成形(session_factory) -> None:
     # verification §2.2 的 DDL 字面是**输入**形态；这里去空格去引号，比的是同一组数。
     emb = defs["ix_kb_card_emb"].replace(" ", "").replace("'", "").lower()
     assert "with(m=16,ef_construction=64)" in emb
+    emb1024 = defs["ix_kb_card_emb_1024"].replace(" ", "").replace("'", "").lower()
+    assert "usinghnsw(embedding_1024vector_cosine_ops)with(m=16,ef_construction=64)" in emb1024
     assert "gin_trgm_ops" in defs["ix_kb_card_search_trgm"]
     assert "to_tsvector('simple'" in defs["ix_kb_card_search_fts"]
     assert "search_text" in defs["ix_kb_card_search_fts"]
     assert "deleted_at IS NULL" in defs["ix_kb_card_ds_kind"], "WHERE 丢了就会扫到软删卡"
     assert "(datasource_id, kind)" in defs["ix_kb_card_ds_kind"]
+
+
+async def test_两套维度的列在真库里各自是那个类型(session_factory) -> None:
+    """ADR-0012：`vector` 的维度是**列类型的一部分**，所以两列并存是唯一能同时供出两套向量的形状。
+
+    第一列是 `vector(1536)` 这个事实由 0005 跑当时的 settings 决定，不是这一版改得动的；
+    第二列是字面量 1024（工单 026 明写：`1024` 这个字面在 ORM 与迁移两处出现，别处没有）。
+    """
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT attname, pg_catalog.format_type(atttypid, atttypmod) "
+                    "FROM pg_attribute WHERE attrelid = (:s || '.kb_card')::regclass "
+                    "AND attname IN ('embedding', 'embedding_1024') ORDER BY attname"
+                ),
+                {"s": _schema()},
+            )
+        ).all()
+    assert dict(rows) == {"embedding": "vector(1536)", "embedding_1024": "vector(1024)"}
 
 
 async def test_未配_embedding_时卡片照常入库且向量为_null(session_factory) -> None:

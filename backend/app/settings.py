@@ -147,7 +147,7 @@ class ExtractGroup(BaseModel):
     batch_interval_ms: int = 100
     heartbeat_interval_s: int = 10
     stale_job_reclaim_s: int = 180
-    sample_distinct: bool = True
+    sample_distinct: bool = False  # 默认关（P4 决策 ⑩）：开了等于每次同步真去源库跑 GROUP BY
     sample_distinct_max_distinct: int = 30
     min_mysql_version: str = "5.7"
     min_pg_version: str = "12"
