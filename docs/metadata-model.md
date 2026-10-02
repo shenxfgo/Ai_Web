@@ -422,6 +422,12 @@ status text NOT NULL DEFAULT 'draft'   -- as-built(P4-026，迁移 0008)：三�
 >    出生入口归 029 的 reindex。剩下六处构造点全在测试里，那是**用例自己摆基准行**（关掉后门之后
 >    要卡片在场就只剩这一条路），不是产品行为，别拿它们当"还有第二个写入点"的证据。
 >    上面 ②③④ 那三条讲的仍是"这一行长什么样"，只是造它的人换了。
+>    **as-built(P4-028) 的订正：这一条的"三个都不在场"只适用于 `kb_service` 那一侧。**
+>    `EMBEDDING_PROVIDER` 这个名字今天**在 `app/` 里 grep 得到**，但它的新住处是
+>    `app/services/embedding_client.py`（唯一读者是 `EmbeddingClient.provider`，029 写档案行时从那里取），
+>    与 027 删掉那份的分别是**方向**：旧那份是"settings 没配也照样算出一个值"，所以它跟着后门一起删；
+>    新那份回答的是"这一次真按哪种协议问了端点"，不读 settings、也不参与任何"要不要建档案"的判断
+>    （ADR-0015：全仓只有一种协议、一个实现）。029 之后别再按着"三个都不在场"去 grep 它。
 > 2. **读 active 的尺子全仓只有一处**：`kb_service.read_active_profile()`（`kb_service.py:376`，
 >    谓词 `status = 'active'` 出现在 `:392`）。它回 `ActiveProfile`（id + 三元组），回读不到是
 >    `None` 而不是抛错——"没有 active"和"问句没命中"在同步侧都是"这一轮没有基准"。

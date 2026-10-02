@@ -667,6 +667,7 @@ Success: no issues found in 54 source files
 | PG 抽取器的**两半**（as-built(P3-024)：不连库那半是 `app/extractor/postgres.py` 的五条 §8.2 SQL 与行→`Raw*` 映射，加上 `sync_service` 的方言驱动表 `_DIALECTS`；live 那半是 §1.6 那份对账清单） | SQL 文本与映射钉在**假连接**上（`_rows` 仍是方言层唯一的 I/O 出口，同上面 020 那行的理由），501 分发与"列写法跟着 kind"钉在纯函数 + 真 `run_sync` 上 | **30 条不连库单测分两张**：`tests/unit/test_extract_pg_map.py` 14 条吃 §8.2 那条查询**自己的别名**当行键（假件与真 SQL 同形才有意义），钉的是 serial 与 identity 分得开（`default_value` 是 `nextval(...)` 那一串）、`_text[]`/`numeric(10,2)[]` 走 023 的归一而 `raw_data_type` 留原文、`modifiers` 白名单只认 `varchar`/`bpchar`/`numeric` 且数组一律 `NULL`、表达式索引那一位的 `column_name` 是 `NULL`（§8.2 D 的分支）、视图 `last_analyze_at` 恒 `NULL` 而表取 `last_analyze`/`last_autoanalyze` **较晚者**（§2.4 注④ 的 PG 半边）、`idx_scan` 只进 `cardinality_hint` 不进 `cardinality`（单位不同）。`tests/unit/test_extract_pg_client.py` 16 条把编排钉在同一颗桩上：`probe` 的三值 + **只有 42704 才降级**（`OperationalError` 且 `sqlstate is None` 不许被吞——那是连不上，不是版本不支持）、`discover` 排除三个系统 schema 与 `pg\_temp%`/`pg\_toast%`、四条查询的发出顺序 `pg_class → pg_index → pg_attribute → pg_constraint`、空范围**不发 `IN ()`**、`MAX_TABLES` 仍在昂贵查询之前判且三条出路原文到达、PG 侧永不产出 `CHARSET_SUSPECT`（那一格的原料是 MySQL 的会话变量）、020 的批形状在 PG 上同形（10 对象/批 3 → 4 批、昂贵查询 12 发、`:tbl_N` 与名单逐一对应、表名不拼进文本）、以及"方言层不许发写语句"——那条用**词边界正则**而不是子串禁（`AS ON_UPDATE` 里的 `ON ` 会被子串 ban 误杀，误杀一次就没人再敢加别名）。**驱动表 10 条**在 `tests/unit/test_sync_dialect_dispatch.py`，钉工单 024 验收 2 的两面：`kind='postgres'` 不再命中 `NotImplementedSource`（只构造不连接，所以演示源没建时这条不会 skip——skip 掉的正好是要钉的那一句），而 `oracle`/`mssql`/`MySQL`/`""` 仍抛且 `code=='not_implemented'`（不许顺手放宽）；另有一条配对断言，把 `table_scope_filter(ds, column=该格的 scope_column)` 渲染出的片段拿去断它**逐字出现在该方言的 B 查询里**（构造器由测试自己按 kind 查表，不从 `_DIALECTS` 拿——从被测那张表读出的构造器去验同一张表，红了只是两格一起改错）。**接线那一条是集成用例**：`test_sync_pg.py::test_postgres_源的范围条件按_pg_的列写法下发`——`kind='postgres'` 的源跑真 `run_sync`，形状桩件把收到的 `table_sql` 原样记下（桩件自己不渲染口径）。实测变异：把编排里那一行换回硬编码 `t.table_name` 之后**只有这一条红**，上面 40 条全绿（它们都不经过 `run_sync`），红了的内容是"PG 源带着 MySQL 的别名出发了"，而那一句本来要等源库报 42703/1054 才看得见。**as-built(P3-024 live 半边)：那条 SQL 已经在真 `ai_web_demo_pg` 上跑过**——`tests/integration/test_extract_pg_live.py` 四条（验收 1/3/4/5），走真 `POST /api/datasources` → `POST /api/sync/jobs`（202）→ worker 循环体 → 回读元数据库，源库与账号都是真的，逐字对账清单与"证到哪一格"写在 §1.6/§1.6.1；仍没证到的那一组（枚举数组形状、`relkind` 的 `'p'/'m'/'f'`、④ 的"两枚时间戳同时在场时取较晚那枚"、③ 的"每批重取 FK 会不会落两次"）**逐条只列在 metadata-model §8.2 末注"证到哪一步"那一份里**，本行不复述清单以免两处各漂一次。live 另钉到一个**缺口**而不是未证项：表达式索引的文本有列可存（§2.4 `meta_index.funcdef`），但 `RawIndexColumn` 不搬它，所以当前恒空。live 抓出两个**不在 PG 抽取器里**的缺陷并已修：① `inferred_rows` 把表 id 的查找键写死成 `_key("", …)`（MySQL 的 catalog 恒空串惯例），PG 侧每条推断边都查不到而**静默丢弃**（`relations_inferred` 报 0），修法是让 `InferredRelation` 带上它本来就该带的 `catalog_name`，`tests/unit/test_sync_rows.py` 补一条纯函数用例钉住（变异验过：换回 `""` 只有这条红）；② `meta_column.enum_values` 落的不是 SQL NULL 而是 JSON `null`（SQLAlchemy 的 JSON 类型默认 `none_as_null=False`，把 Python `None` 序列成 `'null'::jsonb`，于是 `IS NOT NULL` 成立、82 列全都"有枚举值域"），修法是 `enum_values`/`sample_values` 两格显式 `JSONB(none_as_null=True)`——只改绑定值不动 DDL，而 `_COLUMN_SYNC_COLS` 是整列覆盖，重跑一次同步就自清。**验收 6（MySQL 侧回归不变）在两个修复之后随整轮闸重跑**：被搬动的 `slice_names`/`in_list`/`apply_index_flags` 那三样正对着 MySQL 链，细节记在 roadmap §P3 验收 6 的 as-built |
 | `sync_jobs.progress` 那一格（as-built(P3-025)：`app/services/sync_service.py` 的 `progress_of()`，唯一调用点在 `_set_phase` 写事件帧的同一条 `UPDATE`） | 纯函数手算 + 一条真链路 | 这是 §2.5 那列 `numeric(5,2)` 自 0004 建表（`alembic/versions/0004_meta.py:65`）以来**第一次**有写入点。三条口径各钉一次：① 只有 `{done,total}` 参与折算，`base_table`/`view`/`cards` 是三本不同的账，把它们算进百分比会得到一个"看着像进度"的数；② `total<=0` **回 None**，调用方据此**不写那一格**——discover 之前分母还没定出来，写 `0.0` 等于替 `DEFAULT 0` 宣布"我确定现在是 0%"，而真话是"还不知道"（这一支最容易写错成"回 0.0"，因为两种写法在终局那一帧上都显示 100）；③ 值的来源是**事件帧里那一份** counters，不是另算一次——同一个数有两条产生路径就是 §2.8 决策 3（序列真相在 `sync_job_event`）要堵的东西。用例 `tests/unit/test_sync_progress.py`；真效果在 §1.7.1 的两处实录里：`timeline` 段末行 `progress=100.00` 与 `killbatch` 段打断那一行的 `progress=0.00`（那一轮 `heartbeat_at` 有了、`started_at` 有了，而 discover 还没交回分母，正是 ② 那一支的真实现场） |
 | `card_build` 的**档案守卫**（as-built(P4-027)：`app/services/sync_service.py` 的 `card_build_guard()`，唯一调用点在 `run_sync` 的 card_build 段；读侧唯一入口 `kb_service.read_active_profile()`） | 判决本身是纯函数（吃 `ActiveProfile \| None`，回 `{code, detail}` 或一份档案），所以两处守卫各钉一次单测；**"这一轮到底有没有卡"的真效果只能走整条链**（真入队 + 真 worker + 换连接回库），因为要断的是库里的行数而不是返回值 | 三条各钉一件事：① **没有 active 档案时同步 `success` 且零卡片**（`test_没有_active_档案时同步成功且零卡片_档案表一行都没多`）——一次断三件：`status=='success'`、`counters.cards==0`、`SELECT count(*) FROM kb_index_profile` 前后相同。第三件才是本条存在的理由：前两件在旧形状（"读不到就按 settings 建一套"）里照样绿，而"不许留那条兜底"正是本片要关的后门；② 差哪一格就不写卡，**两个方向各一条**（`@pytest.mark.parametrize` 的 改维度 / 改模型），且**被改的那一格在配置这一侧**（`monkeypatch.setenv` + `get_settings.cache_clear()`，档案行仍是夹具钉住的那一套）——这是验收 2 的字面动作"改 `AIWEB_EMBEDDING__DIMENSION` 再跑一次同步"；漂移造在档案行上虽然走同一个比对函数，却钉不到"这台机器改了 `.env` 之后同步看不看它"，而那正是后门原来藏身的地方（worker 在本进程里跑所以 env 改动对它可见，换成真子进程这条就不成立）。detail 必须**两个值都在场**（配置的与档案的）并点出下一步 `POST /api/kb/reindex`——只说"不一致"等于让运维再跑一次 SQL 去查是哪个键歪了；③ 守卫**只长在 card_build 那一步**：`counters.tables`/`columns` 照常有值、`phase` 序列里 `card_build`/`embed`/`done` 三帧都在场，把守卫挪到整段收尾之前（或干脆判成 `failed`）都在这里红。读侧那半边同一片改：`retriever._active_profile_id` 改成从 `read_active_profile` 投影，夹具 `active_profile` 与守卫用例共用**同一个** `conftest.insert_active_profile()`（`provider` 字面与 `name` 三段拼法只住那一处，029/031 改档案行形状时是一处不是一族），且它**只写 `status`、故意不写 `is_active`**，于是"读侧还在按那把镜像列筛"表现成"召回全空"而不是一个数字差——这一条红过才改。用例落点：`tests/unit/test_kb_active_profile.py`（`triplet_drift` 五档：三格全一致 / 各差一格 / 三格全差且顺序固定）+ `tests/unit/test_sync_card_build_guard.py`（判决四档：一致 / 无 active / 差维度 / 差模型，再加"不缓存结论"那条）+ `tests/integration/test_kb_active_profile_pg.py`（读入口五条，含"只有 draft/retired 时回 None"与"读的尺子是 `status` 不是那把镜像列"）+ `test_sync_card_profile_guard_pg.py`（上面三件事，其中②的两个方向各一条 → 共 5 条用例）+ `test_kb_cards_profile_source_pg.py`（卡片挂在传入的档案上、构建不再落档案行）+ `test_kb_cards_live.py` 验收 4（一整轮真同步跑完，`status='active'` 仍只有夹具那一行）。验收 4 那半句"文本与 008 golden 逐字符相同"的靶**不在本片新文件里**，而是 019 那条既有用例 `tests/integration/test_sync_card_isolation_pg.py::test_未注入时写进库的卡片文本与008golden快照逐字符相同`——它挂上 `active_profile` 夹具后照常绿，这才是"来源换了、渲染出来的还是文档那一份"的证据。**"改的是来源不是构造"的反证**：`git diff --name-only -- backend/tests/unit` 只回一个名字——`test_kb_upsert_sql.py`，而那 `+3` 行全在 `test_profile指针与身份键不进set_` 那条的 docstring 里（补一句"来源变了、这条口径没变"，断言一个字没动）；四张 `test_kb_card_*`（golden / identity / rows / text）在 `sync_cards` 签名变化之后**零改动**，一行断言都没跟着动 |
+| 向量路的**两只脚**（as-built(P4-028)：生产侧唯一的 `app/services/embedding_client.py` + 闸内替身 `scripts/fake_embedding_server.py`，判据见 ADR-0015） | 纯半边（编请求体 / 读响应体）走单测不碰网络；凡需要客户端**真发一次 HTTP** 的一律 `live`——**没有第三条路**，因为 `EmbeddingClient.__init__` 有意不收 `httpx`/`transport` 参数（`test_构造签名里没有_transport_注入点` 用 `inspect.signature` 钉着那条接缝不存在） | 单测十一条（`tests/unit/test_embedding_client.py`）：① 请求体是 `{model, input:[…]}` 的手写字面量（**单条也发数组**，两条请求形状等于只测到其中一条）；② 归位读 `data[i].index` 而不是数组下标——用例把 `data` 故意倒序摆，按下标取就回成 `[c,a,b]`，那种错在库里两行都合法、只是卡片 A 从此挂着卡片 B 的向量，检索永远指错表且一条日志都没有；③ 维度不符是**一整档专属错误**（`EmbeddingDimensionMismatch`，029 靠它把整颗作业判 `failed`）且文案里期望维度与实收维度两个数都在场；④ 形状坏（缺 `data`、条目不是 `{index,embedding}`、`index` 缺失或非数、向量元素非数值、少回一条）全落 `EmbeddingBadResponse` 而不是 `KeyError`/`JSONDecodeError`——裸异常冒出去是一个没有 envelope 的 500，而"少回一条"若退化成"返回拿到的那几条"，调用方 zip 短对齐时后面的向量会悄悄挂到前面的卡片上；⑤ 重试词表 `{408,429,500,502,503,504}` 逐字钉且**断 400/401 不在场**（替身对未知 model 回 400，被重试就永远拿不到那条可辨识的失败）。live 十二条（`tests/integration/test_embedding_server_live.py`，夹具 `fake_embedding` 一条用例一份，`--port 0` 起、读 stdout 的 `LISTENING` 当就绪、结束杀）：确定性三条（同问句两次**逐位**相同 + 换问句不同——只断前一半的话，一个永远回同一个向量的替身照样绿；批量里的一条 == 它单发；**换一个替身进程**还是同一个点——内置 `hash()` 按进程加盐，用它的实现只在前两条绿）；两套宽度按 `model` 名分且期望值由 param 表自己声明（不从响应 `len()` 读回来比，那只能证明"它不小于自己"）；未知 model → `EmbeddingBadRequest` 且文案带出那个名字；维度不符 → 两个数都在；杀进程后 → `EmbeddingUnreachable` 且 `<10s` 秒回（不是等满 60s），同一条用例顺带在死端口上断 `embed([]) == []`（空批**一次 HTTP 都不发**，否则"没有内容要嵌"会报成"端点不通"）；另起一份杀掉后那个端口再没人听（验收 6 的另一半，红的形态是"下一条用例连上了上一条的僵尸"）；**验收 4 的两条**打的是探针不是客户端（`check_env.check_embedding` 自己的 `httpx.post` 与它自己的判据）：`ok` 一支 + 维度比对那一支，后者做过变异——把 `actual != emb.dimension` 换成恒假**只有它红**，那条 fail 分支自 0005 写下以来第一次真跑到。**闸内仍未证的那一格**：重试/退避的**真效果**没有端到端证据（替身从不回 5xx，而注入点被 ADR-0015 有意关死），闸里钉到的只有上面那张分类表——要等真端点那一轮 |
 
 配置层的已落地单测：嵌套 `__` 解析、DSN 凭据转义（`u@site` / `p@ss#w/1` → `%40`/`%23`/`%2F`）、
 `masked_dsn` 不出明文、embedding 维度 >2000 被拒、部分配置时 `configured=False`、
@@ -732,6 +733,11 @@ Success: no issues found in 54 source files
      且 SSE 发 `error{code:"llm_timeout"}`。
    - embedding mock 返回**由输入文本 hash 决定的确定性维度向量**，
      这样"相似问题向量近邻"的单测可复现，不用真调计费 API。
+     **as-built(P4-028)：这一句的"mock"形态已被 ADR-0015 换掉，只对 LLM 那半边保留。**
+     `EmbeddingClient` 的构造签名里**有意没有** `http`/`transport` 参数（有一条单测钉着它），
+     所以向量路没有"打桩"这条路——注入点一开，base_url 拼接、超时、非 200、维度不符这四件事
+     就再也没有真跑证据。替代形态是闸内一个**真 HTTP 替身**（`scripts/fake_embedding_server.py`，
+     只 subprocess 一层），起法与判据见下面 §2.3。
    - 另设 `@pytest.mark.live` 打真 API（默认 `addopts = -m "not live"`），手工跑，用于每日确认上游没改行为。
      **as-built(P3-017)**：这一句的前半**从未落地**，`addopts` 至今是 `-q --strict-markers`，
      所以 `make test` / `dev.ps1 check` 里 live 用例是**跟着闸一起跑**的，不是手工档。
@@ -745,6 +751,47 @@ Success: no issues found in 54 source files
 5. **CI 形态（无 Docker）**：`ruff check` + `ruff format --check` + `mypy app` +
    `pytest -q -m "not pg and not live"` + `npm run typecheck && npm run build`。
    pg 用例**只在有 DSN 的 job 跑**（本地 `make test-pg`）。不假装 CI 能验向量。
+
+### 2.3 闸内伪向量替身：怎么起、怎么把四格指过去（工单 028 / ADR-0015）
+
+**它解决的是"检索的向量路在没有计费端点的机器上也要能真跑"这件事**，不是"语义好"的证明。
+替身是一个真 HTTP 服务（标准库 `ThreadingHTTPServer`，无额外依赖），走 OpenAI 兼容的
+`POST /v1/embeddings`；向量内容是**字 n-gram 的 blake2b 哈希**（1/2 元、L2 归一），
+所以"同输入逐位同输出"成立、而"近邻=语义相近"**不**成立——凡是要证语义的验收，这一格
+仍然只能等真端点（见 roadmap §P4 的 as-built 留白）。
+
+```powershell
+# 起（前台，Ctrl+C 收；端口换一个没人在听的）
+uv run python scripts/fake_embedding_server.py --port 8111
+# 指（backend/.env 的四格，键名不变、不新增键）
+#   AIWEB_EMBEDDING__BASE_URL=http://127.0.0.1:8111/v1
+#   AIWEB_EMBEDDING__API_KEY=***
+#   AIWEB_EMBEDDING__MODEL=text-embedding-3-small
+#   AIWEB_EMBEDDING__DIMENSION=1536
+uv run python scripts/check_env.py   # 应报 embedding.dimension ok，1536 维
+```
+
+三个要点：
+
+- **`/v1` 是 base_url 自己带的**。探针与生产客户端都拼 `{base_url}/embeddings`，
+  少一段就变成"探针连得上、客户端连不上"那种最难分的错；替身对 `POST /embeddings`
+  直接 404，就是为了让这种配错在闸里表现成一次可定位的失败而不是静默换路。
+- **`MODEL` 与 `DIMENSION` 必须成对**：替身只认两套——`text-embedding-3-small`=1536、
+  `bge-large-zh-v1.5`=1024（第二套是 026 的 `embedding_1024` 那列的靶）。名字不认识回 400
+  （不"顺手给个默认宽度"），宽度与配置不符则由 `check_env.py` 那条比对分支报
+  "端点返回 N 维，配置是 M 维"——**这一条从今天起有真跑证据**：
+  `tests/integration/test_embedding_server_live.py::test_探针那条维度比对分支能真的动一次`
+  把它逼红过一次（把比对判据换成恒假，只有这条红）。
+- **闸里不需要手工起**。`tests/integration/conftest.py::fake_embedding` 夹具自己
+  `--port 0` 起一份、读它 stdout 打印的 `LISTENING <host> <port>` 当就绪信号、
+  用例结束杀干净（function 作用域，因为有一条用例专门要"杀掉再连"）。
+  需要真客户端的验收全部挂 `live`；纯函数半边（请求体形状、按 `data[i].index` 归位、
+  维度不符那一档）在 `tests/unit/test_embedding_client.py`，不占端口。
+
+**证据边界（如实）**：客户端的重试/退避那一支在闸内**没有端到端证据**——替身从不回 5xx，
+而 ADR-0015 关掉了注入这条路，闸里没有"让端点先坏两次"的手段。它钉到的只有分类表本身
+（`RETRYABLE_STATUS` 那六个字面 + 400/401 不在场，见 `test_重试词表里没有_不被重试的那几档`），
+真效果要等真端点那一轮。
 
 ## 3. 端到端手测清单（15 步，全绿即 v0 可用）
 

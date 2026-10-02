@@ -32,7 +32,10 @@ roadmap §P4 这一片要的是"向量能真跑、档案能原子切换"。今�
    > **as-built(P4-027)：这一条已经关掉了。** 那两个函数（`profile_row` / `ensure_profile`）连同
    > 它们共用的 `EMBEDDING_PROVIDER` 常量一起删除，不是改成只读——所以本节那两处行号坐标
    > 从今天起**指向不存在的代码**，别按它们定位。现行形状与两条新告警的 code 记在
-   > metadata-model §2.6 末注 as-built(P4-027)。仍未落地的是后半句"出生入口归 reindex"：此刻
+   > metadata-model §2.6 末注 as-built(P4-027)。**as-built(P4-028) 补一句**：`EMBEDDING_PROVIDER`
+   > 这个名字后来在 `app/services/embedding_client.py` 里以**相反的方向**重生——它不再按 settings
+   > 算出一个值，只回答"这一次真按哪种协议问了端点"，唯一读者是 `EmbeddingClient.provider`；
+   > 所以"grep 全 `app/` 拿不到它"从今天起不成立，别再按那句去定位。仍未落地的是后半句"出生入口归 reindex"：此刻
    > **应用侧**（`grep` 全 `app/`）没有任何代码路径往 `kb_index_profile` 插行——插入这件事只剩 ORM
    > 类定义，剩下六处 `KbIndexProfile(...)` 构造点全在测试里（用例自己摆那一行基准）。那一格要等故事 11~13（工单 029）。
 4. **换维度无处可去。** pgvector 的 HNSW 只吃定维列，PG 又不允许 `ALTER TYPE` 改 `vector` 维度，
