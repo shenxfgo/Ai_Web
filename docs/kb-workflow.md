@@ -167,7 +167,7 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 >   （`app/extractor/mysql.py` 的 §8.1 A 查询），`rows_to_tables()` 并没有把它落进 `RawTable`，
 >   所以 MySQL 侧该列至今为 NULL。**as-built(P3 切工时修正)**：原记"（`RawTable` 也没有对应字段）"
 >   是失实之语——字段在 `RawTable.last_analyze_at`（`app/extractor/base.py:87`），下游也通
->   （`sync_service.py:97`/`:375` 的 upsert、`kb_service.py:422` 的渲染分支），**缺的只有方言层
+>   （`sync_service.py:103`/`:381` 的 upsert、`kb_service.py:474` 的渲染分支），**缺的只有方言层
 >   那一次映射**，所以这一支的账比原来记的更轻。PG 侧要读
 >   `pg_stat_user_tables.last_analyze`，007 也没做。**这是 007 的账，不是卡片层的**——
 >   008 只在 golden 里手喂 `last_update` 钉住"有值时怎么渲染"。下一张碰抽取器的工单要么补映射、

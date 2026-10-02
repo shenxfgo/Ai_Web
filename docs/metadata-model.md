@@ -275,6 +275,13 @@ counters jsonb DEFAULT '{}'   -- 交付的键（sync_service._Tally）：
                                --   发了几批"（跨库相加），不是"落了多少行"。它只进这一本行级总账，
                                --   不进 §2.8 那五键的进度账：进度条按对象数画百分比，批数对它没有意义）
 warnings jsonb DEFAULT '[]'   -- [{code:'permission_hidden', detail:'库 x 下 12 张表不可见'}]
+                               --   已落地的 code 四个（as-built(P4-027) 盘过一遍 `warnings.append`）：
+                               --   `CHARSET_SUSPECT`（`extractor/mysql.py:563`，注释问号占比超阈值）、
+                               --   `RELATION_OUT_OF_SCOPE`（`sync_service.py:506`，FK 有一端不在本轮范围）、
+                               --   `NO_ACTIVE_PROFILE`（库里没有 status='active' 的档案）与
+                               --   `PROFILE_TRIPLET_MISMATCH`（settings 三元组与它对不上）——
+                               --   后两个由工单 027 新增，只**不写卡**、不改终局状态，见 §2.6 末注。
+                               --   `permission_hidden` 与 `SCHEMA_PARTIALLY_VISIBLE` 仍是 §6 的预告，未落地
 errors   jsonb DEFAULT '[]'   -- [{code, detail}]，分类过的 AppError 再多带一个 data
                                -- （as-built(P3-016)：原记的 `{phase, table, message}` 从未落地过，
                                --   007 起就是 `{code, detail}`，本片补上的是 `data`。进程分离之后
@@ -399,11 +406,39 @@ status text NOT NULL DEFAULT 'draft'   -- as-built(P4-026，迁移 0008)：三�
 > 为空串，而 `name` 是 UNIQUE 键，不能是 `@1536@tplv1` 这种以分隔符开头的残串）。
 > ③ `card_template_version` 是 **int**（§2.6 的列类型），`tplv1` 那个带前缀的形态只出现在 `name` 里。
 > ④ `provider` 恒写 **`openai_compatible`**（architecture §5 只认 OpenAI 兼容端点，没有第二家可填），
-> `distance_fn` 由 `profile_row()` **省略**、落 §2.6 列上的 `DEFAULT 'cosine'`——不在代码里重述默认值，
-> 将来真出现非 cosine 的 profile 时改列默认就行。
+> `distance_fn` 由造行的那一侧**省略**、落 §2.6 列上的 `DEFAULT 'cosine'`——不在代码里重述默认值，
+> 将来真出现非 cosine 的 profile 时改列默认就行。（省略者随 027 换过人：原来是 `profile_row()`，
+> 029 的 reindex 接手之后是它，见下面的 as-built(P4-027)。）
 > 每次同步行权的位置在 `sync_service` 的 `card_build` 阶段：`index_profile_id` **不进** upsert 的
 > `set_`，因为 `doc_uid` 里已经拌了它——让它可改等于允许一轮同步把卡从旧 profile 搬到新 profile，
 > 而 ①那条"两套各一批行、可回滚"就没了。
+>
+> **as-built(P4-027)**（2026-10-02，工单 027；ADR-0013 的后半落地，上面 ① 那条订正从此是既成事实）
+>
+> 1. **后门删了，不是改了。** `kb_service.profile_row()`、`kb_service.ensure_profile()` 和它们共用的
+>    `EMBEDDING_PROVIDER` 常量三个都不在场，`grep` 全 `app/` 拿不到第二处：那条"按 settings 算一套、
+>    库里没有就建一套"的路径**没有留兜底**（工单 027 已定口径）。于是此刻**应用侧（`grep` 全 `app/`）
+>    没有任何代码路径**往 `kb_index_profile` 插行——插入这件事在 Product 代码里只剩 ORM 类定义，
+>    出生入口归 029 的 reindex。剩下七处插入点全在测试里，那是**用例自己摆基准行**（关掉后门之后
+>    要卡片在场就只剩这一条路），不是产品行为，别拿它们当"还有第二个写入点"的证据。
+>    上面 ②③④ 那三条讲的仍是"这一行长什么样"，只是造它的人换了。
+> 2. **读 active 的尺子全仓只有一处**：`kb_service.read_active_profile()`（`kb_service.py:376`，
+>    谓词 `status = 'active'` 出现在 `:392`）。它回 `ActiveProfile`（id + 三元组），回读不到是
+>    `None` 而不是抛错——"没有 active"和"问句没命中"在同步侧都是"这一轮没有基准"。
+>    `retriever._active_profile_id()`（`retriever.py:315`）与 `load_schema_tables()` 都从它投影，
+>    不再各写一遍谓词：031 删 `is_active` 那把镜像列时只有一处要改。
+> 3. **两处守卫住在 `sync_service.card_build_guard()`（`:982`），判决与执行分开**：`run_sync`
+>    （`:1148` 那一次调用）只执行判决。① 库里没 active → `code='NO_ACTIVE_PROFILE'`；
+>    ② `settings` 三元组（`embedding.model` / `embedding.dimension` / `extract.card_template_version`）
+>    与 active 那一行对不上 → `code='PROFILE_TRIPLET_MISMATCH'`，detail 逐格带出**两个值**
+>    （配置的与档案的）和下一步 `POST /api/kb/reindex`。两条都是 `{code, detail}` 形状，
+>    与 §2.5 那列 `warnings` 同步落库、同时进 `card_build` 那一帧的事件负载（负载多一个
+>    `skipped: true`，与 017 的 embed 跳过帧同形）。
+> 4. **不写卡 ≠ 作业失败**：两种守卫下终局仍可以是 `success`，`counters.cards` 停在 0，
+>    `meta_*` 那五张表照常落、陈旧判定照常清、`embed`/`done` 两帧照常发（决策 8 / spec 故事 9）。
+>    三元组**每次现比、不缓存**，对齐 safety §4.1 那条 `readonly_enforced` 的纪律。
+> 5. `is_active` 这一列本片**不删也不写**：026 已定收缩归 031，本片只保证写侧不再生产它，
+>    所以它此刻连"镜像"都算不上——库里那一行的真值只由迁移 0008 的归置结果背书。
 
 ### 2.7 问答
 
@@ -781,7 +816,9 @@ DELETE FROM aiweb.meta_relation
 >    由"这里根本没有卡片提交"来满足，而不是由顺序满足。
 > 2. `ensure_profile` 后面跟着一次**单独的 commit**：它若还留在第一张表的事务里，那张表失败时的
 >    rollback 会把它一起带走，此后每张表的成功提交都在 `kb_card.index_profile_id` 的外键上当场拒收。
->    这是逐表提交换来的、旧形状里不存在的一步。
+>    这是逐表提交换来的、旧形状里不存在的一步。**订正(P4-027)：这一步随 `ensure_profile` 一起没了**——
+>    同步链路上不再有任何档案插入，那次"为档案单独 commit"的必要性自然消失，`card_build` 段现在
+>    只有一次 `read_active_profile` 的读。这一条留作"逐表提交曾要求过什么"的记录，不是现行形状。
 > 3. `sync_cards` 的返回值从 `int` 变成 `CardBuildOutcome(cards, failures)`：`cards` 仍只数**已提交**
 >    的条数（上面第 5 条的"只改事务边界、不改计数"），`failures` 带 `table_full_name`。调用方把它
 >    逐条转成 `errors` 的既有形状 `{code:'card_build_failed', detail:'<表全名>: <原句>'}` 并把终局判
@@ -846,7 +883,7 @@ DELETE FROM aiweb.meta_relation
 >
 > **as-built(P3-020 施工后)**（2026-10-01，工单 020；上面拍板第 11 条落地，真跑见工单 020 交付记录）
 >
-> 1. **两个键从这一片起才有读取点**：`run_sync` 在 `sync_service.py:989-990` 读
+> 1. **两个键从这一片起才有读取点**：`run_sync` 在 `sync_service.py:1106-1107` 读
 >    `extract.batch_size` / `extract.batch_interval_ms`，作为**必填**关键字参数交给 `collect()`。
 >    P2 那本"配置键只剩定义点"的账到此闭掉最后两条。必填而不给默认值是刻意的：给了默认就在方言层
 >    多出第二个 200，而改这个数的人改的是 `Settings`。
@@ -903,14 +940,14 @@ DELETE FROM aiweb.meta_relation
 >
 >    | 键 | 定义点 | 读取点（全仓唯一） | 用例 | 真跑 |
 >    |---|---|---|---|---|
->    | `extract.batch_size` | `settings.py:146` | `sync_service.py:1044` → `collect(batch_size=)` | `unit/test_extract_mysql_batching.py`（11 条）+ `unit/test_extract_pg_client.py` | verification §1.7.1 的压批那一轮：`[3,3,3,1]`、`counters.batches=4` |
->    | `extract.batch_interval_ms` | `:147` | `sync_service.py:1045` | 同上（耗时下限那条）+ `integration/test_extract_mysql_live_batches.py` | 真跑在**两处**、都不是 §1.7.1 那一轮的读数：一是那条 live 用例（间隔 250ms、4 批之间三个间隙各 `>=0.25s`，同轮对照间隔 0 的 `1125ms` vs 间隔 250 的 `1985ms`）；二是 §1.7.1 的 `killbatch`——worker1 被压到 5000ms 正是为了"来得及在批之间被 `kill()`"，worker2 再回到 200ms |
+>    | `extract.batch_size` | `settings.py:146` | `sync_service.py:1106` → `collect(batch_size=)` | `unit/test_extract_mysql_batching.py`（11 条）+ `unit/test_extract_pg_client.py` | verification §1.7.1 的压批那一轮：`[3,3,3,1]`、`counters.batches=4` |
+>    | `extract.batch_interval_ms` | `:147` | `sync_service.py:1107` | 同上（耗时下限那条）+ `integration/test_extract_mysql_live_batches.py` | 真跑在**两处**、都不是 §1.7.1 那一轮的读数：一是那条 live 用例（间隔 250ms、4 批之间三个间隙各 `>=0.25s`，同轮对照间隔 0 的 `1125ms` vs 间隔 250 的 `1985ms`）；二是 §1.7.1 的 `killbatch`——worker1 被压到 5000ms 正是为了"来得及在批之间被 `kill()`"，worker2 再回到 200ms |
 >    | `extract.heartbeat_interval_s` | `:148` | `run_worker.py:177`（经 `cadence()`） | `unit/test_worker_reclaim.py`（⑤ 三键各喂哪个参数）+ `integration/test_worker_heartbeat_pg.py` | §1.7.1 的杀 worker 那一轮： worker 重启后按周期刷钟并判出僵尸 |
 >    | `extract.stale_job_reclaim_s` | `:149` | `run_worker.py:178` | 同上（阈值不是整数当场抛 + 边界 179/181） | §1.7.1：`[worker] 回收 1 个僵尸 job：[21]` |
 >    | `result.retention_days` | `:191` | `run_worker.py:179` | `integration/test_worker_heartbeat_pg.py::test_保留期删过期事件行_未过期不删_结果csv逐字节不动` | **没有**：30 天窗口在演示库上造不出历史行，这一格只有用例背书 |
 >
->    `max_tables`（`:145`，读于 `sync_service.py:1041` 与 `check_env.py:350`）和
->    `card_template_version`（`:156`，读于 `kb_service.py:328`）本来就有读取点，不进这份账。
+>    `max_tables`（`:145`，读于 `sync_service.py:1103` 与 `check_env.py:350`）和
+>    `card_template_version`（`:156`，读于 `kb_service.py:175`）本来就有读取点，不进这份账。
 > 2. **仍无主的四个**（键在 `settings.py:150-153`，都不是 P3 该闭的格）：`min_mysql_version` 全仓
 >    **零读取点**（连 `check_env.py` 都没用它，`.env.example` 里那行 `AIWEB_EXTRACT__MIN_MYSQL_VERSION`
 >    只是把默认值抄给部署的人看）；`min_pg_version` 唯一的

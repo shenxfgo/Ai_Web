@@ -185,7 +185,7 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   **不是** `SHOW FULL TABLES` 数出来的 11。断线重连按 `?cursor=` 与 `Last-Event-ID` 两条路各钉一次，
 >   两边都从 seq=3 起、一条不丢也不重。验收 5 那条"映射唯一"的实测口径是**翻译点唯一**而不是
 >   "字面唯一"（`upsert`/`extract` 这类词在 SQL 语句名里避不开）：全仓 `stage_of` 只有一个调用点
->   （`sync_service.py:653`，写事件的那一处），五个粗档字面作为**词表**只出现在三处——迁移 0007
+>   （`sync_service.py:681`，写事件那一条语句里的 `stage_of` 调用），五个粗档字面作为**词表**只出现在三处——迁移 0007
 >   的 stage CHECK、它的 ORM 镜像 `models/meta.py:357`、`core/sync_vocabulary.py` 的 `_PHASE_TO_STAGE`。
 >   另有三处同字面但**不同义**，都不算第二处翻译：`sync_jobs.phase` 那 9 值 CHECK 本来就含
 >   `card_build`/`embed`/`done`（细值）、`run_sync` 里传给 `_set_phase` 的也是细值、`core/sse.py` 的
@@ -268,7 +268,7 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   `meta_*` 输入，它钉的是模板与逐表提交路径；"真抽取出来的文本没被搬动改坏"那半在
 >   `test_extract_mysql_live_batches.py` 的两次真跑对比里。
 > - **验收 7**：`CARDINALITY`/`SUB_PART` 早在 007 就通了（`mysql.py:121` 读、`:259`/`:265` 映射、
->   `sync_service.py:433`/`:444` 落库），P3 只补"分批后每批都还读到"这一格。
+>   `sync_service.py:442`/`:453` 落库），P3 只补"分批后每批都还读到"这一格。
 >   **as-built(P3-020)：这一格补上了，补法是"两次真跑比形状"**——`test_extract_mysql_live_batches.py`
 >   的第二条用例先按默认 200（一批装完）跑一次、再按 3 切四批跑一次，比对索引那条链的
 >   `(表名, 索引名, SEQ_IN_INDEX, 列名, SUB_PART, cardinality 是否非空)` 有序清单逐位相同，
@@ -359,7 +359,7 @@ live 用例答得出，两件事实不互替。同一份探针另有一格
 | 1 202 + `pending` + 响应先回 | `test_sync_enqueue_pg.py::test_发起同步立刻回_202_而那一轮还没开始跑` | `409` 段第 2、3 行 |
 | 2 409 判据是索引 | 同上 `::test_排队中的_pending_行也挡住新作业`（改索引 WHERE 即红） | `409` 段那两行 `→ 409`（此刻**零 worker**） |
 | 3 claim 唯一 + 领最老 | `::test_同一个作业不会被两个_worker_领走`、`::test_claim_领走最老的_pending_并把这一轮的钟点上`、`::test_claim_出来的顺序就是入队的顺序` | **没有**：本机同一时刻只常驻一个 worker，两个 worker 各拿一件只在用例里发生过（`明确不做`那条"不开多个 worker"是本机运行形态，不是队列语义） |
-| 4 worker 不吃 token，终局写在 `finally` | `::test_worker_跑完之后终局那三样都对`；`sync_service.py:1158-1166` 那条 `finally` | `force` 段：job 19 抛 `ExtractScopeTooLarge`，worker 打"异常（终局已由 run_sync 写好）"而库里那一行仍是 `failed` + `errors` 在场。worker 进程从头到尾没有登录步骤（实录里只有 API 侧登录，worker 子进程的环境变量只有 DB 连接串与 `MAX_TABLES`） |
+| 4 worker 不吃 token，终局写在 `finally` | `::test_worker_跑完之后终局那三样都对`；`sync_service.py:1234-1242` 那条 `finally` | `force` 段：job 19 抛 `ExtractScopeTooLarge`，worker 打"异常（终局已由 run_sync 写好）"而库里那一行仍是 `failed` + `errors` 在场。worker 进程从头到尾没有登录步骤（实录里只有 API 侧登录，worker 子进程的环境变量只有 DB 连接串与 `MAX_TABLES`） |
 | 5 `force` 覆盖上限 + 三处文案一起动 | `test_extract_mysql_client.py` 的 `SCOPE_REMEDIES` 字面 + 021 的端点透传用例 | `force` 段整段（`failed` 与 `success` 各一次，`errors[0].data.remedies` 三条原文可见） |
 | 6 每次状态变化一行事件、`seq` 单调、`NOTIFY` 只带 `job_id` | `test_sync_events_pg.py::test_一次同步把每一步落成事件行_stage_序列单调不倒退`、`test_sync_events_sse_pg.py::test_NOTIFY_叫醒不必等心跳就把那一帧送出来` | `timeline` 段的 `id: 1..5` 与读库那行 `事件=[…]` |
 | 7 SSE 帧序与 `total=10` | `test_事件流把每一行推成一帧_五键齐在场_收尾是_done`、`test_事件_counters_带全五键_分母来自带_scope_的那次计数` | `timeline` 段首帧 `total=10, base_table=9, view=1` |
