@@ -186,7 +186,7 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   两边都从 seq=3 起、一条不丢也不重。验收 5 那条"映射唯一"的实测口径是**翻译点唯一**而不是
 >   "字面唯一"（`upsert`/`extract` 这类词在 SQL 语句名里避不开）：全仓 `stage_of` 只有一个调用点
 >   （`sync_service.py:653`，写事件的那一处），五个粗档字面作为**词表**只出现在三处——迁移 0007
->   的 stage CHECK、它的 ORM 镜像 `models/meta.py:345`、`core/sync_vocabulary.py` 的 `_PHASE_TO_STAGE`。
+>   的 stage CHECK、它的 ORM 镜像 `models/meta.py:357`、`core/sync_vocabulary.py` 的 `_PHASE_TO_STAGE`。
 >   另有三处同字面但**不同义**，都不算第二处翻译：`sync_jobs.phase` 那 9 值 CHECK 本来就含
 >   `card_build`/`embed`/`done`（细值）、`run_sync` 里传给 `_set_phase` 的也是细值、`core/sse.py` 的
 >   `EVENT_DONE = "done"` 是 **SSE 帧名**（与 §6.1 问数流的最后一帧同名，终局档的判定走
@@ -293,6 +293,14 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   结果 csv 不碰。**本片明确不做**：`POST /sync/jobs/{id}/cancel`（连 `cancel_requested` 列一起挂 [P8]，
 >   `cancelled` 继续无写入点）、枚举 NDV 采样（整块推 P4，只新增 `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键，
 >   `sample_distinct*` 两键挂 [P4]，`meta_column.sample_values` 继续无写入点）。
+>   > **改判(P4 决策 ⑩，2026-10-02)：这条"推 P4"的账由 P4 接手，工单 033 —— 不是继续挂着。**
+>   > 三键一起动：`AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 出生即有读取点（P3 收口时判"不补"的那个键，
+>   > 现在和它的读取点同片出生，仍然不违背"一个没有读取点的键比没有这个键更坏"那条判据）、
+>   > `sample_distinct` / `sample_distinct_max_distinct` 第一次被功能路径读到、
+>   > `meta_column.enum_values`（非 ENUM 列）与 `sample_values` 补上写入点。
+>   > **同时 `sample_distinct` 的默认值按本节分组 7 那句"扫源库数据，默认关"落回 `false`**
+>   > （`settings.py` 与 `.env.example` 两处今天一起改，见 §配置语义那行 —— 它一直是 `false`，
+>   > 是代码那侧错了，这次是代码向文档对齐）。认下的后果写在 metadata-model §6 那条改判里。
 > - **测试地基**：P2 的三张 sync 用例（`test_sync_live.py` / `test_sync_pg.py` / `test_sync_cache_pg.py`）
 >   现在都在请求内等 `run_sync` 返回，必须改成"POST 拿 job_id → await worker 的循环体 → 照旧断言"；
 >   用例**不真起子进程**，SSE 与进程边界另有真进费用例钉。
@@ -357,7 +365,7 @@ live 用例答得出，两件事实不互替。同一份探针另有一格
 | 7 SSE 帧序与 `total=10` | `test_事件流把每一行推成一帧_五键齐在场_收尾是_done`、`test_事件_counters_带全五键_分母来自带_scope_的那次计数` | `timeline` 段首帧 `total=10, base_table=9, view=1` |
 | 8 游标续读一条不丢 | `test_重连按游标续读_一条不丢也不重复` | **没有**：实录是一次连到底，没演过断开重连 |
 | 9 每 15s 一帧 `: ping` | `test_没有新事件时每窗吐一帧_ping`（把 `ping_after_s` 设成 0.02 逼出来）+ 常量 `PING_INTERVAL_S == 15.0` 单钉一次 | **没有**：实录里作业 0.03s 就结束了，永远等不到 ping 窗口 |
-| 10 细/粗词表只有一个映射函数 | `test_sync_stage_vocabulary.py`（9 值穷举、逐条写死）。"grep 不到第二处"本轮真 grep 过：`stage_of` 全仓只有定义 `sync_vocabulary.py:36` 与**一个**调用点 `sync_service.py:675`，其余出现是 DDL 的 `CHECK` 字面（`models/meta.py:349`）和写细值的 `phase` 实参 | `timeline` 段每帧的 `stage`/`phase` 成对（`extract`/`discover`、`upsert`/`tables`…） |
+| 10 细/粗词表只有一个映射函数 | `test_sync_stage_vocabulary.py`（9 值穷举、逐条写死）。"grep 不到第二处"本轮真 grep 过：`stage_of` 全仓只有定义 `sync_vocabulary.py:36` 与**一个**调用点 `sync_service.py:675`，其余出现是 DDL 的 `CHECK` 字面（`models/meta.py:357`）和写细值的 `phase` 实参 | `timeline` 段每帧的 `stage`/`phase` 成对（`extract`/`discover`、`upsert`/`tables`…） |
 | 11 `embed` 档 `skipped=true` 而作业仍 `success` | `test_embed_档未配置时以_skipped_出现_作业终局仍是_success` | `timeline` 段 `id: 4` 那一帧与紧随的 `event: done` `status: "success"` |
 | 12 心跳在独立连接、主事务未提交即可见 | `test_worker_heartbeat_pg.py::test_主事务未提交时心跳换个连接就已可见` | `killbatch` 段打断那一行的 `heartbeat=…13:11:03.688542+00:00`（另一条连接读到的） |
 | 13 每轮扫僵尸：`failed` + `errors` 追加 `reclaimed` | `test_worker_reclaim.py`（谓词与条目字面对上文档）+ `::test_一轮循环把心跳超时的_running_改判_failed_并补上终局事件`、`::test_边界_179秒不动_181秒判失败_pending_也算僵尸候选` | `killbatch` 段的回收日志与 `errors=[{'code':'reclaimed',…}]` + `回收补的事件：[(1,'done','done')]` |

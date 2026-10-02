@@ -103,7 +103,10 @@ backend/
 │   └── prompts/              # nl2sql_system.j2 / nl2sql_user.j2 / rewrite.j2 / summarize.j2 / card_template.j2
 ├── alembic/versions/         # 0001_baseline（扩展）→ 0002_users → 0003_datasource → …
 ├── scripts/                  # init_demo_mysql.sql / init_demo_pg.sql / seed_admin.py / check_env.py / demo_ask.py
-│                             # / run_worker.py（as-built(P3-016)：作业执行体）；reembed.py 归 P4，尚未落地
+│                             # / run_worker.py（as-built(P3-016)：作业执行体）；
+│                             # 订正(P4 决策 ①)：归 P4 的是 fake_embedding_server.py（闸内替身，
+│                             # 真 HTTP + OpenAI 兼容 /v1/embeddings + 确定性哈希向量），
+│                             # 不是 reembed.py —— 后者改判归 P9，本片不建空壳
 └── tests/                    # conftest.py + guard/ + unit/ + integration/ + fixtures/
 ```
 
@@ -440,8 +443,12 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > 两个连带后果，都写在明处：
 > 1. **P2 的 `score_kw` 只是展示字段，不参与排序**。关键词路的分数是"每个词取 ILIKE/trgm 的最大值
 >    再求和"，它反映"这张卡的文本和问句有多像"，而表次序现在完全由两个计数决定。
->    同一 (词数, 列数) 下 trgm 分高者不再靠前——这是 P2 的已知取舍，P4 的 RRF（(3)）会把分数
->    重新变成次序本身。
+>    同一 (词数, 列数) 下 trgm 分高者不再靠前——这是 P2 的已知取舍。
+>    **订正(ADR-0014)：P4 的 RRF 不会把分数变回次序本身。**这句原文预测错了：融合吃的是
+>    两路各自的**名次**（`Σ 1/(k + rank_i)`，k 取 `AIWEB_RETRIEVAL__RRF_K`），分数从头到尾不参与；
+>    关键词路送进融合的名次，仍由上面那三个计数键（命中的不同词数、命中列数、`table_uid`）决定。
+>    所以 `score_kw` 的"只展示"不是
+>    P2 的临时状态，而是**架构里的常驻口径**——它是给人看的那一列，不是次序的来源。
 > 2. **词数按"不同的词"去重，而 P2 的切词是 2-gram 近似**（见 kb-workflow.md §9），
 >    同族滑窗词（`订单`/`单金`/`金额`）会一起把计数抬上去。同一族词几乎总是成组出现，
 >    所以表与表的相对次序仍稳；接进真分词器（pinyin/中文 tokenizer）后这个口径自动变准。
@@ -467,23 +474,33 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 ```
 query
  ├─(0) 改写与术语对齐（LLM，可选）→ query_vec_text, query_kw_terms[]
- ├─(1) 向量路：SELECT id,table_id,kind, 1-(embedding <=> $1::vector(1536)) AS score
+ ├─(1) 向量路：SELECT id,table_id,kind, 1-(<向量列> <=> $1::vector) AS score
  │       FROM aiweb.kb_card
  │       WHERE deleted_at IS NULL AND index_profile_id = $active
- │       ORDER BY embedding <=> $1::vector LIMIT 80
- │       （SET LOCAL hnsw.ef_search = 100; iterative_scan='relaxed_orders'）
+ │         AND datasource_id = ANY($可见源)          ← 权限进这一句，见下面那条订正(决策 ⑨)
+ │       ORDER BY <向量列> <=> $1::vector LIMIT $top_vector（缺省取配置，默认 80）
+ │       （SET LOCAL hnsw.ef_search = $ef_search —— 请求体没给就取
+ │        AIWEB_RETRIEVAL__HNSW_EF_SEARCH，缺省 64；iterative_scan='relaxed_orders'）
+ │       拍板(P4 决策 ③/ADR-0012)：<向量列> 不是写死的 `embedding`——换维度是同表加第二列，
+ │       "维度→列名"的映射只住 031 的那一个纯函数里。
  ├─(2) 关键词路：terms = query_kw_terms + 从问题里正则抽出的英文标识符/驼峰拆词
  │       a) 精确/前缀：search_text ILIKE '%'+term+'%'      → score 1.0  （标识符权重最高）
  │       b) 模糊：similarity(search_text, term)            → gin_trgm_ops
  │       c) simple FTS：to_tsvector('simple',search_text) @@ plainto_tsquery('simple',term)
  │       三路 max() 融合，LIMIT 80
- ├─(3) RRF 融合： score = Σ 1/(60 + rank_i)   （k=60，纯函数单测）
+ ├─(3) RRF 融合： score = Σ 1/(rrf_k + rank_i)   （rrf_k 只取 .env 的 AIWEB_RETRIEVAL__RRF_K，默认 60；纯函数单测）
+ │       吃的是**两路各自的名次**，不吃分数：向量路名次 = (1) 那条 SQL 的 ORDER BY 距离次序；
+ │       关键词路名次 = 009 的三个计数键（命中的不同词数 ↓、命中列数 ↓、table_uid ↑），
+ │       不是 score_kw 的降序（理由见 §5.1 as-built(P2-0009) 注 1 的订正）。
  ├─(4) 去重/聚合到表：group by table_id → best_card_score + Σ 该表被命中卡片的 boost(0.05×(n-1))
  │       同 table_id 的 table_columns 卡不单独占位（避免碎片挤占）
- ├─(5) 权限过滤：JOIN data_sources × (allow_global OR grant OR owner)，只保留有权表
+ ├─(5) 权限过滤：**主滤刀已经在 (1)(2) 的 SQL 里**，这一层是应用层二次保险（摘掉它结果必须不变，
+ │       用例见 spec 故事 32）；可见源 = datasource_service.list_visible，两路同一把尺。
  ├─(6) 图扩展：对 top-K 表补 JOIN 桥表，桥表以"关系卡"身份进 prompt，不占 K 名额
  ├─(7) 裁切：按表分数降序装填 K 张表 + token 预算；超预算优先保留主卡前 25 列 + PK/FK 列
- └─(8) 落 chat_messages.retrieved（每卡带 score_vec / score_kw / fused，UI 展示可解释性）
+ └─(8) 落 chat_messages.retrieved（每卡带 score_vec / score_kw / fused，UI 展示可解释性；
+        拍板(P4 决策 ⑧/故事 31)：score_vec / fused 两格从"P2/P3 恒 null"改为写**名次**，
+        字段名不改；mode='keyword' 时 score_vec 回到 null——"没命中"与"没算"仍要分得开）
 ```
 
 相关约束（都已在计划期核实，属硬事实）：
@@ -491,8 +508,14 @@ query
 - **PG 内置 FTS 没有中文分词器**（`to_tsvector('english','订单金额')` 只出 1 个 lexeme），
   所以主关键词路是 pg_trgm + 精确标识符命中，FTS 仅用 `simple` 配置作辅助。
   `AIWEB_RETRIEVAL__TRGM_THRESHOLD=0.08`——中文短串在 trgm 上分数极低，别指望它做语义。
-- **带 `WHERE datasource_id=?` 的向量检索会退化**（HNSW 过滤已知短板）→
-  先取全局 top-80 再按权限过滤，并在向量 SQL 里就 `JOIN grant` 过滤（应用层过滤只作二次保险）。
+- **带 `WHERE datasource_id=?` 的向量检索会退化**（HNSW 过滤已知短板）。
+  > **订正(P4 决策 ⑨，2026-10-02)：原文给的处置（"先取全局 top-80 再按权限过滤"）与它自己的后半句
+  > 矛盾，已被废弃——过滤条件进**向量 SQL**（`datasource_id = ANY(:可见源)`，与关键词路同一把尺，
+  > 见 §5.2 (1)(5) 与 ADR-0008）。** 理由是那句"先取全局再筛"根本不成立：召回窗口只有 80 张卡，
+  > 无权源的卡完全可能把这 80 个名额占满，此时"先召回再筛"返回空集，而库里其实有权可查的表。
+  > 退化的代价（过滤让 HNSW 走更多页）由**调大 `top_vector`** 承接，不是靠把过滤挪到后面规避；
+  > 应用层那一次筛保留作**二次保险**（故事 32 要求有一条用例证明摘掉它结果不变）。
+  > 粒度仍是**到数据源、不到表**——`datasource_grants` 归 P6，本片不建。
 - 换 embedding 模型 / 改卡片模板 = 新建 `kb_index_profile` → 全量重建 → 原子切 active；
   检索永远只命中 active 的卡片，否则新旧向量混在一个索引里，结果不可解释且无法回滚。
 
@@ -506,6 +529,8 @@ as-built(P2-0009)，P2 只跑 (2)(4)(5) 这三步，其余步骤的位置留着�
 - **(5) 权限过滤在 SQL 里就做完**（`datasource_id = ANY(有权源)`），不是"先全召回再筛"——
   召回窗口只有 80 张卡，先筛才有意义。预览端点在这一层之外多一道门：问句**点名**了某个源而
   当前用户无权时直接 403，而不是静默少一张表（静默过滤留着给 012 的自动链路，理由不同）。
+  > 本条就是上面那条订正(决策 ⑨)的证人：P2 的实现早于主流程那句"先取全局 top-80 再筛"，
+  > 订正只是把既成事实升格成架构口径，没有改代码。
 
 ### 5.3 JOIN 路径推导
 
@@ -738,8 +763,9 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | GET | `/metadata/relations/inferred` | read 权 | `?datasource_id&min_confidence` | 待确认清单（UI 一键 accept→转 manual） |
 | POST | `/metadata/purge-stale` | admin | `{datasource_id, dry_run:true}` | 预览/执行 |
 | GET | `/kb/status` | read 权 | `?datasource_id` | `{active_profile, card_count, embedded_count, pending_count, last_build_at, dim}` |
-| POST | `/kb/rebuild` | admin | `{datasource_id?, profile_id?}` | 202 job（复用 sync_jobs 的 card_build 阶段） |
-| POST | `/kb/search` | read 权 | `{query,datasource_ids[],k=5,top_vector=80,ef_search=100,trgm_threshold=0.25,mode:'hybrid'\|'vector'\|'keyword'}` | `{items:[{card_id,table_uid,kind,title,score_vec,score_kw,fused,text_preview}],took_ms,used_profile}` **← 目标形态**。**as-built(0009)**：P2 这颗只实现关键词路，请求侧只认 `{query,datasource_ids[],k}`（`query` 1..200 字、`k` 1..50；`top_vector/ef_search/trgm_threshold/mode` 传了直接 **422**（`extra="forbid"`——P2 不认这些旋钮，静默忽略等于假装它能调，前端只会得到"我传了 vector 怎么结果没变"这种查不出来的错），`trgm_threshold` 一律取配置值）；响应 `items` 是**表粒度**不是卡粒度（§5.2 (4)），每项 = `{table_uid,title,score_kw,matched_term_count,matched_column_count,hits:[{column_name,field,term}],cards:[{card_id,kind,seq,score,text_preview}]}` + 顶层 `took_ms`。`score_vec/fused/used_profile` **P2 不给**——向量路没接，给了就是编的；`text_preview` 是卡片正文前 200 字（预览端点给人眼判断用，010 拼 prompt 用的是 `cards` 里带回的完整段）。边界口径：点名的源无 read 权 → **403**（不是静默少一张表，理由见 §5.2 (5) 那条注）；不点名 → 在该用户看得见的所有源里找；零命中 → `items:[]`；`query` 空或超长 → 422；带未知字段（含那四个向量旋钮）→ 422；未登录 → 401。 |
+| POST | `/kb/reindex` | admin | `{datasource_id}` | 202 job。**订正(P4 决策 ⑥，2026-10-02)：本行原写 `POST /kb/rebuild`，旧名废弃、不留别名。** 理由不是措辞偏好：`rebuild` 读起来像"把现有那套档案重灌一遍"，而这正是 ADR-0013 要排除的误解——档案的**唯一出生入口**就是这条端点（它产出一行 `draft`，激活另走下面那行）。一个数据源一颗作业，复用 `sync_jobs` + JobQueue + worker + `sync_job_event` + SSE 那一整套，phase 九值词表不加值；那颗 draft 档案的 id 落在载体列 `sync_jobs.reindex_profile_id` 上（ADR-0011：执行体在另一个进程里，读不到请求）。 |
+| POST | `/kb/profiles/{id}/activate` | admin | — | 200 档案行。**订正(P4 决策 ②/⑤)**：三态流转 `draft → active`，旧的 active 在同一条 `UPDATE … CASE` 里转 `retired`，"恰好一个 active"由库里那条 partial unique 背书而不是代码分支。校验**只有一项**——该档案的卡片行数与源内表数齐（回填时的单表失败已经落进那颗作业的 `errors[]`/`partial`，不在这里重判）。回滚 = 把某一枚 `retired` 重新 activate。 |
+| POST | `/kb/search` | read 权 | `{query,datasource_ids[],k=5,trgm_threshold,mode:'hybrid'\|'vector'\|'keyword',top_vector,ef_search}`（**订正(P4 决策 ⑧/故事 27)：那两个向量旋钮的默认值字面从 schema 里拿掉**——原这行写着 `top_vector=80`/`ef_search=100`，其中 100 与 roadmap 验收 3 的 64 直接打架。改口为"缺省即取配置"：`ef_search` 取 `AIWEB_RETRIEVAL__HNSW_EF_SEARCH`（64）、`top_vector` 取向量路自己那个召回窗口常量（与关键词路的 `_RECALL_LIMIT=80` **不共用**，否则调一个窗口会同时动两路，诊断分不清是谁的功劳）、`trgm_threshold` 本来就只取配置；`rrf_k` 只进 `.env`，**不进请求体**；"请求给了用请求的、没给用配置的"这层裁决只住一个地方。`k=5`（1..50）是已交付的实际默认值，不动） | `{items:[{table_uid,title,vector_rank,keyword_rank,rrf_score,score_kw,matched_term_count,matched_column_count,hits:[…],cards:[…]}],took_ms,used_profile,aggregated_tables,hops_used}` **← 目标形态（P4 决策 ⑧ 订正：仍是表粒度，一行都不改成卡粒度）**。原这行的"目标形态"写的是卡粒度 `{card_id,…,score_vec,score_kw,fused}`，与 §5.2 (4)"聚合到表"和 009 已交付的实际响应互相矛盾，作废；表粒度上补的是**三列名次**（`vector_rank`/`keyword_rank`/`rrf_score`，来自 §5.2 (3) 的 RRF——它吃名次不吃分数，见 ADR-0014）而不是换粒度，顶层补 `used_profile`（哪套档案在服务）、`aggregated_tables`（009 已交付的聚合原料）、`hops_used`（014 已交付的图原料，本片只填不重做）。**as-built(0009)**：P2 这颗只实现关键词路，请求侧只认 `{query,datasource_ids[],k}`（`query` 1..200 字、`k` 1..50；`top_vector/ef_search/trgm_threshold/mode` 传了直接 **422**（`extra="forbid"`——P2 不认这些旋钮，静默忽略等于假装它能调，前端只会得到"我传了 vector 怎么结果没变"这种查不出来的错），`trgm_threshold` 一律取配置值）；响应 `items` 是**表粒度**不是卡粒度（§5.2 (4)），每项 = `{table_uid,title,score_kw,matched_term_count,matched_column_count,hits:[{column_name,field,term}],cards:[{card_id,kind,seq,score,text_preview}]}` + 顶层 `took_ms`。`score_vec/fused/used_profile` **P2 不给**——向量路没接，给了就是编的；P4 起 `used_profile` 与三列名次开始有值，`text_preview` 是卡片正文前 200 字（预览端点给人眼判断用，010 拼 prompt 用的是 `cards` 里带回的完整段）。边界口径：点名的源无 read 权 → **403**（不是静默少一张表，理由见 §5.2 (5) 那条注）；不点名 → 在该用户看得见的所有源里找；零命中 → `items:[]`；`query` 空或超长 → 422；带未知字段 → 422；未登录 → 401。 |
 | GET | `/kb/cards?table_uid=` | read 权 | `?table_uid` | **as-built(0008)**：一张表的全部卡片段（主卡 `seq=0` 在前，宽表再带 `table_columns` 切片），每项 = 卡片全文 + embedding 元信息（`index_profile:{id,name,model,dimensions,card_template_version}` 与 `embedded_at`，后者 NULL = 还没向量化）。本行原写的 `/kb/cards/{id}`（按单张卡 id 取）**未实现、也不打算实现**：一张表切几段只有服务端按 §6 的策略算得出，要前端先知道段数才能取全素材是倒置的依赖。边界口径：表存在而零张卡 → `[]`（"同步跑过、卡片还没建"是真实中间态，不是"表不存在"）；`table_uid` 找不到 → 404；无 read 权 → 403。 |
 | CRUD | `/kb/terms` | sync 权 | `{name,definition,table_uid?,column?}` | `kind='term'` 卡片 |
 | GET | `/chat/sessions` | user | — | 自己的会话 |

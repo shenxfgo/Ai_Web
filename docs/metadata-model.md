@@ -334,6 +334,16 @@ embedding vector(dim)      -- dim = settings.embedding.dimension，迁移里不�
                              -- 可插拔增强；未启用向量端点时全 NULL 不影响链路
                              -- as-built(0005)：dim 必须 >0——`vector(0)` 非法，所以"未启用向量"
                              -- 由 embedding.configured（base_url/key/model 齐不齐）判定，不由 dim=0 判定
+                             -- **订正(P4-026/ADR-0012)：本行"迁移里不硬编码 dim"只对这一列成立。**
+                             -- 第二套维度不走 dim 那条路：它是**同表第二列**，列宽是迁移里的字面量
+embedding_1024 vector(1024) NULL
+                             -- as-built(P4-026，迁移 0008)：ADR-0012 的落点。换维度 = 加列，不换表、
+                             -- 不改老列；`embedding` 与它的 HNSW 索引在 0008 里**一个字未动**，
+                             -- 于是 1536 与 1024 两批向量物理共存、激活哪套由 profile 决定、可回滚。
+                             -- 列宽 1024 是**写死的**（`pgvector` 的列宽是类型的一部分，
+                             -- `ALTER TYPE` 改不了它——这正是 ADR-0012 选"加列"而不是"改列"的理由），
+                             -- 所以 `AIWEB_EMBEDDING__DIMENSION` 的语义从"决定列宽"降级成
+                             -- "**声明这次要读哪一套维度**"；"维度 → 列名"的映射只住一个纯函数（归 031）
 embedded_at timestamptz NULL
 sync_job_id / created_at / updated_at / deleted_at
 ```
@@ -343,6 +353,10 @@ sync_job_id / created_at / updated_at / deleted_at
 -- HNSW 可以建在空表上（这正是选它而非 IVFFlat 的理由），空表建好省掉 P4 再改迁移）
 CREATE INDEX ix_kb_card_emb ON aiweb.kb_card
   USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+-- as-built(P4-026，迁移 0008)：第二套向量列各守一条自己的 HNSW，调参与上一条逐字相同
+-- （同一把尺调两个列的索引形状，将来对比召回诊断才分得清是列的问题还是参数的问题）
+CREATE INDEX ix_kb_card_emb_1024 ON aiweb.kb_card
+  USING hnsw (embedding_1024 vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 -- 关键词索引
 CREATE INDEX ix_kb_card_search_trgm ON aiweb.kb_card USING gin (search_text gin_trgm_ops);
 CREATE INDEX ix_kb_card_search_fts  ON aiweb.kb_card
@@ -359,6 +373,9 @@ id / name UNIQUE('text-embedding-3-small@1536@tplv1')
 provider text / model text / dimensions int
 card_template_version int / distance_fn text DEFAULT 'cosine'
 is_active bool / created_at / built_at
+status text NOT NULL DEFAULT 'draft'   -- as-built(P4-026，迁移 0008)：三态词表 draft|active|retired
+  CHECK (status IN ('draft','active','retired'))
+  UNIQUE WHERE status = 'active'       -- partial unique（表达式键 (status='active')），"至多一枚 active"由库背书
 ```
 
 > 用途：换模型/改模板时**新建 profile → 全量重建 → 原子切 active**（同事务里把旧 active 置 retired），
@@ -370,6 +387,14 @@ is_active bool / created_at / built_at
 > ① **P2 只落一条行，且直接 `is_active=true`**：`ensure_profile()` 按 `name` 幂等复用，
 > 没有 draft/retired 状态机（那是上面那句"原子切换"，属 P4）。所以 `kb.status` 语义在 P2 就是
 > "当前配置那套 = 唯一那套"，检索侧还谈不上选 profile。
+> > **订正(P4-026/ADR-0013)：状态机今天入库了，"直接 `is_active=true`"这条后门正在关。**
+> > 三态 + 库里那条 partial unique 由迁移 0008 落地，P2/P3 期间那**唯一一行**现存档案按
+> > `CASE WHEN is_active THEN 'active' ELSE 'retired' END` 归置（不是 `draft`——历史行的
+> > `built_at` 要么已有值、要么根本没灌完，两种都不该被当成"等着激活"）。
+> > 从 P4 起档案的**唯一出生入口**是 `POST /api/kb/reindex`（产 draft），`is_active` 降级成
+> > `status` 的镜像列，并在最后一个读点切完的那张工单（031）用收缩迁移删掉。
+> > 本条原文描述的仍是 P2/P3 的既成事实，不许拿它当"现在还能这么造行"的依据：
+> > 027 关掉 `profile_row(is_active=True)` 那条路径之后，同步只认 active、且不会自己造档案。
 > ② `name` 的三段里 model 缺省时用占位字面 **`no-embedding`**（未配端点时 `settings.embedding.model`
 > 为空串，而 `name` 是 UNIQUE 键，不能是 `@1536@tplv1` 这种以分隔符开头的残串）。
 > ③ `card_template_version` 是 **int**（§2.6 的列类型），`tplv1` 那个带前缀的形态只出现在 `name` 里。
@@ -418,6 +443,11 @@ aiweb.chat_feedback : id / message_id FK UNIQUE / user_id / verdict CHECK('up','
 > `false`（省一次 LLM 往返），关掉时"原文"与"对齐后"是同一句，写两份是冗余而不是信息。
 > ② `retrieved` 里的 `score_vec`/`fused` 恒 `null`，只有 `score_kw` 有值——L1 是唯一的检索档，
 > 向量与 RRF 融合是 P4。这正是要留着这一列的理由：**可解释性要能区分"没命中"和"没算"**。
+> > **订正(P4 决策 ⑧/故事 31)：从 P4 起这两格开始写值，但写的值是名次不是分数，字段名不改。**
+> > `score_vec` = 该卡/表在向量路里的那一名次，`fused` = RRF 融合后的名次（§5.2 (3) 吃名次不吃分数，
+> > 见 ADR-0014）；`mode='keyword'`（向量路整体下线的降级路径）时 `score_vec` 回到 `NULL`——
+> > 本条原文那句"区分没命中与没算"继续成立，它现在是 P4 的**分岔依据**而不只是留列的理由。
+> > 字段名保持 `score_*`/`fused` 不改：改名会牵动本节 §2.7 的列定义与还没写的 P8 前端契约。
 > ③ `prompt_tokens`/`completion_tokens` P2 恒 `0`（列建 NOT NULL）。不是忘了，是原料不存在：
 > `llm_client.complete()` 只返回 `choices[0].message.content`，响应体里的 `usage` 被丢掉了。
 > 真 usage 归 P8（流式那侧本来就要从末帧取）， heuristic 估算**不许**写进这一列——它是审计列，
@@ -683,6 +713,14 @@ DELETE FROM aiweb.meta_relation
 > 10. **枚举 NDV 采样整块推 P4**：新增 `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键（此前**不存在**，
 >    而 kb-workflow §8 把它当已有键在讲），`sample_distinct` / `sample_distinct_max_distinct`
 >    两键挂 [P4]，`meta_column.sample_values` 继续无写入点。
+>    > **改判(P4 决策 ⑩，2026-10-02)：这一整块由 P4 接手，工单 033。**三条一起动：
+>    > `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键**出生即有读取点**；`sample_distinct` /
+>    > `sample_distinct_max_distinct` 第一次被功能路径读到；`meta_column.enum_values`（非 ENUM 列）
+>    > 与 `sample_values` 补上写入点。**同时 `sample_distinct` 的默认值从 `true` 改成 `false`**
+>    > （`settings.py` 与 `.env.example` 两处一起，对齐 roadmap 分组 7 那句"扫源库数据，默认关"——
+>    > 键没有读取点时"默认 true"只是文档噪音，有了读取点它就变成每次同步都真去源库跑 `GROUP BY`，
+>    > 而抽取层至今没有 `SET statement_timeout` 那一格保护，见 P3 无主账 ①）。
+>    > 认下的后果照写：默认配置下 §8 三步不跑，非 ENUM 的中文枚举列仍进不了卡片。
 > 11. **读侧真分批**：`collect()` 按 `BATCH_SIZE` 切片循环发那几条 `IN (...)` SQL，批间
 >    `sleep(BATCH_INTERVAL_MS)`。演示库只有 11 个对象，所以用例把 `BATCH_SIZE` 降到 3，
 >    在真库上跑出 4 批——这两个键不再是空转，而"分批"这件事也因此真的被验过。
@@ -879,6 +917,11 @@ DELETE FROM aiweb.meta_relation
 >    读取点是 `check_env.py:110` 的**部署前自检**，不是抽取侧的版本闸门——上面**拍板第 4 条**末句
 >    （"上表第 1 行那条 `UNSUPPORTED_VERSION`…**本片仍不接**"）到收口仍然成立；`sample_distinct` 的唯一读取点是
 >    `unit/test_settings.py:86`（断的是默认值本身，不是功能路径）；`sample_distinct_max_distinct` 零读取点。
+>    > **改判(P4 决策 ⑩)：这两个采样键不再是"无主"，读取点在 P4 的工单 033 落地，默认值同片翻成 `false`。**
+>    > 本条原文写的是 P3 收口那一刻的事实，那句"唯一读取点是断默认值的那条用例"当时成立；
+>    > 默认值已经跟着 033 之前的一次文档订正改成 `false`（`settings.py` 与 `.env.example` 两处一起，
+>    > 那条用例的期望值同步翻了），而**功能路径上的读取点要到 033 才出现**——在它出现之前，
+>    > 本节仍不许被读成"采样已经在跑"。`min_mysql_version` / `min_pg_version` 两条不动，仍写 P6/P10。
 >    归属照旧：两个版本闸门写 **P6/P10**（roadmap §P6 的源库兼容矩阵、§P10 的部署闸门），
 >    两个采样键写 **P4**（NDV 采样整块）。
 > 3. **上面第 10 条那句"新增 `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键"从未落地**：`ExtractGroup`

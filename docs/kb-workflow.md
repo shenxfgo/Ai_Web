@@ -182,6 +182,10 @@ git diff 即人工知识的变更审计；数据库只是它的消费者。想�
 
 卡片编辑的语义：编辑后 `template_version` 不变但 `content_hash` 变，标记"人工修订"，
 并触发该表 embedding 重算（`POST /kb/reembed {table_id}`）。
+> **订正(P4 决策 ⑥，2026-10-02)：`/kb/reembed` 不在 P4 建，也不留空壳——它归 P9。**
+> P4 期间"人工修订之后怎么重算 embedding"只有一条路：对该源发 `POST /api/kb/reindex`
+> （产一枚 draft 档案 → 全量重建 → `POST /api/kb/profiles/{id}/activate`），粒度是整源不是单表。
+> 本句原文那个单表端点仍是 P9 的目标形态，不是当前能力。
 模板本身变更时升 `AIWEB_EXTRACT__CARD_TEMPLATE_VERSION`（写进 `kb_index_profile`），触发全量重算。
 它是 **int**（§2.6 的列类型就是 `card_template_version int`；`roadmap §配置语义` 原示例值写作 `v1`，
 as-built(0008) 已改成 `1`）。带前缀的 `tplv1` 只出现在 profile 的 `name` 里，那是给人看的展示形态。
@@ -227,16 +231,30 @@ token 估算**不引真 tokenizer 到写入路径**：`CJK 字符数×1 + ASCII 
 ## 7. 构建与重建
 
 - 卡片构建与 embedding 回填是同步作业的 `card_build` / `embed` 两个 phase（`sync_jobs.phase` 枚举里就有），
-  也可由 `POST /kb/rebuild`（admin）单独触发，202 返回 job id、SSE 看进度。
+  也可由 `POST /api/kb/reindex`（admin）单独触发，202 返回 job id、SSE 看进度。
+  > **订正(P4 决策 ⑥，2026-10-02)：本行原写 `POST /kb/rebuild`，旧名废弃、不留别名**——`rebuild`
+  > 读起来像"把现有那套档案重灌一遍"，而 P4 的语义是"产一枚 draft 档案再全量重建"（档案的唯一出生入口）。
+  > 两个名字对不上时，读代码的人会去找那个不存在的路由。**行内那两个 phase 名不动**：
+  > `sync_jobs.phase` 的九值词表不加值（决策 ②），`embed` 那一档在 029 之前仍是 `skipped=true`。
 - 换 embedding 模型：新建 `kb_index_profile`（draft）→ 全量重建 → `POST /api/kb/profiles/{id}/activate`
   原子切换（同事务把旧 active 置 retired）。维度不同时要**新表/新列**（影子列/影子表），
   激活后旧 profile 向量仍在，可回滚。
-- `scripts/reembed.py`：换模型时全量重建。
+  > **订正(P4 决策 ③/ADR-0012)：这句的"新表/新列"落成的是同表第二列 `kb_card.embedding_1024`**
+  > （0008 已入库），不是新表；"影子"那两个字留着容易读成"另建一张影子表"。切换与回滚的口径不变，
+  > 由 ADR-0013 的三态 + 库里那条 partial unique 背书（见 §7 末条与 metadata-model §2.6）。
+- ~~`scripts/reembed.py`：换模型时全量重建。~~ **订正(P4 决策 ①/⑥)：这个脚本不建，归 P9。**
+  P4 交付的是 `backend/scripts/fake_embedding_server.py`（闸内替身：真 HTTP、OpenAI 兼容
+  `/v1/embeddings`、确定性 char-ngram 哈希向量），它换的是**端点**不是脚本；
+  "换模型时全量重建"这件事在 P4 由 `POST /api/kb/reindex` 承担。
 - 未启用向量（`settings.embedding.configured=False`：base_url/key/model 任一不齐，或 `DIMENSION=0`）时
   卡片照样构建，`search_text` 与关键词索引可用，`embedding` 列留 NULL——这是 pgvector 可插拔的具体体现。
   **注意"可插拔"指的是运行期不调 embedding 端点，不是迁移期不需要 `vector` 类型**：
   `AIWEB_EMBEDDING__DIMENSION` 同时是 `kb_card.embedding` 的**列宽**，所以 `0005` 迁移要求它 `>0`，
   为 `0` 时拒绝建表并给中文 hint。向量路真正的开关是 `embedding.configured`（见 architecture.md §5.1）。
+  > **订正(P4-0008/ADR-0012)：这半句只对第一列成立。**`DIMENSION>0` 是 `0005` 建 `embedding`
+  > 那列的硬依赖，而 0008 的第二列 `embedding_1024` 是**字面量 1024**、跟着这个键无关；
+  > 0005 那道维度闸本身一字未动。所以从今天起这个键的语义是"**声明读哪一套维度**"，
+  > 不再兼任"决定列宽"——列宽由迁移里的字面量决定，读哪一列由 031 的那个唯一纯函数决定。
 
 ## 8. 枚举 distinct 值采样
 
