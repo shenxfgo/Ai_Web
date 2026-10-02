@@ -12,7 +12,8 @@
   固定顺序的两条（先降级旧 active、再升级新那行），ADR 要的那件事（不引入第二套真相、外部读者只
   看见切换前或切换后）没丢。不引入"唯一索引 + 时间戳两真相"那半句仍然照 ADR 生效。
 - 工单 030 验收 1：切换前后 `count(*) WHERE status='active'` **恒为 1**（只断返回码不算数），
-  且旧那行 `retired`、`is_active` 镜像同步为 false（026 的双写口径）。
+  且旧那行落在 `retired`。026 当时还要求 `is_active` 跟着镜像一次，那一列在 031 的收缩迁移
+  （0009）里已经删掉，所以这一格现在只由 `status` 一列说话。
 - 工单 030 已定口径：draft 且 `built_at IS NULL` → 400；已 active 的自己激活自己 → 幂等，
   不产生第二行、也不把任何一行改成 retired。
 - spec 故事 6 的后半句：`retired` 可以再激活，**而且这一格不许附加 `built_at` 条件**——
@@ -64,16 +65,18 @@ def _profile(name: str, **kw: Any) -> KbIndexProfile:
     )
 
 
-async def _rows(session: AsyncSession) -> list[tuple[str, str, bool]]:
-    """库里每一行档案的 `(name, status, is_active)`，按 name 排序（顺序不参与判定）。"""
+async def _rows(session: AsyncSession) -> list[tuple[str, str]]:
+    """库里每一行档案的 `(name, status)`，按 name 排序（顺序不参与判定）。
+
+    这里曾经还带第三格 `is_active`，用来钉 026 那条"双写"口径。0009 把那一列从库里删了以后
+    它就没有可取的东西了——尺子只剩一把，本来的两列形状也随之出清。
+    """
     rows = (
         await session.execute(
-            select(KbIndexProfile.name, KbIndexProfile.status, KbIndexProfile.is_active).order_by(
-                KbIndexProfile.name
-            )
+            select(KbIndexProfile.name, KbIndexProfile.status).order_by(KbIndexProfile.name)
         )
     ).all()
-    return [(str(r[0]), str(r[1]), bool(r[2])) for r in rows]
+    return [(str(r[0]), str(r[1])) for r in rows]
 
 
 async def _active_count(session: AsyncSession) -> int:
@@ -102,7 +105,7 @@ async def test_激活一行_built_at_齐了的_draft_旧_active_同刻变_retire
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile("text-embedding-3-small@1536@tplv1", status="active", is_active=True),
+            _profile("text-embedding-3-small@1536@tplv1", status="active"),
             _profile("bge-large-zh-v1.5@1024@tplv1", status="draft", built_at=func.now()),
         )
         await session.commit()
@@ -112,8 +115,8 @@ async def test_激活一行_built_at_齐了的_draft_旧_active_同刻变_retire
 
         assert await _active_count(session) == 1, "切换以后 active 计数必须恰好是 1"
         assert await _rows(session) == [
-            ("bge-large-zh-v1.5@1024@tplv1", "active", True),
-            ("text-embedding-3-small@1536@tplv1", "retired", False),
+            ("bge-large-zh-v1.5@1024@tplv1", "active"),
+            ("text-embedding-3-small@1536@tplv1", "retired"),
         ]
         assert outcome.activated.id == draft_id
         assert outcome.retired is not None
@@ -134,7 +137,7 @@ async def test_draft_行物理上排在_active_之前时切换仍然成功(sessi
         ids = await _insert(
             session,
             _profile("bge-large-zh-v1.5@1024@tplv1", status="draft", built_at=func.now()),
-            _profile("text-embedding-3-small@1536@tplv1", status="active", is_active=True),
+            _profile("text-embedding-3-small@1536@tplv1", status="active"),
         )
         await session.commit()
 
@@ -142,8 +145,8 @@ async def test_draft_行物理上排在_active_之前时切换仍然成功(sessi
 
         assert await _active_count(session) == 1
         assert await _rows(session) == [
-            ("bge-large-zh-v1.5@1024@tplv1", "active", True),
-            ("text-embedding-3-small@1536@tplv1", "retired", False),
+            ("bge-large-zh-v1.5@1024@tplv1", "active"),
+            ("text-embedding-3-small@1536@tplv1", "retired"),
         ]
 
 
@@ -157,7 +160,7 @@ async def test_retired_可以再激活回去而且库里仍是恰好一行_activ
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile("text-embedding-3-small@1536@tplv1", status="active", is_active=True),
+            _profile("text-embedding-3-small@1536@tplv1", status="active"),
             _profile("bge-large-zh-v1.5@1024@tplv1", status="draft", built_at=func.now()),
         )
         await session.commit()
@@ -175,8 +178,8 @@ async def test_retired_可以再激活回去而且库里仍是恰好一行_activ
             is None
         )
         assert await _rows(session) == [
-            ("bge-large-zh-v1.5@1024@tplv1", "retired", False),
-            ("text-embedding-3-small@1536@tplv1", "active", True),
+            ("bge-large-zh-v1.5@1024@tplv1", "retired"),
+            ("text-embedding-3-small@1536@tplv1", "active"),
         ]
 
 
@@ -185,7 +188,7 @@ async def test_built_at_为空时拒绝激活而且三态一个字没动(session
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile("text-embedding-3-small@1536@tplv1", status="active", is_active=True),
+            _profile("text-embedding-3-small@1536@tplv1", status="active"),
             _profile("bge-large-zh-v1.5@1024@tplv1", status="draft"),
         )
         await session.commit()
@@ -205,7 +208,7 @@ async def test_激活已经_active_的那一行是幂等它没有改变任何东
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile("text-embedding-3-small@1536@tplv1", status="active", is_active=True),
+            _profile("text-embedding-3-small@1536@tplv1", status="active"),
         )
         await session.commit()
         active_id = ids["text-embedding-3-small@1536@tplv1"]
@@ -214,7 +217,7 @@ async def test_激活已经_active_的那一行是幂等它没有改变任何东
 
         assert outcome.retired is None, "自己激活自己不该把谁改成 retired"
         assert outcome.activated.id == active_id
-        assert await _rows(session) == [("text-embedding-3-small@1536@tplv1", "active", True)]
+        assert await _rows(session) == [("text-embedding-3-small@1536@tplv1", "active")]
 
 
 async def test_库里一行_active_都没有时激活把_draft_顶上去(session_factory: Any) -> None:
@@ -230,7 +233,7 @@ async def test_库里一行_active_都没有时激活把_draft_顶上去(session
 
         assert await _active_count(session) == 1
         assert outcome.retired is None
-        assert await _rows(session) == [("bge-large-zh-v1.5@1024@tplv1", "active", True)]
+        assert await _rows(session) == [("bge-large-zh-v1.5@1024@tplv1", "active")]
 
 
 async def test_不存在的_profile_id_回_404_而且库里没有任何变化(session_factory: Any) -> None:
@@ -244,7 +247,7 @@ async def test_不存在的_profile_id_回_404_而且库里没有任何变化(se
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile("text-embedding-3-small@1536@tplv1", status="active", is_active=True),
+            _profile("text-embedding-3-small@1536@tplv1", status="active"),
         )
         await session.commit()
         before = await _rows(session)
@@ -399,7 +402,7 @@ async def test_逐源行数齐的_draft_能上线(session_factory: Any) -> None:
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(session, "demo-mysql", ("shop_t1", "shop_t2"))
@@ -426,7 +429,7 @@ async def test_少一个源的_draft_被拒_detail_点名那个源与两个数(s
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         keep = await _source(session, "shop_main", ("shop_order",))
@@ -461,7 +464,7 @@ async def test_同一张表的切片卡不重复计数(session_factory: Any) -> 
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(
@@ -500,7 +503,7 @@ async def test_只重建了宽表那一段的_draft_按表去重算缺(session_f
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(session, "demo-mysql", WIDE_AND_NARROW)
@@ -532,7 +535,7 @@ async def test_软删的卡不算实有(session_factory: Any) -> None:
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(session, "demo-mysql", ("shop_t1", "shop_t2"))
@@ -568,7 +571,7 @@ async def test_term_卡不进尺(session_factory: Any) -> None:
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(session, "demo-mysql", ("shop_t1",))
@@ -603,7 +606,7 @@ async def test_切换不删旧档案下的任何一张卡(session_factory: Any) 
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(session, "demo-mysql", ("shop_t1", "shop_t2"))
@@ -633,7 +636,7 @@ async def test_陈旧表不进尺(session_factory: Any) -> None:
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(session, "demo-mysql", ("shop_t1", "shop_t2"), stale=("shop_t2",))
@@ -713,7 +716,7 @@ async def test_上线与回滚都不改两根向量列里的内容(session_facto
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(session, "demo-mysql", ("shop_t1", "shop_t2"))
@@ -743,4 +746,4 @@ async def test_上线与回滚都不改两根向量列里的内容(session_facto
 
         assert back.activated.id == ids[OLD]
         assert await _vector_snapshot(session) == before, "回滚读的就是这批还没被动的向量"
-        assert await _rows(session) == [(NEW, "retired", False), (OLD, "active", True)]
+        assert await _rows(session) == [(NEW, "retired"), (OLD, "active")]

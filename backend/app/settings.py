@@ -171,6 +171,14 @@ class RetrievalGroup(BaseModel):
     # §5.3 的"候选度 > 8"。一个键同时管两侧：写侧的同名字段度（只告警不丢边）
     # 与图侧的表度（只禁当桥不禁当端点）。roadmap 分组 9 原本没有这一键，键名由工单 014 拍板。
     max_join_degree: int = 8
+    # RRF 融合公式 `score = Σ 1/(rrf_k + rank)` 里的那个常数（architecture §5.2 (3)）。
+    # **只住 .env，不进请求体**（spec 故事 27）：换值会真的翻融合次序，证据见
+    # test_retriever_rrf 里 60 → 10 那一条——它同时也就是"这一格真被读到"的证据。
+    rrf_k: int = 60
+    # HNSW 的查询期邻居预算（§5.2 (1) 那条 `SET LOCAL hnsw.ef_search`）。
+    # 请求体给了就用请求体的，没给取这一格。roadmap 写的 64 与 §7 示例的 100 都只是草稿，
+    # 所以两边都不写进代码：它只住这里，改它不改代码。
+    hnsw_ef_search: int = 64
 
 
 class QueryGroup(BaseModel):

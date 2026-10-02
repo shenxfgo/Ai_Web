@@ -1,17 +1,18 @@
-"""阶梯 L1（结构化关键词）的检索器。接缝与配方住在 `docs/architecture.md` §5.1/§5.2。
+"""检索器与它的两条腿。接缝与配方住在 `docs/architecture.md` §5.1/§5.2。
 
-P2 只实现 `LikeRetriever`：`Retriever` Protocol 里**没有任何向量概念**（没有 dim、没有
-`<=>`、没有 ef_search），所以 P4 换 `HybridRetriever` 时 `pipeline` 一行都不用改——
-协议上只允许出现"问句 + 候选表 + 分数 + 命中理由"。
+P2 交付 `LikeRetriever`（L1 结构化关键词），P4 交付 `HybridRetriever`（关键词 + 向量，RRF 融合）。
+`Retriever` Protocol 里**没有任何向量概念**（没有 dim、没有 `<=>`、没有 ef_search），所以换实现
+时 `pipeline` 与 `/kb/search` 端点一行都不用改——协议上只允许出现"问句 + 候选表 + 分数 + 命中理由"。
 
-分三截读：
+分四截读：
 
 1. **切词、命中判定与排序（纯函数，不碰数据库）**：`query_terms` / `column_hits` /
    `rank_candidates`。
-2. **召回（只碰元数据库）**：`_recall_statement` 在 `kb_card` 的卡片文本列上做 §5.2 (2)
-   的关键词路，`_candidate_columns` 把候选表的列原料读回来喂给第 1 截。
-   **绝不连源库**——源库要等 011 的只读执行才碰，而且那时也不走这条路。
-3. **接缝**：`Retriever`（Protocol）与 `LikeRetriever`（唯一实现）。
+2. **融合与裁决（纯函数）**：`rrf_fuse` / `fuse_rankings` / `resolve_tuning`（工单 031）。
+3. **两条腿各自的召回（只碰元数据库；向量路另加一次端点调用）**：`_keyword_ranking` 走 §5.2 (2)
+   的 ILIKE + pg_trgm，`_vector_ranking` 走 §5.2 (1) 的 `<=>`。**绝不连源库**——源库要等 011
+   的只读执行才碰，而且那时也不走这条路。
+4. **接缝**：`Retriever`（Protocol）、两个实现，以及全仓唯一的选择点 `_retriever_for()`。
 """
 
 from __future__ import annotations
@@ -22,8 +23,23 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Protocol, cast
 
-from sqlalchemy import Select, Table, case, func, or_, select
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    Float,
+    Select,
+    String,
+    Table,
+    bindparam,
+    case,
+    func,
+    literal,
+    or_,
+    select,
+    text,
+)
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import TextClause
 
 from app.models.kb import KbCard, KbIndexProfile
 from app.models.meta import MetaColumn, MetaTable
@@ -34,11 +50,13 @@ from app.schemas.kb import (
     KbSearchItemOut,
     KbSearchOut,
     KbSearchRequest,
+    SearchMode,
 )
 from app.services import datasource_service
-from app.services.kb_service import read_active_profile
+from app.services.embedding_client import EmbeddingClient
+from app.services.kb_service import ActiveProfile, read_active_profile, vector_target_for
 from app.services.nl2sql.prompt_builder import SchemaTable
-from app.settings import get_settings
+from app.settings import RetrievalGroup, get_settings
 
 # 一段"词"要么是 ASCII 标识符（含下划线），要么是一串连续汉字；其它字符一律当分隔符。
 # 问句里的标点、空格、全角括号都是天然断点，不需要额外的停用词表就能切开。
@@ -229,10 +247,128 @@ def rank_candidates(
     return candidates[:k]
 
 
+# ============================================================ 融合与裁决（纯函数）
+
+# 向量路的召回窗口（§5.2 (1) 的 `LIMIT`）。**与关键词路的 `_RECALL_LIMIT` 是两个独立的数**
+# （spec 故事 22）：同名同值看着省事，但调召回窗口时会一起挪走另一路的窗口，
+# 而那一格的缺省是有用例钉着的（`test_recall_limit_is_80` 一类）。
+_VECTOR_TOP_VECTOR: Final = 80
+
+
+def _rank_map(uids: Sequence[str]) -> dict[str, int]:
+    """一串 uid 折成 `uid → 名次`（从 1 起）。次序就是输入次序，这里不看任何分数。"""
+    return {uid: index + 1 for index, uid in enumerate(uids)}
+
+
+@dataclass(frozen=True)
+class FusedTable:
+    """RRF 融合后的一张表：两路各自的**名次**加融合分数。
+
+    名次可为 `None`，那是"这一路没命中它"而不是"第 0 名"——032 落 `chat_messages.retrieved`
+    的 `score_vec` / `fused` 两格时要的就是这个区分（§5.2 (8)：`mode='keyword'` 那一路
+    向量名次回到 null，"没命中"与"没算"分得开）。
+    """
+
+    table_uid: str
+    keyword_rank: int | None
+    vector_rank: int | None
+    rrf_score: float
+
+
+def rrf_fuse(
+    keyword_uids: Sequence[str], vector_uids: Sequence[str], *, rrf_k: int
+) -> list[FusedTable]:
+    """§5.2 (3) 的 RRF：`score = Σ 1/(rrf_k + rank)`，**吃两路各自的名次，不吃分数**（ADR-0014）。
+
+    为什么不加分数：两路的量纲根本不一致——关键词路是"每个词取该卡上的最大值再跨词求和"，
+    可以大于 1（见 `CardMatch.score`），向量路是 cosine 相似度落在 0..1。相加等于让量纲大的
+    那一路说话。名次没有这个问题：两边都是"第几名"。
+
+    并列（分数严格相等）按 `table_uid` 升序收口——同一个库跑两次必须给同一个次序，
+    与 §5.1 那条稳定排序是同一条理由。
+    """
+    keyword_ranks = _rank_map(keyword_uids)
+    vector_ranks = _rank_map(vector_uids)
+    fused = [
+        FusedTable(
+            table_uid=uid,
+            keyword_rank=keyword_ranks.get(uid),
+            vector_rank=vector_ranks.get(uid),
+            rrf_score=(1 / (rrf_k + keyword_ranks[uid]) if uid in keyword_ranks else 0.0)
+            + (1 / (rrf_k + vector_ranks[uid]) if uid in vector_ranks else 0.0),
+        )
+        # `dict.fromkeys` 去重且保序：两路都命中的表只出一条，名次对还是两对。
+        for uid in dict.fromkeys((*keyword_uids, *vector_uids))
+    ]
+    fused.sort(key=lambda item: (-item.rrf_score, item.table_uid))
+    return fused
+
+
+def fuse_rankings(
+    keyword: Sequence[RetrievedTable], vector: Sequence[RetrievedTable], *, rrf_k: int
+) -> list[RetrievedTable]:
+    """两条腿的完整次序 → 融合后的次序（§5.2 (3) 的装配那一半）。
+
+    名次从 `rrf_fuse` 来，**表对象从各自的腿来**：一张两路都命中的表要带关键词路那份
+    `hits`/`cards` 出门（界面上的"命中理由"只有 ILIKE 那一路给得出，向量路没有理由可说）。
+    所以这里按 uid 建一次反向索引，而不是把两列 `RetrievedTable` 拼起来再排。
+
+    只在向量路出现的表由调用方喂进来（`_vector_ranking` 造的 `RetrievedTable` 里
+    `score_kw=0.0`、`hits`/`cards` 为空），融合不看那两个格子。
+    """
+    fused = rrf_fuse(
+        [item.table_uid for item in keyword],
+        [item.table_uid for item in vector],
+        rrf_k=rrf_k,
+    )
+    by_uid: dict[str, RetrievedTable] = {}
+    # 关键词路排在后，覆盖同 uid 的向量路那份：同一张表有两种形状时，出门的是带命中理由的那一份。
+    for item in (*vector, *keyword):
+        by_uid[item.table_uid] = item
+    return [by_uid[item.table_uid] for item in fused]
+
+
+@dataclass(frozen=True)
+class SearchTuning:
+    """一次检索的三个旋钮，裁决完的结果（请求体 / 配置 / 代码缺省三层的终点）。"""
+
+    mode: SearchMode
+    top_vector: int
+    ef_search: int
+
+
+def resolve_tuning(
+    *,
+    cfg: RetrievalGroup,
+    vector_ready: bool,
+    mode: SearchMode | None = None,
+    top_vector: int | None = None,
+    ef_search: int | None = None,
+) -> SearchTuning:
+    """故事 27：请求给了就用请求的，没给才回落到配置/代码缺省，三格各自独立判。
+
+    只有**缺省的** `mode` 看 `vector_ready`：配齐向量端点才默认 hybrid（§5.1 那句"未配置时
+    检索直接走结构化路径、链路不断"，与 `/api/healthz` 的 `retrieval_mode` 同一个判据）。
+    请求明确要 `vector`/`hybrid` 而端点没配时，这里**不改口**——悄悄降级等于在响应里写一件
+    没发生的事，失败留给那一次真调用去说（`EmbeddingClient` 在未配置时抬
+    `EmbeddingNotConfigured`，端点缺哪一格由它逐格点名）。
+
+    `rrf_k` 不在这里：它只住 `.env`，请求体收了就是范围蔓延（spec 故事 27 的落法）。
+    """
+    return SearchTuning(
+        mode=mode if mode is not None else ("hybrid" if vector_ready else "keyword"),
+        top_vector=top_vector if top_vector is not None else _VECTOR_TOP_VECTOR,
+        ef_search=ef_search if ef_search is not None else cfg.hnsw_ef_search,
+    )
+
+
 # ============================================================ 召回（只碰元数据库）
 
 # §5.2 (2) 关键词路的召回窗口：先粗召回再聚合到表，最终名额由 `k` 收口。
 _RECALL_LIMIT: Final = 80
+# §5.2 (1) 括号里的 `iterative_scan`：HNSW 一边扫一边被 WHERE 滤掉邻居时，靠它继续往下凑满结果。
+# 取值那件事的实测证据写在 `hnsw_tuning_statement()` 的文档串里（同一个事实不两处刻）。
+_ITERATIVE_SCAN: Final = "relaxed_order"
 # (2a) 精确/前缀那一路的权重：文档给的就是 1.0，标识符对上就是最硬的信号。
 _EXACT_SCORE: Final = 1.0
 # 预览端点给正文开头的截断长度：够人眼判断"命中的是不是这张表"，又不至于把整卡刷进日志。
@@ -312,12 +448,90 @@ def _recall_statement(
     )
 
 
+def hnsw_tuning_statement(ef_search: int) -> TextClause:
+    """§5.2 (1) 括号里那两格查询期设置，合成一条语句发。
+
+    为什么不是 `SET LOCAL hnsw.ef_search TO :ef`：PG 的 `SET` 不接绑定参数（它后面不是表达式），
+    绑上去是 syntax error；`set_config(name, value, is_local)` 是同一件事的函数形态，
+    第三格 `true` 就是 LOCAL 的语义——只活到本事务结束，连接还回池子时不带这次的 ef。
+
+    值一律走绑定：`ef_search` 的源头是请求体，拼串等于把注入面开在一条每次检索都发的语句上。
+
+    `iterative_scan` 的取值是 **`relaxed_order`（单数）**。这一格在编译期抓不到：HNSW 的 GUC
+    在扩展于本会话装载**之前**只是占位符，`set_config` 对任何拼写都照收不误；装载之后才认
+    `off | relaxed_order | strict_order`，而 `docs/architecture.md` §5.2 原文写的 `relaxed_orders`
+    在那一刻会抬 `invalid value for parameter`（这台机器 PG 18.6 / pgvector 0.8.6，实测见
+    `test_kb_search_hybrid_pg.py`，文档由 031 的文档半边订正）。
+    """
+    return text(
+        "SELECT set_config('hnsw.ef_search', :hnsw_ef_search, true),"
+        " set_config('hnsw.iterative_scan', :hnsw_iterative_scan, true)"
+    ).bindparams(
+        bindparam("hnsw_ef_search", value=str(ef_search), type_=String),
+        bindparam("hnsw_iterative_scan", value=_ITERATIVE_SCAN, type_=String),
+    )
+
+
+def vector_recall_statement(
+    *, column: str, profile_id: int, datasource_ids: Sequence[int], top_vector: int
+) -> Select:
+    """§5.2 (1) 的向量路：按余弦**距离**升序取 `top_vector` 张卡（距离升序 = 相似度降序）。
+
+    `column` 只准来自 `vector_column_for()` 那份唯一映射（ADR-0012：换维度是同表加第二列，
+    读侧必须知道读的是哪一列）。它进的是 `_CARD.c[column]` 这个受控列对象，不是拼进 SQL 的串，
+    所以这里没有注入面——但也没有第二处知道列名。
+
+    WHERE 里三个谓词少一个都不当场报错，失效形状都长得像"一切正常"：
+    - `index_profile_id = active`：漏了就是把两套档案的向量混进同一个 ORDER BY（ADR-0012 立论
+      要防的正是它，而新旧向量混排出来的次序看起来完全合理）。
+    - `datasource_id IN (可见源)`：决策 ⑨/ADR-0008 的落点——权限过滤**进这一句**，不是
+      "先取全局 top-80 再筛"（召回窗口会被无权源的卡占满，筛完是空集，而库里明明有权可查的表）。
+      谓词形态与关键词路同一条，两路同一把尺。
+    - `<列> IS NOT NULL`：ADR-0003「卡片先于向量」的读侧一半。NULL 排不出距离，而 PG 把 NULL
+      排在升序末尾——于是"还没灌向量"伪装成"最不相关"，并在 `top_vector` 大于真向量卡数时来占名额。
+
+    `score` 选的是 `1 - 距离`（相似度），只给人看：RRF 吃的是这条 ORDER BY 的**名次**（ADR-0014）。
+    """
+    card = _CARD
+    target = card.c[column]
+    # `<=>` 的返回类型得**当场写明**是 Float：`op()` 默认把左边列的类型（Vector）当成结果类型续上，
+    # 于是 `1 - 距离` 里的整型 1 会走 Vector 的绑定处理器，报 `expected list or ndarray`。
+    # 这一格在 SQL 文本上看不出来（两种写法渲染出的串一模一样），所以只有真库能抓到它。
+    distance = target.op("<=>", return_type=Float)(
+        bindparam("query_vector", type_=Vector()).cast(Vector())
+    )
+    return (
+        select(
+            card.c.id,
+            card.c.table_id,
+            card.c.datasource_id,
+            card.c.kind,
+            card.c.seq,
+            card.c.title,
+            _META_TABLE.c.table_uid,
+            (literal(1) - distance).label("score"),
+        )
+        .join(_META_TABLE, _META_TABLE.c.id == card.c.table_id)
+        .where(
+            card.c.deleted_at.is_(None),
+            card.c.index_profile_id == profile_id,
+            card.c.datasource_id.in_(datasource_ids),
+            target.is_not(None),
+        )
+        .order_by(distance)
+        # 具名绑定而不是匿名：§5.2 (1) 那句写的就是 LIMIT $top_vector，具名还让
+        # 「这一格到底下发了什么值」在真库上可查（切片 D 的用例读 compiled.params）。
+        .limit(bindparam("top_vector", value=top_vector))
+    )
+
+
 async def _active_profile_id(session: AsyncSession) -> int | None:
     """当前生效的那套档案的 id。检索只命中它的卡（§2.6 末：新旧两套混在一个索引里不可解释）。
 
     "哪一行在服务"这个问题在工单 027 之后全仓只有一个答案（`kb_service.read_active_profile`，
     尺子是 `status='active'`）。这里留着这层投影，是因为召回和按表回读两处都只要 id——
-    要是两处各写一遍谓词，031 删 `is_active` 那把镜像列时就又要人肉数一遍调用点。
+    两处各写一遍谓词的话，换一次尺子就要人肉数一遍调用点；031 收掉 `is_active` 那条镜像列
+    能一处收完，靠的正是这一层。
     """
     active = await read_active_profile(session)
     return None if active is None else active.index_profile_id
@@ -358,6 +572,167 @@ async def _candidate_columns(
     ]
 
 
+# ============================================================ 两路共用的前置与关键词路
+
+
+def _final_limit(k: int | None) -> int:
+    """`k` 缺省时取配置那一格。**两种实现、三条 mode 都从这里取名额**——名额裁决若有两处，
+    `mode='keyword'` 那条"与 P2 逐字同构"（故事 26）就得逐处再证一遍。
+    """
+    return k if k is not None else get_settings().retrieval.final_tables_k
+
+
+async def _search_scope(
+    session: AsyncSession, *, actor: User, datasource_ids: Sequence[int]
+) -> tuple[ActiveProfile, tuple[int, ...]] | None:
+    """两路共用的两个前置：actor 看得见的源、当前生效的那套档案。缺任何一个回 `None`。
+
+    `None` 时**故意不抬错**：Protocol 的返回类型是 `list[RetrievedTable]`，改成抛异常会连累
+    010/012 的调用方，而"没有生效 profile"和"问句没命中"在 P2 都是同一个答案——空候选。
+    可诊断性归 013：那里的 `NO_SCHEMA_FOUND` 分类要把这两种分开，给不同的下一步
+    （前者是"去跑同步/建卡片"，后者是"换个说法或补录知识"）。
+
+    返回的是整份 `ActiveProfile` 而不是只有 id：向量路还要拿它的 `dimensions` 定列
+    （ADR-0012），而"再读一次档案行"等于把"哪套在服务"这件事在同一句问句里问两遍。
+    """
+    visible = {ds.id for ds, _ in await datasource_service.list_visible(session, actor)}
+    scoped = visible & set(datasource_ids) if datasource_ids else visible
+    if not scoped:
+        return None
+
+    profile = await read_active_profile(session)
+    if profile is None:
+        return None
+    return profile, tuple(sorted(scoped))
+
+
+async def _keyword_ranking(
+    session: AsyncSession, *, terms: Sequence[str], profile_id: int, scoped: Sequence[int]
+) -> list[RetrievedTable]:
+    """§5.2 (2) 的关键词路，回**完整次序**（不截断）。
+
+    截断留给调用方是有意的：`rank_candidates` 的 `k` 就是最终名额，而融合要的是一条完整次序
+    ——关键词路第 6 名、向量路第 1 名的那张表，它的名次必须在，不能被名额先砍掉。
+    这里给 `k` 传卡片数（≥ 候选表数），等于"这一路不砍"。
+    """
+    rows = (
+        (
+            await session.execute(
+                _recall_statement(
+                    terms,
+                    profile_id=profile_id,
+                    datasource_ids=scoped,
+                    threshold=get_settings().retrieval.trgm_threshold,
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    if not rows:
+        return []
+
+    cards = [
+        CardMatch(
+            card_id=int(row["id"]),
+            table_id=int(row["table_id"]),
+            table_uid=str(row["table_uid"]),
+            datasource_id=int(row["datasource_id"]),
+            kind=str(row["kind"]),
+            seq=int(row["seq"]),
+            title=row["title"],
+            score=float(row["score"]),
+            text_preview=str(row["text_preview"]),
+        )
+        for row in rows
+    ]
+    hits = column_hits(
+        await _candidate_columns(session, sorted({c.table_id for c in cards})), terms
+    )
+    return rank_candidates(cards, hits, k=len(cards))
+
+
+# ============================================================ 向量路（只碰元数据库 + 端点）
+
+
+def _vector_table(rows: Sequence[RowMapping]) -> RetrievedTable:
+    """一张表在向量路里的形状：只有身份字段，没有命中理由。
+
+    这是本片补的一条口径（工单 031 的字面只说了"融合吃名次"）：`hits`/`cards` 那两格是
+    §5.2 (2) 的 ILIKE 命中计数，向量路给不出"哪一列被哪个词对上"这句话——端点只回了一串
+    浮点数，硬凑一条理由等于替它编造它没说过的话。`score_kw=0.0` 同一条理由：那一格是
+    关键词路的和分数，向量路的相似度量纲不同（0..1），填进去就是把两路的分数混进一个格子
+    （ADR-0014 立论要防的正是这个）。032 扩 `vector_rank`/`rrf_score` 三列时，这一格才第一次
+    有地方说"我是被向量路带上来的"。
+
+    `title` 的取法与关键词路同一条规则（主卡 `seq=0` 优先，没有主卡就退回这张表的第一张卡）：
+    同一张表在两路印出不同标题，界面上就成了两张表。
+    """
+    first = rows[0]
+    return RetrievedTable(
+        table_uid=str(first["table_uid"]),
+        table_id=int(first["table_id"]),
+        datasource_id=int(first["datasource_id"]),
+        title=next((row["title"] for row in rows if int(row["seq"]) == 0), first["title"]),
+        score_kw=0.0,
+        matched_term_count=0,
+        matched_column_count=0,
+        hits=(),
+        cards=(),
+    )
+
+
+async def _vector_ranking(
+    session: AsyncSession,
+    *,
+    question: str,
+    profile: ActiveProfile,
+    scoped: Sequence[int],
+    tuning: SearchTuning,
+) -> list[RetrievedTable]:
+    """§5.2 (1) 的向量路：问句 → 端点取一根向量 → `<=>` 距离升序取 `top_vector` 张卡 → 聚合到表。
+
+    三处失败各有各的形状，**这里一处都不兜**：
+    - 端点没配、连不上、回的宽度不对：`EmbeddingClient` 那一族 `AppError` 原样抬出去。兜住它
+      等于把"这台机器没启用向量路"翻译成"这句问句没命中"，而故事 27 反对的正是这种降级。
+    - active 档案那一维没有预置列：`vector_target_for` 抬 `VectorColumnMissing`（工单 031 验收 6）。
+      读侧复用写侧那一份映射，全仓因此仍然只有一处知道"1024 落在哪一列"。
+    - 一行都没召回：空列表。`top_vector` 大于库里向量卡数是常态（向量列刚建、只灌了一半）。
+
+    先 `hnsw_tuning_statement` 再召回，两条语句走**同一个 session**：§P4 踩坑 ② 说的就是
+    SQLAlchemy 惰性 BEGIN——若 `set_config(..., true)` 落在事务之外，它当场生效又当场失效，
+    召回用的还是默认那个 40，而 SQL 一个字没变、结果看起来完全正常。切片 D 的单调性用例
+    （64 的名次集合 ⊆ 400 的）钉的正是这一格。
+    """
+    target = vector_target_for(dimensions=profile.dimensions, model=profile.model)
+    client = EmbeddingClient(embedding=get_settings().embedding)
+    (query_vector,) = await client.embed([question], expected_dimension=target.dimensions)
+
+    await session.execute(hnsw_tuning_statement(tuning.ef_search))
+    rows = (
+        (
+            await session.execute(
+                vector_recall_statement(
+                    column=target.column,
+                    profile_id=profile.index_profile_id,
+                    datasource_ids=scoped,
+                    top_vector=tuning.top_vector,
+                ),
+                {"query_vector": query_vector},
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+    # 距离升序的卡片行聚到表：一张表**第一次**出现的那一行就是它在向量路的名次行，
+    # 后面的卡只是同一张表的第二、第三句证据（§5.2 (4)：同一张表不占两个名额）。
+    grouped: dict[int, list[RowMapping]] = {}
+    for row in rows:
+        grouped.setdefault(int(row["table_id"]), []).append(row)
+    return [_vector_table(items) for items in grouped.values()]
+
+
 # ============================================================ 接缝
 
 
@@ -380,7 +755,11 @@ class Retriever(Protocol):
 
 
 class LikeRetriever:
-    """L1 的最小实现：元数据库上的 ILIKE + pg_trgm，按 §5.1 的（命中词数, 命中列数, uid）排序。"""
+    """L1 的最小实现：元数据库上的 ILIKE + pg_trgm，按 §5.1 的（命中词数, 命中列数, uid）排序。
+
+    P4 之后它同时是 `HybridRetriever` 的 `mode='keyword'` 那一路（降级路径直接复用这一份，
+    不照着再写一遍），所以 009 那一整文件的用例是两条路共用的回归位。
+    """
 
     async def search(
         self,
@@ -393,66 +772,114 @@ class LikeRetriever:
     ) -> list[RetrievedTable]:
         terms = query_terms(question)
         if not terms:
-            # 一个词都没切出来（全是标点或单字）：不发 SQL，也不猜表。
+            # 一个词都没切出来（全是标点或单字）：不发 SQL，也不猜表。这一格在 `_search_scope`
+            # **之前**，所以"空问句不查库"（工单 009 那条用例的名字）不是碰巧，是这里的顺序。
             return []
 
-        visible = {ds.id for ds, _ in await datasource_service.list_visible(session, actor)}
-        scoped = visible & set(datasource_ids) if datasource_ids else visible
-        if not scoped:
+        scope = await _search_scope(session, actor=actor, datasource_ids=datasource_ids)
+        if scope is None:
             return []
+        profile, scoped = scope
 
-        profile_id = await _active_profile_id(session)
-        if profile_id is None:
-            # 一张卡都没建过（没跑过同步，或同步过但卡片那一段没落）。这里**故意不抬错**：
-            # Protocol 的返回类型是 `list[RetrievedTable]`，改成抛异常会连累 010/012 的调用方，
-            # 而"没有生效 profile"和"问句没命中"在 P2 都是同一个答案——空候选。
-            # 可诊断性归 013：那里的 `NO_SCHEMA_FOUND` 分类要把这两种分开，给不同的下一步
-            # （前者是"去跑同步/建卡片"，后者是"换个说法或补录知识"）。
-            return []
-
-        rows = (
-            (
-                await session.execute(
-                    _recall_statement(
-                        terms,
-                        profile_id=profile_id,
-                        datasource_ids=sorted(scoped),
-                        threshold=get_settings().retrieval.trgm_threshold,
-                    )
-                )
-            )
-            .mappings()
-            .all()
+        ranked = await _keyword_ranking(
+            session, terms=terms, profile_id=profile.index_profile_id, scoped=scoped
         )
-        if not rows:
-            return []
+        return ranked[: _final_limit(k)]
 
-        cards = [
-            CardMatch(
-                card_id=int(row["id"]),
-                table_id=int(row["table_id"]),
-                table_uid=str(row["table_uid"]),
-                datasource_id=int(row["datasource_id"]),
-                kind=str(row["kind"]),
-                seq=int(row["seq"]),
-                title=row["title"],
-                score=float(row["score"]),
-                text_preview=str(row["text_preview"]),
+
+class HybridRetriever:
+    """§5.2 的两条腿：关键词路 + 向量路，各自出名次，RRF 折成一次融合次序（ADR-0014）。
+
+    三个旋钮在**构造时**给定（`SearchTuning`），不进 `search()` 的签名：协议里一旦出现
+    `ef_search` 或维度，`pipeline` 就认识向量了，故事 21 那份协议纪律当场作废。裁决（请求体 /
+    配置 / 代码缺省）住在 `_retriever_for()` 那一处，这里只收裁决完的结果。
+
+    三条 `mode` 的形状：
+    - `keyword`：**直接调用** `LikeRetriever`，不是照着再写一遍。故事 26 那句"降级路径与 P2
+      逐字同构"因此由构造保证，009 那一整文件（pg + live）同时是这两条路的回归位；而这一支
+      一个 embedding 请求都不发，端点坏没坏都不影响降级。
+    - `vector`：只有向量路，返回的表没有命中理由（见 `_vector_table`）。
+    - `hybrid`：两条腿各跑一次，融合后再收口到 `k`。
+    """
+
+    def __init__(self, *, tuning: SearchTuning, rrf_k: int) -> None:
+        self._tuning = tuning
+        self._rrf_k = rrf_k
+
+    async def search(
+        self,
+        session: AsyncSession,
+        *,
+        actor: User,
+        question: str,
+        datasource_ids: Sequence[int] = (),
+        k: int | None = None,
+    ) -> list[RetrievedTable]:
+        if self._tuning.mode == "keyword":
+            return await LikeRetriever().search(
+                session,
+                actor=actor,
+                question=question,
+                datasource_ids=datasource_ids,
+                k=k,
             )
-            for row in rows
-        ]
-        hits = column_hits(
-            await _candidate_columns(session, sorted({c.table_id for c in cards})), terms
+
+        scope = await _search_scope(session, actor=actor, datasource_ids=datasource_ids)
+        if scope is None:
+            return []
+        profile, scoped = scope
+
+        vector = await _vector_ranking(
+            session,
+            question=question,
+            profile=profile,
+            scoped=scoped,
+            tuning=self._tuning,
         )
-        limit = k if k is not None else get_settings().retrieval.final_tables_k
-        return rank_candidates(cards, hits, k=limit)
+        if self._tuning.mode == "vector":
+            return vector[: _final_limit(k)]
+
+        terms = query_terms(question)
+        # 切不出词时关键词那条腿直接空（不发 SQL），融合因此退化成向量路的次序，而不是整条
+        # 链返回空——这是 hybrid 与 keyword 唯一的形状差别，也是 `mode='vector'` 那一条的用意：
+        # 问句全是标点时 ILIKE 无路可走，端点却仍然可能给出有意义的邻近卡。
+        keyword = (
+            await _keyword_ranking(
+                session, terms=terms, profile_id=profile.index_profile_id, scoped=scoped
+            )
+            if terms
+            else []
+        )
+        return fuse_rankings(keyword, vector, rrf_k=self._rrf_k)[: _final_limit(k)]
 
 
 # ============================================================ 预览端点用的那一层
 
 
-# 端点只认协议，不认实现：P4 换 HybridRetriever 改的是这一行的赋值，往上一行都不动。
-_RETRIEVER: Retriever = LikeRetriever()
+# 端点只认协议，不认实现。工单 031 验收 5 那句"换实现只改一行"，P4 之后指的就是下面这一处
+# 函数体里的构造：`search_preview()` 与 `pipeline` 都不认识 `HybridRetriever` 这个名字
+# （`tests/unit/test_retriever_seam.py` 把这两句话钉成了机械检查）。
+def _retriever_for(payload: KbSearchRequest) -> Retriever:
+    """请求体的三个旋钮 → 一个检索实现。全仓唯一一处 `HybridRetriever(...)` 的构造点。
+
+    它必须是**工厂而不是一个模块级实例**：P4 之后同一份实现要按请求换 `ef_search`，
+    模块级那个单例装不下"这次请求要什么旋钮"。换实现仍只改一处——改的是这里那一行构造，
+    而不是散到端点与 pipeline 里各 new 一个。
+
+    `vector_ready` 只在这句裁决里出现一次：配齐向量端点四格才默认 hybrid（§5.1 那句
+    "未配置时链路不断"，与 `/api/healthz` 的 `retrieval_mode` 同一个判据）。
+    """
+    cfg = get_settings()
+    return HybridRetriever(
+        tuning=resolve_tuning(
+            cfg=cfg.retrieval,
+            vector_ready=cfg.embedding.configured,
+            mode=payload.mode,
+            top_vector=payload.top_vector,
+            ef_search=payload.ef_search,
+        ),
+        rrf_k=cfg.retrieval.rrf_k,
+    )
 
 
 def _item_out(r: RetrievedTable) -> KbSearchItemOut:
@@ -491,7 +918,7 @@ async def search_preview(
         await datasource_service.get_authorized(session, actor, ds_id)
 
     started = time.perf_counter()
-    found = await _RETRIEVER.search(
+    found = await _retriever_for(payload).search(
         session,
         actor=actor,
         question=payload.query,

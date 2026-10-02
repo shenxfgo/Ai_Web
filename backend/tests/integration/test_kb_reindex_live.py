@@ -176,10 +176,17 @@ async def _presence_by_table(
 
 
 async def _search_items(client: AsyncClient, acct: Login, ds_id: int) -> list[dict[str, Any]]:
-    """打一次 `/kb/search`，只回 `items`（`took_ms` 不参与比对，见文件头口径）。"""
+    """打一次 `/kb/search`，只回 `items`（`took_ms` 不参与比对，见文件头口径）。
+
+    这里显式写 `mode='keyword'`，不是偷懒而是本片之后唯一还能用 `/kb/search` 当"线上基准没动"
+    代理的问法：031 之后默认档是 hybrid，它会先问 embedding 端点要一根问句向量，而本用例中途
+    刻意把 settings 换到 `OTHER`（1024）、线上服务的却仍是 1536 那套档案——三元组与 active
+    不一致时向量路**显式报错**（`embedding_dimension_mismatch`，工单 031 已定口径"不静默回落"）。
+    031 之前这条用例不需要写这个旋钮，因为当时全仓只有关键词路一件东西。
+    """
     resp = await client.post(
         "/api/kb/search",
-        json={"query": _QUERY, "datasource_ids": [ds_id], "k": 5},
+        json={"query": _QUERY, "datasource_ids": [ds_id], "k": 5, "mode": "keyword"},
         headers=acct.headers,
     )
     assert resp.status_code == 200, resp.text
@@ -279,7 +286,8 @@ async def test_reindex到另一维时新列真写旧列一字不动且检索结�
     替身按 model 名回宽度，所以 `_pin` 换成 `OTHER` 之后端点真的回 1024——不是用例假装它回。
 
     `/kb/search` 前后各问一次比 `items`：它是表粒度、且只认 active 档案，所以"重建中不影响
-    线上检索"应当是**逐字节**相同，而不是"名次看起来差不多"。
+    线上检索"应当是**逐字节**相同，而不是"名次看起来差不多"。两问都走 `mode='keyword'`，
+    理由在 `_search_items` 的 docstring 里——那格断的是"线上基准没动"，不是"向量路能跑"。
     """
     active_id = await insert_active_profile(
         session_factory,

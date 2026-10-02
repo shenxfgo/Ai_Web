@@ -48,7 +48,7 @@ async def _complete_draft(session_factory: Any) -> dict[str, int]:
     async with session_factory() as session:
         ids = await _insert(
             session,
-            _profile(OLD, status="active", is_active=True),
+            _profile(OLD, status="active"),
             _profile(NEW, status="draft", built_at=func.now()),
         )
         src = await _source(session, "demo-mysql", ("shop_t1", "shop_t2"))
@@ -95,8 +95,8 @@ async def test_admin_上线一行建齐的_draft_回_200_两格摘要(
     async with session_factory() as session:
         assert await _active_count(session) == 1
         assert await _rows(session) == [
-            (NEW, "active", True),
-            (OLD, "retired", False),
+            (NEW, "active"),
+            (OLD, "retired"),
         ]
 
 
@@ -229,4 +229,4 @@ async def test_同一条_activate_连发两次不产生第二行_active(
     }, "重放时旧 active 已经是自己，retired 只能是 null"
     async with session_factory() as session:
         assert await _active_count(session) == 1
-        assert await _rows(session) == [(NEW, "active", True), (OLD, "retired", False)]
+        assert await _rows(session) == [(NEW, "active"), (OLD, "retired")]

@@ -126,15 +126,17 @@ def test_卡片正文列非空_与_build_cards_的产出字段一一对应() -> 
 def test_index_profile_把模型_维度_模板版本钉成一行() -> None:
     """§2.6：换模型/改模板必须新建 profile 全量重建，所以这三样是列，不是散在 settings 的隐式约定。
 
-    `name` 唯一（形如 `text-embedding-3-small@1536@tplv1`）= 同一配置不会重复建 profile；
-    `is_active` 是检索侧唯一的过滤位——激活切换的机制在 P4，但列必须在 P2 就存在，
-    否则 `kb_card.index_profile_id` 那根 NOT NULL 外键无处可指。
+    `name` 唯一（形如 `text-embedding-3-small@1536@tplv1`）= 同一配置不会重复建 profile。
+    那条 `is_active` 曾经在这里排第一（P2 时它是检索侧唯一的过滤位），0008 让 `status` 接手、
+    027 关掉写侧、031 关掉读侧，0009 把列删了——所以这一格现在钉的是**它不在**：一个没人读的
+    布尔留在模型里，下一版就会有人以为它是第二真相（ADR-0013 反对的就是这件事）。
     """
     ddl = _ddl("kb_index_profile")
     oneline = ddl.replace("\n", " ")
     assert "CONSTRAINT uq_kb_index_profile_name UNIQUE (name)" in oneline
-    for name in ("provider", "model", "dimensions", "card_template_version", "is_active"):
+    for name in ("provider", "model", "dimensions", "card_template_version"):
         assert "NOT NULL" in _col(ddl, name), f"{name} 是 profile 身份的组成部分"
+    assert "is_active" not in ddl, "收缩那一版没删干净：模型里还留着那条镜像列"
     assert "INTEGER" in _col(ddl, "dimensions")
     assert "INTEGER" in _col(ddl, "card_template_version")
     distance = _col(ddl, "distance_fn")

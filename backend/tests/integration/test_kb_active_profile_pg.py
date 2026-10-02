@@ -1,8 +1,8 @@
 """全仓唯一把 `status='active'` 翻成"该用哪套档案"的那个读入口（工单 027 / ADR-0013）。
 
 接缝：`read_active_profile()` 收一个 session，回 `ActiveProfile | None`。它是同步链路以后
-和检索链路共用的**同一个**读法——027 之后"该用哪套档案"只准有这一处翻译，别处再写一条
-`WHERE is_active` 就是 spec §1 问题 2 的那条安静任选。
+和检索链路共用的**同一个**读法——027 之后"该用哪套档案"只准有这一处翻译，别处再各写一条
+自己的谓词，就是 spec §1 问题 2 的那条安静任选。
 
 期望值口径（文档字面，不是从实现反推）：
 - ADR-0013：三态词表是 `draft|active|retired`，服务中的那一套**只有** `status='active'` 一个标记；
@@ -111,28 +111,30 @@ async def test_读入口不往库里落行_两次调用前后行数相同(sessio
         assert await _count(session) == 1
 
 
-async def test_读的尺子是_status_不是那条镜像列(session_factory) -> None:
-    """026 的"本片只加列不改读侧"到 027 结束：读侧换尺子，`is_active` 从此只是镜像。
+async def test_库里只剩_status_这一把尺子_镜像列已经不在那一格上了(session_factory) -> None:
+    """026 的"本片只加列不改读侧"到 027 结束、到 031 收尾：读侧只认 `status`，而镜像列没了。
 
-    用例故意造出一行 `is_active=True` 但 `status='retired'` 的不一致行：两列冲突时**以 status
-    为准**（ADR-0013，031 删掉镜像列）。如果实现还在读 `is_active`，这一步就红。
-    下一步把 status 改成 active、镜像列留在 true 之外（`is_active=False`），读得到才证明
-    它认的是 status 而不是"两列都要为真"。
+    这一格原本的用例是"造一行 `is_active=True` 而 `status='retired'` 的冲突行，看实现认哪一列"。
+    0009 把 `is_active` 从库里删掉之后，**那个前提造不出来了**——不是实现变强了，是可供冲突的
+    第二列没了。所以这里的钉子换成形状本身：ORM 的这张表里不再有那一格（`getattr` 直接抛），
+    而读入口照旧只按 `status` 认行。两列冲突时以谁为准这件事，交给 031 的收缩链
+    （`test_kb_is_active_shrink_pg.py`）与库里那条 partial unique 去背。
 
-    证据边界：SQL 文本里还有没有 `is_active` 这个词，本用例证不了，它由 `grep` 的调用点清单
-    背书（工单 027 验收 1，收口记录）。
+    证据边界仍然一样：SQL 文本里还有没有 `is_active` 这个词，本用例证不了，它由 `grep` 的
+    调用点清单背书（工单 027 验收 1、031 验收 7）。
     """
+    assert not hasattr(KbIndexProfile, "is_active"), "镜像列还挂在模型上：0009 那一版没接上"
+
     async with session_factory() as session:
-        session.add(_profile("mirror@1536@tplv1", status="retired", is_active=True))
+        session.add(_profile("only-status@1536@tplv1", status="retired"))
         await session.flush()
         assert await read_active_profile(session) is None
 
         await session.execute(
             text(
-                f'UPDATE "{_schema()}".kb_index_profile '
-                "SET status = 'active', is_active = false WHERE name = :name"
+                f"UPDATE \"{_schema()}\".kb_index_profile SET status = 'active' WHERE name = :name"
             ),
-            {"name": "mirror@1536@tplv1"},
+            {"name": "only-status@1536@tplv1"},
         )
         active = await read_active_profile(session)
         assert active is not None

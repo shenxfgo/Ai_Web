@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+# `POST /kb/search` 的三路开关（architecture §5.2：`keyword` 只走 (2)，`vector` 只走 (1)，
+# `hybrid` 两路各自出名次再 RRF）。住在 schema 层是因为 import 方向只有一个：
+# `retriever` 本来就 import 这一层，反过来会成环。
+SearchMode = Literal["keyword", "vector", "hybrid"]
 
 
 class KbCardProfileOut(BaseModel):
@@ -85,10 +90,14 @@ class KbActivateOut(BaseModel):
 class KbSearchRequest(BaseModel):
     """`POST /kb/search` 的 body（§7）。
 
-    §7 那一行还写着 `top_vector / ef_search / trgm_threshold / mode`，P2 一个都不收：它们
-    全是向量路的调参，而 P2 只有 ILIKE 一条路（阈值走 `AIWEB_RETRIEVAL__TRGM_THRESHOLD`）。
-    不收的方式是**拒**（`extra="forbid"` → 422），不是静默忽略：传了就当场告诉前端"P2 没有这个
-    旋钮"，比默默按默认值跑完再让人怀疑参数没生效要诚实得多。
+    P4（工单 031）收 `mode / top_vector / ef_search` 三个旋钮，但仍收不下 §7 那行原来列的第四个
+    ——`trgm_threshold` 是 (2b) 那一路的分数门槛，只取 `AIWEB_RETRIEVAL__TRGM_THRESHOLD`；
+    `rrf_k` 也不给：它管的是**全库的融合次序**（§5.2 (3)），进请求体等于让一次调用改写排序规则
+    （spec 故事 27 的落法）。两者传上来都是 422，不是静默忽略（`extra="forbid"`）。
+
+    **三个旋钮都不带默认值**：缺省即 `None`，由 `resolve_tuning()` 回落到配置或向量路自己的
+    窗口。这里写死一个数就是第三个答案——roadmap 验收 3 的 `ef_search=64` 与 §7 示例的 100
+    本来就要靠"请求体不给 → 配置说了算"这条规则收口。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -97,6 +106,15 @@ class KbSearchRequest(BaseModel):
     # 空 = 在我看得见的所有源里找；非空 = 只在指定的这几个里找
     datasource_ids: list[int] = Field(default_factory=list)
     k: int = Field(default=5, ge=1, le=50)
+    # §5.2 的三路开关。没给 = 配齐向量端点走 hybrid、没配走 keyword（§5.1 的降级判据）；
+    # 明确给了 `vector`/`hybrid` 而端点没配**不会**被悄悄降级，见 `resolve_tuning()`。
+    mode: SearchMode | None = None
+    # 向量路的召回窗口（§5.2 (1) 的 `LIMIT $top_vector`）。只 `ge=1`：上界不归本片发明，
+    # 大到 HNSW 扫不动是 PG 自己的事，它的失败会在这一发查询里如实长出来。
+    top_vector: int | None = Field(default=None, ge=1)
+    # 查询期 HNSW 邻居预算，下发形态是 `set_config('hnsw.ef_search', …, true)`。
+    # 同样不设上界：pgvector 自己认的范围才是这件事的权威。
+    ef_search: int | None = Field(default=None, ge=1)
 
 
 class KbSearchHitOut(BaseModel):

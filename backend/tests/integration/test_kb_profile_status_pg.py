@@ -1,13 +1,15 @@
-"""0008 落进真库之后的三件事：至多一行 active 由**库**背书、归置口径真的跟着 `is_active`、
+"""0008 落进真库之后的三件事：至多一行 active 由**库**背书、词表由那条 CHECK 圈住、
 reindex 的载体列可用。
 
 期望值口径（全部是文档字面，不是从模型代码反推的）：
 - ADR-0013 + spec 故事 1：`status IN ('draft','active','retired')` 与一条 partial unique
   `WHERE status = 'active'`。用例断的是 **IntegrityError**，不是某个 Python 分支——
   "只有一个 active"如果住在代码里，两个进程各读各的就是 spec §1 问题 2 那条安静任选。
-- 工单 026 的归置口径：`is_active=true` → `active`，其余 → `retired`（不是 `draft`）。
-  这条只能真跑：它是"迁移对存量行做了什么"，DDL 字符串里没有它。
 - ADR-0011 + 工单 026/029：`sync_jobs.reindex_profile_id` 可空、外键 SET NULL。
+
+026 那一格原本还在这里验"归置口径真的跟着 `is_active`"，它在 031 的收缩之后搬去了
+`test_kb_is_active_shrink_pg.py`：`is_active` 这一列在 head 库里已经不存在，用例造不出前提，
+而搬家以后的证据反而更硬——跑的是迁移本体，不是重抄一遍那句 SQL。
 
 `docs/verification.md` §2.2 第 2 项：迁移剩下的那 10% 只能在真 PG 上验。
 """
@@ -15,7 +17,6 @@ reindex 的载体列可用。
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,17 +28,8 @@ import app.models  # noqa: F401
 from app.core.db import Base
 from app.models.kb import KbIndexProfile
 from app.models.meta import SyncJob
-from tests.conftest import BACKEND_ROOT, load_script
 
 pytestmark = pytest.mark.pg
-
-MIGRATION_0008 = BACKEND_ROOT / "alembic" / "versions" / "0008_embedding_columns.py"
-
-
-@pytest.fixture(scope="module")
-def mig8() -> object:
-    assert MIGRATION_0008.is_file(), f"迁移文件不存在：{MIGRATION_0008}"
-    return load_script("m0008_pg", Path(MIGRATION_0008))
 
 
 def _schema() -> str:
@@ -133,8 +125,8 @@ async def test_词表之外的_status_由库里那条_check_拒(session_factory)
 async def test_没写_status_的档案落库就是_draft(session_factory) -> None:
     """029 的出生默认：reindex 造的就是 draft，调用方不写状态也不该掉进 active。
 
-    默认值方向错了会怎样：新档案一插就 active，等于绕过故事 6 的"必须显式激活"，
-    而旧档案还挂在 is_active 上没人 retire——两条真相立刻分家。
+    默认值方向错了会怎样：新档案一插就 active，等于绕过故事 6 的"必须显式激活"，而线上正在
+    服务的那一套当场被顶掉（要么撞 partial unique，要么在有 active 之前先悄悄成为唯一基准）。
     """
     async with session_factory() as session:
         profile = _profile("newcomer@1536@tplv1")
@@ -142,28 +134,6 @@ async def test_没写_status_的档案落库就是_draft(session_factory) -> Non
         await session.flush()
         await session.refresh(profile)
         assert profile.status == "draft"
-
-
-async def test_归置口径那句_update_只跟着_is_active_走(session_factory, mig8: object) -> None:
-    """工单 026 写死的归置口径，真跑一遍：`is_active=true` → active，其余 → **retired**。
-
-    这里刻意把两行的 status 都先写成 'draft'（迁移当时那一列刚加、默认就是 draft），
-    跑的就是迁移用的**同一个** SQL 对象——不是重新抄一句 CASE。
-    证据边界：`upgrade()` 里那句 `op.execute` 有没有接上，本用例证不了，它由真库
-    `alembic upgrade head` 的实录背书（工单 026 交付记录，验收 1/3）。
-    其余历史行归成 retired 而不是 draft，是因为 draft 的含义是"建好等激活"，
-    而 P2/P3 落下的非 active 行是没在服务的一套。
-    """
-    async with session_factory() as session:
-        session.add(_profile("serving@1536@tplv1", is_active=True, status="draft"))
-        session.add(_profile("history@1536@tplv0", is_active=False, status="draft"))
-        await session.flush()
-        await session.execute(text(str(mig8.backfill_status_sql(_schema()))))  # type: ignore[attr-defined]
-        await session.flush()
-        assert await _statuses(session) == {
-            "history@1536@tplv0": "retired",
-            "serving@1536@tplv1": "active",
-        }
 
 
 async def test_库里_check_约束的名字与_orm_渲染的那一个逐字相同(session_factory) -> None:

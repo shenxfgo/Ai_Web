@@ -57,7 +57,6 @@ _PROFILE_COLUMNS = {
     "card_template_version",
     "distance_fn",
     "status",
-    "is_active",
     "created_at",
     "built_at",
 }

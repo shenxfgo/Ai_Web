@@ -13,7 +13,6 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     CHAR,
     BigInteger,
-    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -37,9 +36,9 @@ class KbIndexProfile(Base):
     __tablename__ = "kb_index_profile"
     __table_args__ = (
         UniqueConstraint("name", name="uq_kb_index_profile_name"),
-        # 三态词表的库内落点（ADR-0013）。不能靠 is_active + built_at 推导：「建好待切」与
-        # 「已退役」在库里同形（都是 NOT is_active 且 built_at NOT NULL），
-        # 推不出来的那一态只能是一列。
+        # 三态词表的库内落点（ADR-0013）。0005 那版想靠 `is_active + built_at` 推导，推不出：
+        # 「建好待切」与「已退役」在库里同形（NOT is_active 且 built_at NOT NULL），
+        # 缺的那一态只能是一列。那根布尔已由 0009 删掉，现在库里只有 status 这一套真相。
         CheckConstraint("status IN ('draft','active','retired')", name="status_allowed"),
         # 「全表至多一行 active」没有自然键列，所以键是表达式本身：命中谓词的行全取同一个值 true，
         # 第二行 active 当场撞唯一约束。见 ADR-0013。
@@ -60,12 +59,10 @@ class KbIndexProfile(Base):
     dimensions: Mapped[int] = mapped_column(Integer, nullable=False)
     card_template_version: Mapped[int] = mapped_column(Integer, nullable=False)
     distance_fn: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'cosine'"))
-    # 档案的状态机（ADR-0013）。`is_active` 从此只是它的镜像、不是第二真相——但双写还没接上：
-    # 027 关 `profile_row(is_active=True)` 那条后门，031 换读侧的尺子并把 `is_active` 删掉。
+    # 档案的状态机（ADR-0013）：读写两侧都只认它。0005 那版还有一条 `is_active` 布尔当过滤位，
+    # 027 关掉写侧、031 换掉读侧、0009 把那一列删了——留着一列没人读的布尔，就是 ADR-0013
+    # 反对的那件"库里两套真相"原地保留。
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'draft'"))
-    is_active: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("false"), default=False
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

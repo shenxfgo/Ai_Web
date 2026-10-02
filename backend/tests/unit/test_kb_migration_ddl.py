@@ -21,6 +21,7 @@ from tests.conftest import BACKEND_ROOT, load_script
 
 MIGRATION = BACKEND_ROOT / "alembic" / "versions" / "0005_kb_card.py"
 MIGRATION_0008 = BACKEND_ROOT / "alembic" / "versions" / "0008_embedding_columns.py"
+MIGRATION_0009 = BACKEND_ROOT / "alembic" / "versions" / "0009_drop_profile_is_active.py"
 
 
 @pytest.fixture(scope="module")
@@ -33,6 +34,12 @@ def mig() -> object:
 def mig8() -> object:
     assert MIGRATION_0008.is_file(), f"迁移文件不存在：{MIGRATION_0008}"
     return load_script("m0008", Path(MIGRATION_0008))
+
+
+@pytest.fixture(scope="module")
+def mig9() -> object:
+    assert MIGRATION_0009.is_file(), f"迁移文件不存在：{MIGRATION_0009}"
+    return load_script("m0009", Path(MIGRATION_0009))
 
 
 class _Result:
@@ -137,3 +144,28 @@ def test_0008_加第二向量列前也要过同一道扩展闸(mig8: object) -> 
     assert "pg_extension" in seen[0]
 
     mig8.require_vector_extension(_Bind(1, []))  # type: ignore[attr-defined]
+
+
+def test_0009_接在_0008_之后而不是另起一条线(mig9: object) -> None:
+    """工单 031 验收 8 定的那条链：`0008` 扩、`0009` 收，两条都在同一条线上。
+
+    期望值是工单字面，不是从文件里反推的。断链的表现不是报错而是**静默不跑**（同 0008 那条）：
+    收缩那一版不在主线上，`is_active` 就一直留在库里，而读侧已经只认 `status`——
+    于是"两套真相"那句 ADR-0013 反对的事，恰恰被我们自己留下来了。
+    """
+    assert mig9.revision == "0009"  # type: ignore[attr-defined]
+    assert mig9.down_revision == "0008"  # type: ignore[attr-defined]
+
+
+def test_0009_的_downgrade_按_status_把镜像补回来(mig9: object) -> None:
+    """回滚那一格必须是**从 status 补**，不是"加一列全 false"。
+
+    收缩迁移的 downgrade 很容易写成 `ADD COLUMN … DEFAULT false` 就完事：列回来了，
+    内容却全空，旧代码（0008 那一世）读到的 active 档案是零行——回滚等于把现状抹掉。
+    0009 收的是 `is_active`，那一刻 `status` 还在（0008 的 downgrade 才删它，顺序在 0009 之后），
+    所以镜像有一个唯一的来源。期望值来自 026 定的双写口径（`is_active` 跟着 `status` 的字面走），
+    不是从迁移实现里抄的。
+    """
+    sql = mig9.restore_is_active_sql("aiweb")  # type: ignore[attr-defined]
+    assert "SET is_active = (status = 'active')" in sql, sql
+    assert '"aiweb".kb_index_profile' in sql, "得打在带 schema 的那张表上"

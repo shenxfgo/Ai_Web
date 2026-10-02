@@ -444,7 +444,8 @@ async def create_draft_profile(session: AsyncSession) -> int:
     3. **撞到的那行是 active → 409**（撞名口径的补集）：复用它等于往线上基准上原地改向量，
        spec 故事 3 那句"重建中不影响线上检索"当场为假。
 
-    `is_active` 不写：027 之后读写两侧都只认 `status`，那一列 031 要删。
+    出生时**只写 `status='draft'`**：0005 那条 `is_active` 在 031 的收缩迁移里已经出清，
+    这一行从出生到退役都只有一条尺子。
     `provider` 读 `embedding_client.EMBEDDING_PROVIDER`，不在这再抄一遍字面（§2.6 注④）。
 
     **必须 commit**：worker 是另一个进程（ADR-0011），未提交的档案行在它眼里不存在，
@@ -717,19 +718,19 @@ def activate_stmts(profile_id: int) -> tuple[Any, Any]:
     那种"库里没有 active"的情形走完。真正兜住"恒为一行"的一直是 partial unique 本身
     （工单口径原话：它是兜底不是实现），这里改的只是别把它当成要实现的东西。
 
-    `is_active` 是**镜像**（026 的双写口径）：两条语句各写各的，所以它的值直接跟着 `status`
-    的字面走，不引第二个真相。这一列 031 删，删之前读侧一律只认 `status`。
+    这里**只写 `status`**：0005 那条 `is_active` 曾经要在这里一起写（026 的双写口径），
+    031 的收缩迁移把它从库里删了，所以"两套真相要怎么对齐"这件事现在没有对象了。
     """
     demote = (
         update(_PROFILE)
         .where(_PROFILE.c.status == "active", _PROFILE.c.id != profile_id)
-        .values(status="retired", is_active=False)
+        .values(status="retired")
         .returning(*[_PROFILE.c[name] for name in _ACTIVATE_FIELDS])
     )
     promote = (
         update(_PROFILE)
         .where(_PROFILE.c.id == profile_id)
-        .values(status="active", is_active=True)
+        .values(status="active")
         .returning(*[_PROFILE.c[name] for name in _ACTIVATE_FIELDS])
     )
     return demote, promote

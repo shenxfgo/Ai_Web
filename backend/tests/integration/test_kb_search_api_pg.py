@@ -5,14 +5,15 @@
 响应里不该出现数据源字段。命中算法本身在 `test_kb_search_pg.py` 那一侧验。
 
 期望值口径：
-- `docs/architecture.md` §7 端点表：read 权、body `{query,datasource_ids[],k}`
+- `docs/architecture.md` §7 端点表：read 权、body `{query,datasource_ids[],k}` 加 P4 的
+  三个检索旋钮（`mode/top_vector/ef_search`，工单 031 接的那一格）
 - `docs/architecture.md` §5.2 (5)：权限过滤在召回这一层就做
 - 工单 006 那把尺：口令与 `connect_user` 不进响应体
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 import pytest
@@ -20,7 +21,10 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.models  # noqa: F401
+from app.models.user import User
 from app.services.kb_service import ActiveProfile
+from app.services.nl2sql import retriever
+from app.services.nl2sql.retriever import RetrievedTable
 from tests.integration.conftest import Account
 from tests.integration.test_kb_cards_pg import _cards, _column, _data_source, _table
 
@@ -187,30 +191,126 @@ async def test_问句空或过长回422(
         assert resp.status_code == 422, resp.text
 
 
-async def test_传P4的检索旋钮时当场422而不是假装收下了(
+async def test_P4的检索旋钮收了_没发明的那个仍拒(
     active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """§7 端点表里那四个向量旋钮 P2 不收，收的方式是拒。
+    """工单 031 之后 `mode / top_vector / ef_search` 收了；`rrf_k` 与 `trgm_threshold` 仍不收。
 
-    静默忽略会留下最难查的一种"没生效"：前端把 `mode=vector` 传上来，接口返回的还是 ILIKE
-    的结果，看上去一切正常。422 直接把话说明白。
+    三条界线各有各的"收了反而更坏"：
+    - `rrf_k` 是**全库融合次序**的常数（§5.2 (3)），进请求体等于让一次调用改写排序规则；
+      spec 故事 27 把它钉在 `.env` 里。
+    - `trgm_threshold` 同一条理由，且它是 (2b) 那一路的分数门槛（P2 起就只取配置值）。
+    - 收的方式是**收下并按它跑**，不是收下就丢：静默忽略会留下最难查的那种"没生效"
+      （前端传 `mode=vector`，接口回的还是 ILIKE 的结果，看上去一切正常）。
+      按它跑的证据在 `test_kb_search_hybrid_pg.py`（ef/维度/三路模式各有一条），这里只钉契约。
     """
-    acct = await login(username="search-forbid", role="member")
-    await _seed(session_factory, owner_id=acct.user_id, name="demo-forbid")
+    acct = await login(username="search-knobs", role="member")
+    await _seed(session_factory, owner_id=acct.user_id, name="demo-knobs")
 
-    for extra in (
-        {"mode": "vector"},
-        {"top_vector": 20},
-        {"ef_search": 64},
-        {"trgm_threshold": 0.3},
-    ):
+    for knob in ({"mode": "keyword"}, {"top_vector": 20}, {"ef_search": 400}):
         resp = await client.post(
-            "/api/kb/search", json={"query": "订单金额", **extra}, headers=acct.headers
+            "/api/kb/search", json={"query": "订单金额", **knob}, headers=acct.headers
         )
-        assert resp.status_code == 422, f"{extra} → {resp.status_code} {resp.text}"
+        assert resp.status_code == 200, f"{knob} → {resp.status_code} {resp.text}"
+
+    for rejected in ({"mode": "semantic"}, {"rrf_k": 10}, {"trgm_threshold": 0.3}):
+        resp = await client.post(
+            "/api/kb/search", json={"query": "订单金额", **rejected}, headers=acct.headers
+        )
+        assert resp.status_code == 422, f"{rejected} → {resp.status_code} {resp.text}"
+
+
+async def test_请求体不给旋钮时结果与给了keyword旋钮逐字相同(
+    active_profile: ActiveProfile,
+    client: AsyncClient,
+    login: Login,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """schema **不带默认值**（已定口径：`top_vector`/`ef_search` 都是 `| None`）。
+
+    roadmap 验收 3 写 `ef_search=64`、§7 的示例写 100——那场冲突的收口方式是"请求体不给就是
+    配置说了算"，所以这里不许有第三条答案（schema 里写死的第三个数）。
+    本机没配向量端点（`unconfigured` 那一格），缺省模式因此就是 keyword（§5.1 的降级判据），
+    于是"不给"与"明说 keyword"必须端出同一份东西。
+    """
+    acct = await login(username="search-nodefault", role="member")
+    await _seed(session_factory, owner_id=acct.user_id, name="demo-nodefault")
+
+    async def _items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+        resp = await client.post("/api/kb/search", json=payload, headers=acct.headers)
+        assert resp.status_code == 200, resp.text
+        return resp.json()["items"]
+
+    plain = await _items({"query": "订单金额"})
+    told = await _items(
+        {"query": "订单金额", "mode": "keyword", "top_vector": 20, "ef_search": 400}
+    )
+    assert [i["table_uid"] for i in plain] == [i["table_uid"] for i in told]
+    assert plain == told, "向量旋钮在 keyword 路上不该改变任何东西——改了就说明它们被当成了分数参数"
+
+
+async def test_换实现只改那一处_端点经缝取实现而不是自己new(
+    active_profile: ActiveProfile,
+    client: AsyncClient,
+    login: Login,
+    session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """工单 031 验收 5 的"换实现"那半：把缝里换掉一份假实现，端点就照着假的答。
+
+    这一条证的正是 031 整片的风险所在——**装配**。`search_preview()` 里那句
+    `_retriever_for(payload)` 是端点侧唯一的取用点；它一旦自己 new 了一份真实现，缝换了它照旧
+    返回真命中，而"换实现只改一行"就是一句空话。这种错法只有真 HTTP 打得出来，所以挂在 pg 这侧；
+    不碰库的那半（实现字面扫描与构造点计数）住在 `tests/unit/test_retriever_seam.py`。
+
+    两次请求用的是**同一份** payload：换缝之前先跑一次，端出的是真卡片的标题，换完再跑一次端出
+    假标题——差别的唯一来源就是被换掉的那一行构造，这排除了"断言本来就空转"。
+    """
+    acct = await login(username="search-swap", role="member")
+    seeded = await _seed(session_factory, owner_id=acct.user_id, name="demo-swap")
+    body = {"query": "订单金额", "datasource_ids": [seeded["ds_id"]], "k": 5}
+
+    class StubRetriever:
+        """只会说一句话的实现：形状照 `Retriever` 协议，内容全是假的。"""
+
+        async def search(
+            self,
+            session: AsyncSession,
+            *,
+            actor: User,
+            question: str,
+            datasource_ids: Sequence[int] = (),
+            k: int | None = None,
+        ) -> list[RetrievedTable]:
+            return [
+                RetrievedTable(
+                    table_uid=seeded["table_uid"],
+                    table_id=999_999,
+                    datasource_id=seeded["ds_id"],
+                    title="假实现的答案",
+                    score_kw=0.0,
+                    matched_term_count=0,
+                    matched_column_count=0,
+                    hits=(),
+                    cards=(),
+                )
+            ]
+
+    async def _titles() -> list[str]:
+        resp = await client.post("/api/kb/search", json=body, headers=acct.headers)
+        assert resp.status_code == 200, resp.text
+        return [item["title"] for item in resp.json()["items"]]
+
+    real = await _titles()
+    # 这里不断言真标题长什么样（卡片标题的渲染格式归 008 的用例管），只要求两件事：
+    # 换缝之前端出来的是**真查到的东西**，且它不是假实现那句自报家门。
+    assert real, "真实现这一发就该有命中，否则下面的对比是空的"
+    assert real != ["假实现的答案"], "换缝之前就出现了假答案——端点没走缝"
+    monkeypatch.setattr(retriever, "_retriever_for", lambda payload: StubRetriever())
+    assert await _titles() == ["假实现的答案"]
 
 
 async def test_未登录回401(client: AsyncClient) -> None:

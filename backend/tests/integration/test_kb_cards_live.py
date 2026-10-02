@@ -178,8 +178,8 @@ async def test_验收4_未配向量端点时卡片照落_embedding_为_NULL(
     )[0]
     assert row["total"] == row["nulls"] == CARDS
 
-    # 尺子是 `status`（ADR-0013），不是那条镜像列 `is_active`——工单 027 之后同步链路上
-    # 没有任何代码写它了，还按它断言就等于断"夹具没写的那一列是空的"。
+    # 尺子是 `status`（ADR-0013），不是 0005 那条镜像列——027 关掉写侧、031 的收缩迁移（0009）
+    # 把它从库里删了，今天库里只有 `status` 一列能回答"哪一套在服务"。
     profiles = await _rows(
         session_factory,
         "select count(*) as n from \"{s}\".kb_index_profile where status = 'active'",
