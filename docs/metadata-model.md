@@ -350,8 +350,25 @@ embedding_1024 vector(1024) NULL
                              -- 列宽 1024 是**写死的**（`pgvector` 的列宽是类型的一部分，
                              -- `ALTER TYPE` 改不了它——这正是 ADR-0012 选"加列"而不是"改列"的理由），
                              -- 所以 `AIWEB_EMBEDDING__DIMENSION` 的语义从"决定列宽"降级成
-                             -- "**声明这次要读哪一套维度**"；"维度 → 列名"的映射只住一个纯函数（归 031）
+                             -- "**声明这次要读哪一套维度**"；"维度 → 列名"的映射只住一个纯函数
+                             -- **as-built(P4-029)：它已经出生了，住处是 `app/core/vector_columns.py`
+                             -- 的 `vector_column_for()`**（不是"归 031"——写侧等不了读侧）。
+                             -- 钉它只有一处的不是纪律自觉而是一条用例：
+                             -- `tests/unit/test_vector_columns.py::test_列名字面在源码里只出现在映射与列定义本身`
+                             -- 扫 `app/` 与 `alembic/versions/`，allowlist 就是下面那三行出现的地方
+                             -- （**它只扫得到 `embedding_1024` 这个字面**：`embedding` 与 ORM 属性
+                             -- 同形，裸 grep 会在每一处 `card.embedding` 上误报。`1536 → embedding`
+                             -- 那一半的机械代偿是 `core/vector_columns.py` 的 `ALL_VECTOR_COLUMNS`
+                             -- ——它从那份映射**投影**出来，`kb_card_upsert()` 用它一次洗掉**全部**
+                             -- 向量列，因此"映射长了第三格而写入只跟着第一格"会红在
+                             -- `tests/unit/test_kb_upsert_sql.py::test_重建把向量清成NULL等下一次灌`
+                             -- ——那条的期望值取自 ORM 那张表里 `Vector` 类型的列，不是取自映射）
 embedded_at timestamptz NULL
+                             -- as-built(P4-029)：这一格第一次被写成**非 NULL**。此前它唯一的写入点
+                             -- 是 `kb_card_upsert()` 里那个显式的 NULL（改文本就把向量与它一起洗掉），
+                             -- 所以"有写入点"这句话在 029 之前是真的、在 029 之后才是有用的。
+                             -- 它只与向量列在**同一条 UPDATE** 里落（`kb_service.card_vector_update()`）：
+                             -- "有向量但时间戳是 NULL"与"有时间戳但列是 NULL"两种谎形都构造不出来
 sync_job_id / created_at / updated_at / deleted_at
 ```
 
@@ -380,6 +397,8 @@ id / name UNIQUE('text-embedding-3-small@1536@tplv1')
 provider text / model text / dimensions int
 card_template_version int / distance_fn text DEFAULT 'cosine'
 is_active bool / created_at / built_at
+                             -- as-built(P4-029)：`built_at` 有写入点了（`mark_profile_built()`，
+                             -- 只由 reindex 那颗作业在 `success`/`partial` 时盖）；见本节末注第 2 条
 status text NOT NULL DEFAULT 'draft'   -- as-built(P4-026，迁移 0008)：三态词表 draft|active|retired
   CHECK (status IN ('draft','active','retired'))
   UNIQUE WHERE status = 'active'       -- partial unique（表达式键 (status='active')），"至多一枚 active"由库背书
@@ -445,6 +464,56 @@ status text NOT NULL DEFAULT 'draft'   -- as-built(P4-026，迁移 0008)：三�
 >    三元组**每次现比、不缓存**，对齐 safety §4.1 那条 `readonly_enforced` 的纪律。
 > 5. `is_active` 这一列本片**不删也不写**：026 已定收缩归 031，本片只保证写侧不再生产它，
 >    所以它此刻连"镜像"都算不上——库里那一行的真值只由迁移 0008 的归置结果背书。
+>
+> **as-built(P4-029)**（2026-10-02，工单 029；上面第 1 条那句"出生入口归 029 的 reindex"从此是既成事实）
+>
+> 1. **出生入口真的在了，应用侧的插入点从"零处"变成"一处"**：`kb_service.create_draft_profile()`，
+>    唯一调用点是 `POST /api/kb/reindex`。第 1 条那句"应用侧没有任何代码路径往这张表插行"从今天起
+>    要连着它一起读：**一处**是有意的（它就是决策 ⑤ 说的那个唯一入口），仍然不许有第二处。
+>    三条口径各自有用例钉着：embedding 四格（`BASE_URL`/`API_KEY`/`MODEL`/`DIMENSION`）没配齐
+>    → 400 且**不建 draft 空壳**（工单字面写作"三键"，`EmbeddingGroup.configured` 实际判四格，
+>    文案已按四格点名；留一行永远灌不完的 draft，
+>    后果是 030 看得见它并诱导人去激活一套零结果的基准）；撞 `uq_kb_index_profile_name` → **复用**
+>    那一行、回同一个 id、不抬 409（档案是**全局**的，`profile_name()` 里没有 datasource，
+>    "两个源共用一套基准"是正常状态）；撞到的那一行是 `active` → **409**（复用它等于原地改线上基准，
+>    spec 故事 3 那句"重建中不影响线上检索"当场为假）。并发撞名走 `IntegrityError` 那一条分支，
+>    只认这个约束名，与 `enqueue` 认 `ux_sync_running` 同一条纪律。
+>    它**必须 commit**：worker 是另一个进程（ADR-0011），未提交的档案行在它眼里不存在。
+> 2. **`built_at` 这一格第一次有写入点**：`kb_service.mark_profile_built()`，只在 `run_sync` 收尾处、
+>    且只当这颗作业是 reindex（`sync_jobs.reindex_profile_id` 非空）且终局是 `success` 或 `partial`
+>    时执行（工单已定口径：`partial` 也盖，否则 030 那句"未跑完不许激活"永远为真——炸掉的表已经
+>    落进那颗作业的 `errors[]`，不在这里重判）。`failed` 不盖。那条 UPDATE **只动这一格**，
+>    `status` 不在射程内（单测钉着）：draft→active 是 030 那道门槛的权力，同步链路不许代劳。
+>    `is_active` 依旧不写，第 5 条那句话本片一字不改。
+> 3. **三元组跟着档案走，不跟 settings**：写哪一根向量列、发给端点的 `expected_dimension`、
+>    以及**请求体里的那个 model 名**，读的都是靶那一行——`kb_service.read_vector_target()` 一次取
+>    `dimensions` + `model` 两格，编成 `VectorTarget`（列名经 `core/vector_columns.py` 那份唯一映射，
+>    `model` 原样带着走；编排层只从 settings 拿"端点在哪、用什么凭证"两格）。
+>    这一格里 `model` 是双轴审查补上的：029 初版只把 `dimensions` 从档案读，`model` 仍从
+>    `get_settings().embedding` 拼请求体，于是同一颗作业**一半认档案、一半认配置**——改了模型名再
+>    索引一轮时问的是新模型、按旧档案的宽度校验，两边恰好同宽就静默灌进一批来自另一个语义空间的
+>    向量，库里看不出任何异常。闸内证据是 `test_kb_reindex_live.py::test_请求体问的是档案那一行的模型名而不是配置当前那个`
+>    （替身按 model 名回话、未知名字当场 400，所以"读 settings"那个错法在那里是 `partial` 不是静默）。
+>    027 那道 `card_build` 守卫只管**普通同步**，reindex 那颗作业在它眼里是
+>    "自带靶的一轮"，所以 `test_reindex_的卡片挂在_draft_那一行_哪怕跑之前_配置_又改了` 里
+>    入队之后把配置清空，卡片照旧挂在 draft 上——**改的是配置，不是这颗作业的靶**。
+> 4. **`embed` 档从"一帧说明"变成"一表一帧真计数"**：`sync_service._run_embed_stage()` 逐表
+>    发 HTTP、逐表提交、逐表发帧，`payload` 是 `{table, embedded}`。`_embed_skipped()` 里
+>    `embedding_not_implemented` 那一支随本片删除（它自 017 写下以来一直在说"这一档还没实现"，
+>    从今天起那句是假话），回落帧只剩"未配置"那一支。帧数与口径的差异见 §2.8 注 ⑥ 的 as-built。
+> 5. **失败分两档，加上本片补的第三档**：单表端点失败（5xx/连不上/超时）→ 按表进 `errors[]`、
+>    终局 `partial`、其余表向量照常在场；维度不符 → 往上抬、整颗 `failed`、`built_at` 不盖
+>    （它重试一万次还是那个维度）。本片补的那一档是**"reindex 那颗作业即使没配端点也走真灌那一路"**：
+>    它的存在理由就是给那套新档案灌向量，灌不了就是没完成使命，静默 `skipped` 会留下一行
+>    `built_at` 已盖、零向量的 draft，而 030 那道"卡片行数齐"拦不住它——所以
+>    `EmbeddingNotConfigured` 与维度符同档，整颗 `failed`。这条是工单字面之外的补充，
+>    写在这里是因为它改了"三键为空"在两条链路上的表现（普通同步仍回落到 `{skipped:true}`）。
+> 6. **写侧不需要给 asyncpg 注册向量编解码器**（本轮实测，031 读侧要自己判）：
+>    `pgvector.sqlalchemy.VECTOR` 的 `bind_processor` 自己把 `list[float]` 渲染成带方括号的字面量，
+>    异步驱动直接认；读回来的是**文本**形态。另两条同轮实测的事实：`vector` 是 **float4**，
+>    双精度点存进来会先被削成约 7 位有效数字（用例的比对容差因此是 `1e-6` 相对误差，见
+>    `tests/integration/test_kb_reindex_live.py` 文件头）；两根列各自宽度写死，所以"往错的列写"
+>    会被库当场拒掉——逐字节比旧列那一条是**双保险**而不是唯一防线，工单要的就是这一格。
 
 ### 2.7 问答
 
@@ -544,6 +613,18 @@ INDEX (job_id, seq)             -- as-built(P3-017)：不单独建，见下方 �
 >    `card_build`、`embed`、`done`。所以 `card_build` 那一帧的 `cards` 是 **0**：它发在
 >    `sync_cards()` 之前，那一刻一张卡都还没落成，卡片数从 `embed` 帧起才是实际条数。
 >    拿最终卡片数去断 `card_build` 帧会把这条口径记反（`test_sync_events_live.py` 钉的就是 `[0,0,0,12,12]`）。
+>    > **as-built(P4-029)：这五处"位置"没变，但位置数不等于帧数。**`embed` 那一个位置从今天起
+>    > 是**逐表一帧**（`payload={table, embedded}`；本轮一张卡都没写时仍发恰好一帧 `{embedded:0}`，
+>    > 少一帧进度条就以为这一档没跑过）。于是上面那句"卡片数从 `embed` 帧起才是实际条数"要连着
+>    > `counters` 一起读：`counters.done` 在 embed 那几帧上是**平的**（已经等于 `total`），
+>    > 因为 `_Progress` 的分母是"本轮抽成的对象数"，灌向量不新增对象；逐表真涨的那个数在
+>    > `payload.embedded` 里。工单 029 验收 4 的字面写的是"`done` 单调上涨到 `total`"，
+>    > 实际口径是"单调**不降**、到 embed 时已等于 `total`"——这条差异按字面追下去会得出
+>    > "embed 帧没发"的错误结论，所以写在这里而不是埋在用例注释里。
+>    > 另一半后果：`sync_jobs.progress` 在 embed 段不动（它就是 `done/total` 折算的，而分母在
+>    > discover 那一刻就定死了），所以 `card_build` 与 `embed` 那几帧上它**已经是 100%**——
+>    > 一轮真灌完向量的作业后半程进度条一直满格是正常的，别拿它判断"向量灌了几张表"，
+>    > 那一格的答案只在 `payload.embedded` 里。
 > ⑦ `seq` 由写侧在**同一事务**里取 `max(seq)+1`（`sync_service._add_event`），`UNIQUE` 只是兜住
 >    并发的那一层。不需要序列号分配器：同一个作业同一时刻只有一个 worker 在写它（§6 的 claim）。
 > ⑧ `NOTIFY` 与事件行**同事务**发出。PG 的事务型 `NOTIFY` 到 COMMIT 才投递，所以"被叫醒"天然蕴含
@@ -742,6 +823,12 @@ DELETE FROM aiweb.meta_relation
 > 6. **`embed` 档在 P3 是 `skipped`**。本机 embedding 三键（`BASE_URL`/`API_KEY`/`MODEL`）全空，
 >    `settings.embedding.configured` 为 False，事件流里该档带 `skipped=true` 与原因，
 >    向量回填整块归 P4。验收 5 的注入点因此改用 `card_build`（008 的渲染器逐表调用）。
+>    > **as-built(P4-029)：这句到 P4 为止。**`embed` 档从今天起只在**embedding 没配齐**时才发
+>    > （`EmbeddingGroup.configured` 判的是四格：`BASE_URL`/`API_KEY`/`MODEL`/`DIMENSION>0`，
+>    > 上面那句 P3 原文只点了三格）；配了端点（真端点或 §2.3 那个替身）就逐表真灌。
+>    > 本节上面 §2.6 末注第 4、5 条是它的现行口径，`_embed_skipped()` 里那句
+>    > "这一档还没实现"（`embedding_not_implemented`）随本片删除。
+>    > **但 reindex 那颗作业例外**：它没配齐时不走这一支，整颗 `failed`（第 5 条补的那一档）。
 > 7. **`?force=true` 本片接**（上表第 5 条的那笔账到此闭环）：端点加 `force` 参数透传
 >    `run_sync(force=)`，同时把 `SCOPE_REMEDIES` 第三条文案换回"admin 用 `?force=true` 覆盖上限"，
 >    §6 表 / 常量 / `test_extract_mysql_client.py` 三处一起动。

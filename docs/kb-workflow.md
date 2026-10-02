@@ -235,7 +235,23 @@ token 估算**不引真 tokenizer 到写入路径**：`CJK 字符数×1 + ASCII 
   > **订正(P4 决策 ⑥，2026-10-02)：本行原写 `POST /kb/rebuild`，旧名废弃、不留别名**——`rebuild`
   > 读起来像"把现有那套档案重灌一遍"，而 P4 的语义是"产一枚 draft 档案再全量重建"（档案的唯一出生入口）。
   > 两个名字对不上时，读代码的人会去找那个不存在的路由。**行内那两个 phase 名不动**：
-  > `sync_jobs.phase` 的九值词表不加值（决策 ②），`embed` 那一档在 029 之前仍是 `skipped=true`。
+  > `sync_jobs.phase` 的九值词表不加值（决策 ②）。
+  > **as-built(P4-029)：本行的三处字面都落地了，其中两处口径变了。**
+  > ① 路径是 `POST /api/kb/reindex`（`endpoints/kb.py`），体只有 `datasource_id`（`extra="forbid"`，
+  > 多一个键就是给调用方多开一个入参）；② 202 回的是 `{job_id, profile_id}` 两颗 id，**没有任何计数**
+  > （作业还在队列里，计数只能是编的，016 的口径）；③ 鉴权是 **owner 档**（`get_owned`，与
+  > `POST /api/sync/jobs` 同一把尺），不是本行原写的 admin——reindex 会派 worker 拿这个源的凭据去连库，
+  > 还要烧真端点的 embedding 额度，'global' 档的人不该有这两样能力。
+  > 顺序是"先建档案、后入队"：反过来留的是队列里一颗**没有靶**的作业，worker 领到它就按普通同步跑
+  > （`reindex_profile_id` 为 NULL），把"重建"悄悄做成"同步"。档案名冲突复用同一行，撞 active 那行则 409。
+  > 端点与返回形状另见 architecture §7 的 as-built(P4-029)。
+  > ④ `embed` 那一档**不再是 `skipped=true`**：`_run_embed_stage` 逐表把卡片文本送去端点、
+  > 用一条 `UPDATE` 同时写向量列与 `embedded_at`（`kb_service.card_vector_update()`），一表一帧
+  > 负载 `{table, embedded}`。失败分两档——单表调用失败进 `errors[]` 且作业落 `partial`；
+  > 维度与档案声明不符则整颗作业 `failed`（一套档案里混两种宽度，检索那一路就没有可比的意义）。
+  > 未配置端点时仍走 `_embed_skipped()`，这是"运行期不调 embedding 端点"那一半的可插拔。
+  > 另有一档是本片加的口径：**reindex 作业即使键没配齐也不 skip**，而是整颗 `failed`——
+  > 有人明确点过"重建"，静默跳过等于给他一颗假的绿灯。
 - 换 embedding 模型：新建 `kb_index_profile`（draft）→ 全量重建 → `POST /api/kb/profiles/{id}/activate`
   原子切换（同事务把旧 active 置 retired）。维度不同时要**新表/新列**（影子列/影子表），
   激活后旧 profile 向量仍在，可回滚。
@@ -254,7 +270,14 @@ token 估算**不引真 tokenizer 到写入路径**：`CJK 字符数×1 + ASCII 
   > **订正(P4-0008/ADR-0012)：这半句只对第一列成立。**`DIMENSION>0` 是 `0005` 建 `embedding`
   > 那列的硬依赖，而 0008 的第二列 `embedding_1024` 是**字面量 1024**、跟着这个键无关；
   > 0005 那道维度闸本身一字未动。所以从今天起这个键的语义是"**声明读哪一套维度**"，
-  > 不再兼任"决定列宽"——列宽由迁移里的字面量决定，读哪一列由 031 的那个唯一纯函数决定。
+  > 不再兼任"决定列宽"——列宽由迁移里的字面量决定，读哪一列由那个唯一纯函数决定。
+  > **as-built(P4-029)：这个函数已经出生了，住处是 `app/core/vector_columns.py::vector_column_for()`**，
+  > 不是"归 031"——写侧（embed 回填要知道该往哪一列写）等不了读侧。全仓"维度→列名"的翻译只有这一处，
+  > 机械闸门是 `tests/unit/test_vector_columns.py` 那条 allowlist 用例（扫 `app/` 与 `alembic/versions/`，
+  > 列名字面只许出现在映射本身与列定义/迁移里）；031 复用同一个函数，不再开第二份。
+  > 同文件另有一个 `ALL_VECTOR_COLUMNS`，它是那份映射的**投影**而不是第二份清单——§5 那句
+  > "改文本就把向量洗成 NULL"要一次洗掉**全部**向量列，点名只洗一根的写法在 0008 之后
+  > 等于对第二列说"过期也算有效"（P4-029 双轴审查·规格轴第一条）。
 
 ## 8. 枚举 distinct 值采样
 
