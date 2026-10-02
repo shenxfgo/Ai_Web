@@ -667,6 +667,7 @@ Success: no issues found in 54 source files
 | 单表失败 → `partial` 且其余表向量真在场 | 同文件 `test_单表embed失败时落partial其余表的向量真在场` | 失败注入在**替身侧**（`--fail-on`），不是给编排加 test-only 形参；查库断"炸那张 NULL、另外两张非空" |
 | 维度不符 → 整颗 `failed` 且不盖 `built_at` | 同文件 `test_端点回的宽度与档案不符时整颗作业failed且不盖built_at` | 替身按 model 名回 999 维，失败信息里两个数同时在场 |
 | 请求体问的是**档案那一行的 model**，不是配置当前那个 | 同文件 `test_请求体问的是档案那一行的模型名而不是配置当前那个` | 入队后把 `MODEL` 换成替身不认的名字、`DIMENSION` 留在同宽：宽度那一路分不出两侧，只有名字能。读 settings 的错法在替身侧是 400 → 终局 `partial`（本轮变异实测过：把客户端换回 `get_settings().embedding` 只有这一条红） |
+| 换基准的**三态流转**：切换、回滚、幂等、四种前置各回各的码 | `tests/integration/test_kb_activate_pg.py`（16 条）+ `test_kb_activate_endpoint_pg.py`（8 条） | 前者打 service 那条缝，逐条断的是**库里的 active 计数**而不是返回码；后者走真 HTTP 真鉴权，钉 admin-only 那一档与错误 envelope 里点名的源名。切换那条做过变异：让它在切换后把新档案的向量清空 → 只有"两根向量列内容未变"那一条红 |
 
 **留白（必须真端点，闸内造不出语义）**：
 
@@ -683,7 +684,8 @@ Success: no issues found in 54 source files
 | 2 | `POST /api/kb/reindex {datasource_id}` → 记下 `job_id`/`profile_id`，按 §1.7 那条命令起 worker | 202 两键齐；库里多一行 `status='draft'`、`built_at IS NULL`；active 那一行逐格不变 | 未跑（闸内已证同一形状，差真端点） |
 | 3 | SSE 追这颗作业：`GET /api/sync/jobs/{job_id}/events?cursor=0` | `embed` 段**一表一帧**，`payload` 是 `{table, embedded}` 且 `embedded` 逐表上涨、全程没有 `skipped` 键 | 未跑（同上） |
 | 4 | 跑完查库：`SELECT count(*) FILTER (WHERE embedding IS NOT NULL), count(*) FROM kb_card WHERE index_profile_id=:draft` | 非空数 = 该档案下的卡片数（真端点不丢发的话） | 未跑 |
-| 5 | `POST /api/kb/profiles/{id}/activate` → 再问一次 §3 那句问句 | 只有一个 active；`used_profile` 换成新档案；旧向量列仍在（可回滚） | 归 **030**，本片没有这条端点 |
+| 5 | `POST /api/kb/profiles/{id}/activate` → 再问一次 §3 那句问句 | 200 回 `{activated, retired}` 两格；库里 `count(*) WHERE status='active'` 恒为 1；旧向量列仍在（可回滚） | 未跑（030 已交付这条端点，闸内已证同一形状；`used_profile` 那一格要等 032 的响应契约） |
+| 6 | 换一个 `member` 身份再发同一条请求 → 然后把基准切**回**旧那套 | 前者 403 `forbidden` 且库里三态一个字没动；后者 200、`activated` 是旧那套、库里仍只有一个 active，且两根向量列的内容与切换前逐字节相同 | 未跑（同上，闸内 `test_kb_activate_endpoint_pg.py` + `test_上线与回滚都不改两根向量列里的内容` 各钉一半） |
 
 ---
 
