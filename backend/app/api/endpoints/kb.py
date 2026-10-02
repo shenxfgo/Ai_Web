@@ -1,6 +1,6 @@
-"""知识库接口：卡片读取 + 检索预览 + 重建基准（reindex）。
+"""知识库接口：卡片读取 + 检索预览 + 重建基准（reindex）+ 上线基准（activate）。
 
-`/kb/reindex` 是工单 029 交付的（本节下面那条），`/kb/profiles/{id}/activate` 归 030。
+`/kb/reindex` 是工单 029 交付的，`/kb/profiles/{id}/activate` 是工单 030 交付的。
 architecture §7 原写的旧名 `/kb/rebuild` 已被 P4 决策 ⑥ 废弃，不留别名。
 `/kb/status` 也是 §7 承诺项，但至今无工单认领（P3 收口记进无主账，P4 spec 不接手）。
 这里都不放空壳——一个返回 501 的端点只会让前端以为功能存在。
@@ -11,10 +11,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.deps import get_current_user, get_db, get_job_queue
+from app.deps import get_current_user, get_db, get_job_queue, require_admin
 from app.models.user import User
 from app.schemas.kb import (
+    KbActivateOut,
     KbCardOut,
+    KbCardProfileOut,
     KbReindexAccepted,
     KbReindexRequest,
     KbSearchOut,
@@ -83,3 +85,46 @@ async def reindex(
     profile_id = await kb_service.create_draft_profile(db)
     job_id = await queue.enqueue(ds.id, actor.id, reindex_profile_id=profile_id)
     return KbReindexAccepted(job_id=job_id, profile_id=profile_id)
+
+
+def _profile_out(summary: kb_service.ProfileSummary) -> KbCardProfileOut:
+    """`ProfileSummary` → 响应模型：一格一格列出来，不 `model_validate` 整行。
+
+    ORM 行里还有 `provider`/`distance_fn`/`created_at`/`built_at`，整行倒出来就等于让
+    "上线一套档案"顺带漏出它的建档案时钟（`KbCardOut` 不整行倒出 `kb_card` 同一条理由）。
+    """
+    return KbCardProfileOut(
+        id=summary.id,
+        name=summary.name,
+        model=summary.model,
+        dimensions=summary.dimensions,
+        card_template_version=summary.card_template_version,
+    )
+
+
+@router.post("/kb/profiles/{profile_id}/activate")
+async def activate_profile(
+    profile_id: int,
+    actor: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> KbActivateOut:
+    """把这套档案上线，同刻把原先生效的那套退役（工单 030 / spec 故事 5、6、19）。
+
+    鉴权 **admin-only**（`docs/architecture.md` §7 端点表那一行的"admin"列）。这是仓库第一个
+    按角色判的写端点，理由是它没有资源可判：`/sync/jobs` 与 `/kb/reindex` 判的是"这个源是不是
+    你登记的"，而 activate 换的是**全库**的检索基准——它一改，所有人问出来的结果都变。
+    工单 030 把这一格列为"待认的一格"并写了默认 admin-only，本轮按默认落，差异记进交付记录。
+
+    成功与失败都在 service 那一层（`kb_service.activate_profile`）：状态机、`built_at` 那道门、
+    卡片行数那把尺。这一层只做两件事——把身份换成 403、把 `AppError` 交给全局 envelope
+    （404 `not_found` / 400 `profile_not_built` / 400 `profile_cards_incomplete`）。
+    不在这里再判一次权限或再包一层 try：那会把"库里只有一行 active"这件事的守门人变成端点自己。
+
+    **不发事件、不入队**（工单已定口径 / ADR-0010）：`sync_job_event` 是作业进度的真相，
+    一次切换不是作业进度。前端要"哪套在服务"就读这个响应体的 `activated`，别去订阅一条不存在的事件。
+    """
+    outcome = await kb_service.activate_profile(db, profile_id=profile_id)
+    return KbActivateOut(
+        activated=_profile_out(outcome.activated),
+        retired=None if outcome.retired is None else _profile_out(outcome.retired),
+    )

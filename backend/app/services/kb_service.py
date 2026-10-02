@@ -27,11 +27,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import (
     NotFound,
+    ProfileCardsIncomplete,
+    ProfileNotBuilt,
     ReindexEmbeddingMissing,
     ReindexMatchesActive,
     VectorColumnMissing,
 )
 from app.core.vector_columns import ALL_VECTOR_COLUMNS, vector_column_for
+from app.models.datasource import DataSource
 from app.models.kb import KbCard, KbIndexProfile
 from app.models.meta import (
     MetaColumn,
@@ -314,6 +317,9 @@ _META_COLUMN = cast("Table", MetaColumn.__table__)
 _META_INDEX = cast("Table", MetaIndex.__table__)
 _META_INDEX_COLUMN = cast("Table", MetaIndexColumn.__table__)
 _META_RELATION = cast("Table", MetaRelation.__table__)
+# 只为 030 那句"detail 里点得出那个源的全名"而存在：`name` 是全局唯一的那一列（§2.2），
+# 也是 `docs/kb-workflow.md` 直接当知识库目录名用的那一列，所以点它才认得出来。
+_DS = cast("Table", DataSource.__table__)
 
 # 每轮同步都重写的正文列。`index_profile_id` **有意不在这里**：doc_uid 里已经拌了它，
 # 放进 set_ 就等于允许一条 upsert 把卡片从旧 profile 搬到新 profile，
@@ -509,6 +515,291 @@ def _accept_existing_profile(existing: RowMapping, *, name: str) -> int:
             "想给现有卡片补向量就跑一次普通同步（四键配齐且三元组一致时它会真写完 embed 档）。",
         )
     return int(existing["id"])
+
+
+# ============================================================ 档案的上线（工单 030 / ADR-0013）
+#
+# 027 关掉同步链路自己长基准那条后门、029 把出生入口收进 reindex，这一节收最后那道门：
+# "上线"只能走 `activate_profile`。库里 active 恒为一行不是靠这里的分支拦出来的，而是
+# `ux_kb_index_profile_active` 那把 partial unique 拦的（spec 故事 1：由库拒，不由代码判重）。
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileSummary:
+    """切换前后各一行的摘要：id + name + 三元组（§2.6 `profile_name()` 的那三段）。
+
+    带三元组而不只带 id：`docs/architecture.md` §7 那行 activate 要回的是"档案摘要"，
+    而前端/诊断看"我刚上线的是哪套基准"看的就是这三格——只看 id 还得再查一次库。
+    """
+
+    id: int
+    name: str
+    model: str
+    dimensions: int
+    card_template_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class ActivateOutcome:
+    """`activate_profile()` 的返回：`{activated, retired}`，`retired` 在没有旧基准时是 `None`。
+
+    `None` 而不是"零值摘要"：库里一行 active 都没有时的上线（第一次上线、或 P4 之前只有回填出来的
+    retired 行）确实没有"被换下去的那一行"，编一个出来就等于给响应体里塞一件库里没有的事。
+    """
+
+    activated: ProfileSummary
+    retired: ProfileSummary | None
+
+
+_ACTIVATE_FIELDS: Final = ("id", "name", "model", "dimensions", "card_template_version")
+
+
+def _summary(row: RowMapping) -> ProfileSummary:
+    return ProfileSummary(
+        id=int(row["id"]),
+        name=str(row["name"]),
+        model=str(row["model"]),
+        dimensions=int(row["dimensions"]),
+        card_template_version=int(row["card_template_version"]),
+    )
+
+
+# ================================================== 卡片行数那把尺（工单 030 已定口径 / 决策 9）
+#
+# 只校行数，**不校 `embedding IS NOT NULL`**（spec 故事 5）：哪些表 embed 失败由那颗作业的
+# `errors[]` 说，不由上线门槛说。门槛管的是"切过去会不会有源静默缺席"，不是"向量好不好看"。
+
+_SCALE_KINDS: Final = ("table", "table_columns")
+
+
+@dataclass(frozen=True, slots=True)
+class MissingCardSource:
+    """一个"当前 active 在那儿有卡、目标档案还没建齐"的源。"""
+
+    datasource_id: int
+    required: int
+    actual: int
+
+
+def missing_card_sources(
+    *,
+    required: Mapping[int, int],
+    active: Mapping[int, int],
+    target: Mapping[int, int],
+) -> list[MissingCardSource]:
+    """纯比较：三份"每源表数"进来，缺的那些出去（工单 030 验收 5 的判据）。
+
+    三个参数字典都按 `datasource_id` 索引，值是按表去重后的表数：
+    - `required`：该源 `meta_table` 里非陈旧表数（应建）。
+    - `active`：**当前生效**那套档案在各源实有的表数——它的键集就是"整档案激活"要比的那些源。
+    - `target`：要上线的那套档案在各源实有的表数。
+
+    比的是 `active` 的键集而不是 `required` 的键集（决策 9 的字面是"源集合 ⊇ 当前 active
+    有卡片的源集合"）：登记了但从没同步过的源不在检索面上，把它一起算进来，第一次上线
+    就会被一个跟自己无关的源挡在门外。反过来少算的那一半才是真事故——全局档案切过去以后，
+    那个源在向量路里**静默缺席**，正是 `docs/architecture.md` §5.2 (1) 列的最坏失效形状。
+
+    只判 `actual < required`，`actual > required` 放行。"行数齐"的字面是"相等"，而这一格收窄是
+    有意的：多出来的那几张只能来自**已经变陈旧**的表（`required` 会随同步掉下去），
+    它不构成静默缺席；按相等拦就会把"某个源删过一张表"变成上线不了，而那批卡本来就该留着
+    （验收 3 要旧档案的卡一张都不动）。留一行日志级别的信息都比把人挡在门外便宜。
+    """
+    missing: list[MissingCardSource] = []
+    for datasource_id in sorted(active):
+        want = required.get(datasource_id, 0)
+        have = target.get(datasource_id, 0)
+        if have < want:
+            missing.append(
+                MissingCardSource(datasource_id=datasource_id, required=want, actual=have)
+            )
+    return missing
+
+
+def required_card_count_stmt() -> Any:
+    """每个源**应建卡片的表数** = 该源 `meta_table` 里 `is_stale = false` 的行数。
+
+    陈旧表不参与（工单 030 已定口径点名 `app/models/meta.py` 的 `is_stale`）：源库已经没这实体了，
+    本轮同步不给它建卡，`sync_service` 那句"只给本轮真的落成了的表建卡"是同一件事的两面。
+    `is_hidden` **不是**卡片过滤器——它是人工列（§3），隐藏表照样出卡，所以尺子里也不减它。
+    """
+    return (
+        select(_META_TABLE.c.datasource_id, func.count().label("tables"))
+        .where(_META_TABLE.c.is_stale.is_(False))
+        .group_by(_META_TABLE.c.datasource_id)
+    )
+
+
+def card_count_stmt(profile_id: int) -> Any:
+    """某套档案在每个源上**实有的表级去重行数**。
+
+    `count(DISTINCT table_id)` 而不是 `count(*)`：一张宽表按 §6 切成主卡 + 若干
+    `table_columns` 切片（`doc_uid` 里拌了 `seq`），卡片行数会比表数大，于是"只重建了一张宽表、
+    别的源一张没补"的档案能靠段数凑够行数绿过去。`test_只重建了宽表那一段的_draft_按表去重算缺`
+    就是这一格的反证。
+
+    `deleted_at IS NULL`：软删的卡对检索已经不存在了，不能拿它凑数。
+    `kind IN ('table','table_columns')`：`term` 卡不挂在表上（`table_id` 可空），
+    `count(DISTINCT ...)` 会跳过 NULL，所以它既不算实有、也不影响别的表。
+    """
+    return (
+        select(_CARD.c.datasource_id, func.count(func.distinct(_CARD.c.table_id)).label("tables"))
+        .where(
+            _CARD.c.index_profile_id == profile_id,
+            _CARD.c.kind.in_(_SCALE_KINDS),
+            _CARD.c.deleted_at.is_(None),
+        )
+        .group_by(_CARD.c.datasource_id)
+    )
+
+
+async def _tables_per_source(session: AsyncSession, stmt: Any) -> dict[int, int]:
+    rows = (await session.execute(stmt)).all()
+    return {int(row[0]): int(row[1]) for row in rows}
+
+
+async def _source_names(session: AsyncSession, ids: Sequence[int]) -> dict[int, str]:
+    """点名要用的那一列：`data_sources.name`（§2.2 全局唯一，也是 §6 直接当目录名用的那一列）。
+
+    放在"已经决定要拒绝了"之后单独查一次，而不是 JOIN 进三条计数语句里：JOIN 会让
+    `count(DISTINCT …)` 的分组多上一列，而点名只需要那几个 id——这次查询只在失败路径上发生。
+    """
+    rows = (await session.execute(select(_DS.c.id, _DS.c.name).where(_DS.c.id.in_(ids)))).all()
+    return {int(row[0]): str(row[1]) for row in rows}
+
+
+async def _check_cards_complete(
+    session: AsyncSession, *, profile_id: int, target_name: str, active_id: int | None
+) -> None:
+    """整档案卡片行数前置（工单 030 验收 2/5）：不齐就 400，并点名那个源与两个数。
+
+    `active_id is None` 时直接放行：库里没有生效档案就没有"正在服务检索的源集合"，
+    那正是第一次上线的形状（0008 归置之后 P2/P3 的历史行是 retired，active 那一格是空的）。
+    三条只读语句各查一次、不 JOIN：每条都能被单独读懂，而 JOIN 出来的形状里
+    "陈旧表不进尺"和"按表去重"这两条会糊在同一条 SQL 上。
+    """
+    if active_id is None:
+        return
+    required = await _tables_per_source(session, required_card_count_stmt())
+    active = await _tables_per_source(session, card_count_stmt(active_id))
+    target = await _tables_per_source(session, card_count_stmt(profile_id))
+    missing = missing_card_sources(required=required, active=active, target=target)
+    if not missing:
+        return
+    names = await _source_names(session, [item.datasource_id for item in missing])
+    parts: list[str] = []
+    for item in missing:
+        parts.append(f"{names[item.datasource_id]}（应有 {item.required}，实有 {item.actual}）")
+    raise ProfileCardsIncomplete(
+        f"档案 {target_name} 的卡片行数不齐：" + "、".join(parts),
+        detail="这是**整档案**上线：切过去以后这些源在向量路里会静默缺席，"
+        f"而不是返回少几条结果。给它们各跑一次 POST /api/kb/reindex（{target_name} 会复用同一行 "
+        "draft、把该源的卡补进这套档案），补齐后再激活。",
+    )
+
+
+def activate_stmts(profile_id: int) -> tuple[Any, Any]:
+    """上线要发的**两条**语句，顺序固定：① 把当前 active 那行降级 ② 把 `profile_id` 那行升级。
+
+    ADR-0013 的字面是"一条 `UPDATE … CASE` 同时改两行"。实物不成立，而且是**当场**不成立：
+    partial unique 的键是表达式 `(status = 'active')`，PG 在语句内部逐行写索引项、逐行查重，
+    所以只要那条 CASE 先扫到要升级的那行（draft 的 tid 比旧 active 小就会这样），旧 active 的
+    索引项还在，新行进不去 → `UniqueViolationError: ux_kb_index_profile_active`。
+    本轮在真库上探过四种形状，结论是行序决定单条语句的生死：
+
+    - 单条 CASE，draft 先插 → **撞约束**；单条 CASE，旧 active 先插 → 成功。
+    - 两条（先降级再升级）→ 两种行序都成功。两条（先升级）→ 撞约束。
+
+    所以"一条语句"换基准这件事，靠的是 heap 扫描顺序的运气，不是靠约束。工单 030 的
+    `test_draft_行物理上排在_active_之前时切换仍然成功` 就是为这一格写的，它红得对。
+
+    两条语句没有丢掉 ADR 想要的那件事：外部读者看见的仍是"切换前"或"切换后"，
+    中间那一刻只存在于本事务里（未提交），而 ① 的 `WHERE` 命中 0 行时 ② 照样把第一次上线
+    那种"库里没有 active"的情形走完。真正兜住"恒为一行"的一直是 partial unique 本身
+    （工单口径原话：它是兜底不是实现），这里改的只是别把它当成要实现的东西。
+
+    `is_active` 是**镜像**（026 的双写口径）：两条语句各写各的，所以它的值直接跟着 `status`
+    的字面走，不引第二个真相。这一列 031 删，删之前读侧一律只认 `status`。
+    """
+    demote = (
+        update(_PROFILE)
+        .where(_PROFILE.c.status == "active", _PROFILE.c.id != profile_id)
+        .values(status="retired", is_active=False)
+        .returning(*[_PROFILE.c[name] for name in _ACTIVATE_FIELDS])
+    )
+    promote = (
+        update(_PROFILE)
+        .where(_PROFILE.c.id == profile_id)
+        .values(status="active", is_active=True)
+        .returning(*[_PROFILE.c[name] for name in _ACTIVATE_FIELDS])
+    )
+    return demote, promote
+
+
+async def activate_profile(session: AsyncSession, *, profile_id: int) -> ActivateOutcome:
+    """把 `profile_id` 那套档案上线，同刻把原先 active 的那套退役（工单 030 验收 1/6）。
+
+    前置各有用例：
+
+    1. **不存在 → 404**（用仓库既有那只通用 `NotFound`，与"没有这个同步作业"同档）。
+    2. **已经 active → 幂等**：不抬错、不发语句，也不把谁改成 retired（工单已定口径——它没造成
+       任何变化，也没什么可指错）。返回体的 `retired` 是 `None`。
+    3. **`draft` 且 `built_at IS NULL` → 400 `profile_not_built`**（spec 故事 6 的字面是
+       "built_at IS NULL（还没跑完）的 **draft** 不允许激活"）。这一格读的就是 029 写下的那两格
+       合取：`success` 与 `partial` 才盖钟，`failed` 不盖。
+       主语只有 draft：同一行 spec 的后半句是"`retired` 的档案可以再激活"，而 0008 的归置口径
+       把 P2/P3 的历史行落成 retired 且**不碰 `built_at`**（那批行本来没有作业）——把这一格写成
+       "任何非 active 行都要有 built_at"，回滚就会在第一次上线新档案之后立刻失效，正好把
+       roadmap 验收 5 的"可回滚"挡在门外。
+
+    卡片行数那道前置（决策 9 的"整档案激活"）是第 4 格 → 400 `profile_cards_incomplete`，
+    判据与"为什么只判少不判多"都写在 `missing_card_sources()` 那头。它在 `built_at` 之后：
+    还没跑完的档案必然也不齐，先报那件更窄的事（"等它跑完"是唯一出路），别让人先去看行数。
+
+    **不发事件、不入队**（工单已定口径 / ADR-0010）：`sync_job_event` 是作业进度的真相，
+    一次切换不是作业进度；审计走这张表自己的 `status`/`created_at` + 日志。
+    """
+    target = (
+        (
+            await session.execute(
+                select(
+                    *[_PROFILE.c[name] for name in (*_ACTIVATE_FIELDS, "status", "built_at")]
+                ).where(_PROFILE.c.id == profile_id)
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if target is None:
+        raise NotFound(f"没有这套档案（id={profile_id}）")
+    if str(target["status"]) == "active":
+        return ActivateOutcome(activated=_summary(target), retired=None)
+    if str(target["status"]) == "draft" and target["built_at"] is None:
+        raise ProfileNotBuilt(
+            f"档案 {target['name']} 还没跑完（built_at 为空），不能上线",
+            detail="等那颗 reindex 作业到 success 或 partial；跑崩了就先看它的 errors[]，"
+            "再发一次 POST /api/kb/reindex（同三元组会复用这一行 draft，不会另建一套）。",
+        )
+
+    # 回滚（retired → active）也过这一格：这一格守的是"切过去以后哪个源会静默缺席"，
+    # 那件事与要上线的档案是 draft 还是 retired 无关——退休期间有源新登记并同步过，
+    # 退回去就等于把它从检索面上摘掉。
+    current = await read_active_profile(session)
+    await _check_cards_complete(
+        session,
+        profile_id=profile_id,
+        target_name=str(target["name"]),
+        active_id=None if current is None else current.index_profile_id,
+    )
+
+    demote, promote = activate_stmts(profile_id)
+    retired_rows = (await session.execute(demote)).mappings().all()
+    promoted = (await session.execute(promote)).mappings().one()
+    await session.commit()
+
+    # `retired_rows` 至多一行：partial unique 说的就是"当前 active 至多一个"。空的那一支是
+    # 第一次上线（库里本来没有 active），它不是错误。
+    retired = _summary(retired_rows[0]) if retired_rows else None
+    return ActivateOutcome(activated=_summary(promoted), retired=retired)
 
 
 # ================================================== meta_* 行 → TableMeta

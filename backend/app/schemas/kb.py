@@ -13,6 +13,7 @@ class KbCardProfileOut(BaseModel):
 
     `name` 是 §2.6 的 `model@dim@tplv` 拼法，给人一眼看出这批卡是谁生成的；
     `provider` 不露：P2 只有 `openai_compatible` 一种，露出来前端只会多写一个用不上的分支。
+    030 的 `/kb/profiles/{id}/activate` 也复用这一形状，所以这里不另建一个"档案摘要"模型。
     """
 
     id: int
@@ -66,6 +67,19 @@ class KbReindexAccepted(BaseModel):
 
     job_id: int
     profile_id: int
+
+
+class KbActivateOut(BaseModel):
+    """`POST /api/kb/profiles/{id}/activate` 的 200（architecture §7 那行的"档案行"）。
+
+    两格而不是整行：`created_at`/`built_at`/`provider` 这些诊断字段这一片没有读取点，
+    §6 的档案列表端点也不建（spec 明确不做），露出来只会诱导前端去猜它们的含义。
+    `retired` 可为 `null`——库里本来没有 active 时那一次上线确实没有"被换下去的那一行"，
+    编一个零值摘要就等于在响应里写一件库里不存在的事（029 的 202 只回两颗 id 同一条口径）。
+    """
+
+    activated: KbCardProfileOut
+    retired: KbCardProfileOut | None
 
 
 class KbSearchRequest(BaseModel):

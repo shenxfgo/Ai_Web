@@ -154,6 +154,44 @@ class ReindexMatchesActive(Conflict):
     code = "reindex_matches_active_profile"
 
 
+class ProfileNotBuilt(AppError):
+    """激活一套**还在建**的档案：`draft` 且 `built_at IS NULL`。
+
+    工单 030 验收 4 / spec 故事 6。
+    为什么单独立一档而不用 `InvalidRequest`（422）：这一格的事实是"现在还不行，等它跑完就行"，
+    422 的主语是"请求体本身写错了"。400 与 `embedding_not_configured` 同一条理由——请求合法，
+    是这台机器此刻的状态不支持，用户做一个动作（等作业终局，或去看那颗作业的 `errors[]`）就能自救。
+
+    主语是 draft 不是"任何非 active"：`NULL` 在 draft 身上有两种读法（还在跑 / 跑崩了），两种都
+    不该上线；在 retired 身上它还有第三种读法——0008 归置出来的 P2/P3 历史行从来没有作业，所以
+    迁移不碰这一列。那一档正是回滚要指回去的基准，把它一起拦掉等于取消"可回滚"（spec 故事 6
+    后半句"`retired` 的档案可以再激活"要的就是这一格）。
+    """
+
+    code = "profile_not_built"
+    status_code = status.HTTP_400_BAD_REQUEST
+
+
+class ProfileCardsIncomplete(AppError):
+    """要上线的那套档案卡片行数不齐（工单 030 验收 5 / spec 决策 9 的"整档案激活"）。
+
+    为什么必须是**整档案**的尺而不是逐源：`kb_index_profile` 是全局的（档案名里没有 datasource，
+    §2.6），而 `POST /api/kb/reindex` 是按源的一颗作业。于是"draft 建好了"这句话只对它跑过的那个源
+    成立——直接切过去，别的源会在向量路里**静默缺席**（返回的结果里根本没有那个源的表，也不报错）。
+    这是 `docs/architecture.md` §5.2 (1) 列的最坏失效形状，所以门槛在这里，不在检索侧。
+
+    detail 必须点名**那个源的全名**并给出应有/实有两个数：多源场景下要做的动作是"给那个源再跑一次
+    reindex"，只回"行数不齐"等于把定位的活推给看的人。
+
+    为什么是 400 不用 409：与 `profile_not_built` 同一条理由——请求本身合法，是这台机器此刻的状态
+    不支持，用户跑一次作业就能自救。区别于 `reindex_matches_active_profile`（409）：那一档说的是
+    "这个请求不该受理"（重建的就是线上那套），这一档说的是"这套档案还没准备好"。
+    """
+
+    code = "profile_cards_incomplete"
+    status_code = status.HTTP_400_BAD_REQUEST
+
+
 class VectorColumnMissing(AppError):
     """档案那一维在 `kb_card` 上**没有预置的向量列**（工单 029 的 embed 档）。
 

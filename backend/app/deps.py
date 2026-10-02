@@ -10,7 +10,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.db import get_sessionmaker
-from app.core.errors import Unauthorized
+from app.core.errors import Forbidden, Unauthorized
 from app.core.security import decode_access_token
 from app.models.user import User
 from app.services.job_queue import JobQueue, PostgresJobQueue
@@ -75,6 +75,19 @@ async def get_current_user(
         # 改密会 bump token_version，此前签发的全部令牌当场作废
         raise Unauthorized("登录已失效，请重新登录")
     return user
+
+
+async def require_admin(actor: User = Depends(get_current_user)) -> User:
+    """admin-only 那一档（architecture §7 端点表"admin"那一列的落点）。
+
+    仓库里此前没有这一档不是巧合：P3 之前所有写端点判的都是"这个东西是不是你的"
+    （`datasource_service.get_owned` / `get_authorized`），因为资源本身带 `created_by`。
+    030 的 activate 换的是**全库**的检索基准，它不挂在任何单个资源上，只能按角色判。
+    403 而不是 401：登录态是好的，缺的是权限（与 `Forbidden` 那档同一条理由）。
+    """
+    if actor.role != "admin":
+        raise Forbidden("切换检索基准只有管理员能做")
+    return actor
 
 
 _http: httpx.AsyncClient | None = None
