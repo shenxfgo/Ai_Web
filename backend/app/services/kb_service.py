@@ -157,6 +157,42 @@ def profile_name(model: str, *, dimension: int, card_template_version: int) -> s
     return f"{model or NO_EMBEDDING_MODEL}@{dimension}@tplv{card_template_version}"
 
 
+# 档案身份的那三格（§2.6 的 name 就由它们拼成）。ADR-0013 之后它是**比对单位**：
+# "配置里这一套" 与 "库里 active 那一套" 是不是同一套，只看这三格。
+Triplet = tuple[str, int, int]
+
+# 逐格报出来时的名字，顺序就是三元组的顺序（模型 → 维度 → 卡片模板版本）。
+# 顺序写死在常量上：这条文案会进 `sync_jobs.warnings` 与事件流，两次同步要能逐字对比。
+_TRIPLET_LABELS: Final = ("模型", "维度", "卡片模板版本")
+
+
+def configured_triplet() -> Triplet:
+    """settings 那一侧的三元组——"这台机器现在打算用哪套档案"。"""
+    settings = get_settings()
+    return (
+        settings.embedding.model,
+        settings.embedding.dimension,
+        settings.extract.card_template_version,
+    )
+
+
+def triplet_drift(*, configured: Triplet, active: Triplet) -> list[str]:
+    """逐格比对配置与 active 档案，返回"哪几格对不上"的说明；全一致返回空表。
+
+    空表是同步链路上唯一"这轮可以写卡"的信号（工单 027：任何一格不一致都不写卡）。
+    每条文案必须同时点出**两个值**（配置的与档案的）：只说"不一致"的告警等于让运维再跑一次
+    SQL 去查是哪个配置改歪了，而 spec 故事 9 要的是当场看得出来。
+
+    逐格报而不是一条汇总：三格里错一格和错三格是两种不同的处置（改 `.env` 一个键 vs 装错端点），
+    合成一句话就分不出来了。
+    """
+    return [
+        f"{label}：配置为 {cfg_value}，当前生效档案为 {active_value}"
+        for label, cfg_value, active_value in zip(_TRIPLET_LABELS, configured, active, strict=True)
+        if cfg_value != active_value
+    ]
+
+
 def _human_int(value: int | None) -> str:
     """`12345` → `12,345`：卡片里的行数是给 LLM 读的，千分位比"约 1.2 万"少一层歧义。"""
     return f"{value:,}" if value is not None else ""
@@ -314,43 +350,60 @@ def _card_new(stmt: Any, names: tuple[str, ...]) -> dict[str, Any]:
     return {name: getattr(stmt.excluded, name) for name in names}
 
 
-# 未配置向量端点时 model 列为空，name 里用同一个占位字面（与 profile_name 一致）
-EMBEDDING_PROVIDER: Final = "openai_compatible"
+# 这个入口只读四列：id 用来挂卡片，其余三格就是 §2.6 的三元组。`name` 不读——它是给人看的
+# 拼写，而这里的消费者要比的是那三格的值；把 name 拿来比等于间接依赖它的拼法。
+_ACTIVE_PROFILE_FIELDS: Final = ("id", "model", "dimensions", "card_template_version")
 
 
-def profile_row(*, is_active: bool = True) -> dict[str, Any]:
-    """`kb_index_profile` 的一行：`(model, dim, tplv)` 三元组的物化（§2.6）。
+@dataclass(frozen=True, slots=True)
+class ActiveProfile:
+    """库里"当前生效的那一套"档案：一行 `kb_index_profile` 的 id 加它的三元组。
 
-    P2 的口径（工单 008 修正 ③）：只建表 + 落这一条行，`draft→全量重建→原子切 active`
-    那套机制属 P4，所以这里直接 `is_active=true`——它一落库就是当前生效的那套。
+    三元组住在对象上而不是摊成三个参数：比对（`triplet_drift`）和使用（卡片挂 id）读的是
+    同一份，拆开传就会有人只往下传 id，把"这套档案是哪三格"留在身后。
     """
-    settings = get_settings()
-    emb, version = settings.embedding, settings.extract.card_template_version
-    return {
-        "name": profile_name(emb.model, dimension=emb.dimension, card_template_version=version),
-        "provider": EMBEDDING_PROVIDER,
-        "model": emb.model,
-        "dimensions": emb.dimension,
-        "card_template_version": version,
-        "is_active": is_active,
-    }
+
+    index_profile_id: int
+    model: str
+    dimensions: int
+    card_template_version: int
+
+    @property
+    def triplet(self) -> Triplet:
+        return (self.model, self.dimensions, self.card_template_version)
 
 
-async def ensure_profile(session: AsyncSession) -> int:
-    """取回当前配置的 profile id，没有就建一条（幂等）。
+async def read_active_profile(session: AsyncSession) -> ActiveProfile | None:
+    """全仓唯一把 `status='active'` 翻成"该用哪套档案"的地方（ADR-0013 / 工单 027）。
 
-    name 是 §2.6 的 UNIQUE 键，所以"已存在"必须原样复用：每次同步都新建一个 profile，
-    等于每轮都把全部卡片重插一遍成新 doc_uid，旧的那套永远留在库里。
+    读不到就回 `None`，**不建**：建档案的权力在 029 的 reindex 手上，同步链路只读。
+    工单 027 删掉的正是那条后门（原 `kb_service.ensure_profile()`：按 settings 算一套、库里
+    没有就建一套）——spec §1 问题 3 的"改一行 `.env` 再跑一次普通同步，全库检索基准就绕过
+    激活机制换了"，从这一步就没有入口了。
+
+    `one_or_none()` 而不是 `limit(1)`：库里真出现两行 active 时（partial unique 之外只剩直接
+    DDL 绕约束），`limit(1)` 会安静地任选一套继续跑，而两列分家那种"看起来在服务"恰恰是最难
+    查的状态。让它当场 `MultipleResultsFound` 才是诚实的失败方式。
     """
-    name = profile_row()["name"]
-    existing = await session.execute(select(_PROFILE.c.id).where(_PROFILE.c.name == name))
-    found = existing.scalar_one_or_none()
-    if found is not None:
-        return int(found)
-    created = await session.execute(
-        pg_insert(_PROFILE).values(**profile_row()).returning(_PROFILE.c.id)
+    row = (
+        (
+            await session.execute(
+                select(*[_PROFILE.c[name] for name in _ACTIVE_PROFILE_FIELDS]).where(
+                    _PROFILE.c.status == "active"
+                )
+            )
+        )
+        .mappings()
+        .one_or_none()
     )
-    return int(created.scalar_one())
+    if row is None:
+        return None
+    return ActiveProfile(
+        index_profile_id=int(row["id"]),
+        model=str(row["model"]),
+        dimensions=int(row["dimensions"]),
+        card_template_version=int(row["card_template_version"]),
+    )
 
 
 # ================================================== meta_* 行 → TableMeta
@@ -539,6 +592,7 @@ class CardBuildOutcome:
 async def sync_cards(
     session: AsyncSession,
     *,
+    index_profile_id: int,
     datasource_id: int,
     job_id: int | None,
     table_ids: Sequence[int],
@@ -551,6 +605,11 @@ async def sync_cards(
     `table_ids` 只准传本轮同步落成的表：陈旧表（`is_stale`）源库里已经没有实体了，
     还给它刷卡片等于让 AI 照一张不存在的表写 SQL。
 
+    `index_profile_id` 由调用方从 `read_active_profile()` 传入——本函数**没有**建档案的权力
+    （工单 027 关掉的就是这里原来的 `ensure_profile()`：按 settings 算一套、库里没有就建一套，
+    于是改一行 `.env` 再跑一次普通同步就绕过了激活机制）。id 会拌进 `doc_uid`（§2.6），
+    所以"换一套档案"落在库里是新一批行，旧那批原样留着，这才是故事 6 能回滚的原因。
+
     逐表提交（工单 019，roadmap P3 验收 5 的前提）：每张表的卡片 upsert 自成一次
     commit，下一张表的失败只作废它自己。事务边界挪到这里之后，调用方**不再**为卡片
     统一提交——`_set_phase` 自己会 commit，卡片提交与 phase 提交不许并进同一个事务。
@@ -562,10 +621,6 @@ async def sync_cards(
     ids = sorted(set(table_ids))
     if not ids:
         return CardBuildOutcome(cards=0)
-    profile_id = await ensure_profile(session)
-    # profile 单独钉成事务：逐表失败的那次 rollback 不许把它一起带走——它若没落定，
-    # 之后每张表的成功提交都会在 `kb_card.index_profile_id` 的外键上当场拒收。
-    await session.commit()
 
     tables = _as_dicts(
         (
@@ -681,9 +736,12 @@ async def sync_cards(
                     "kind": doc.kind,
                     "table_id": table["id"],
                     "seq": doc.seq,
-                    "index_profile_id": profile_id,
+                    "index_profile_id": index_profile_id,
                     "doc_uid": card_doc_uid(
-                        doc.kind, str(table["table_uid"]), seq=doc.seq, index_profile_id=profile_id
+                        doc.kind,
+                        str(table["table_uid"]),
+                        seq=doc.seq,
+                        index_profile_id=index_profile_id,
                     ),
                     "title": doc.title,
                     "text_md": doc.text_md,

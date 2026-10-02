@@ -42,6 +42,7 @@ from dotenv import dotenv_values
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.services.kb_service import ActiveProfile
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_events_pg import _events
 from tests.integration.test_sync_live import _counts, _one, _relation_edges, _rows
@@ -199,6 +200,7 @@ async def _source_stat_stamps(source: DbAccount) -> dict[str, tuple[Any, Any]]:
 
 
 async def test_验收1_登记PG源跑通四段_终局success_事件可回放(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     pg_source: DbAccount,

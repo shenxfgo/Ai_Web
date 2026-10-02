@@ -24,7 +24,12 @@ import app.models  # noqa: F401
 from app.core.security import encrypt_secret
 from app.models.datasource import DataSource
 from app.models.meta import MetaColumn, MetaDatabase, MetaTable
-from app.services.kb_service import card_doc_uid, sync_cards
+from app.services.kb_service import (
+    ActiveProfile,
+    card_doc_uid,
+    read_active_profile,
+    sync_cards,
+)
 from tests.integration.conftest import Account
 
 pytestmark = pytest.mark.pg
@@ -112,8 +117,13 @@ async def _seed(
         uid = tbl.table_uid
         out = {"ds_id": src.id, "table_id": tbl.id, "table_uid": uid}
         if with_cards:
+            # 档案 id 从库里那一行 active 读（工单 027 之后同步链路上不再自己长档案行）：
+            # 要卡片的用例必须先 request `active_profile` 摆基准。
+            active = await read_active_profile(session)
+            assert active is not None, "用例没摆 active 档案：请 request `active_profile` 夹具"
             await sync_cards(
                 session,
+                index_profile_id=active.index_profile_id,
                 datasource_id=src.id,
                 job_id=None,
                 table_ids=[tbl.id],
@@ -125,6 +135,7 @@ async def _seed(
 
 
 async def test_按table_uid取回一张表的全部卡片段按seq升序(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -164,6 +175,7 @@ async def test_按table_uid取回一张表的全部卡片段按seq升序(
 
 
 async def test_响应里不含数据源字段与口令(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -211,6 +223,7 @@ async def test_表存在但还没建卡回空数组(
 
 
 async def test_无权限的人读不到卡片(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -228,6 +241,7 @@ async def test_无权限的人读不到卡片(
 
 
 async def test_global档的人能读卡片_read权而不是owner权(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],

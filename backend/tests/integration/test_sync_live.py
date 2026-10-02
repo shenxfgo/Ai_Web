@@ -31,6 +31,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.extractor.mysql import MySQLExtractor
+from app.services.kb_service import ActiveProfile
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_pg import _sync
 from tests.unit.test_type_domain import assert_in_value_domain
@@ -310,6 +311,7 @@ async def test_验收2_cardinality_与_sub_part_真的有非空值(
 
 
 async def test_验收3_真外键落成_extracted_且自引用不报错(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,

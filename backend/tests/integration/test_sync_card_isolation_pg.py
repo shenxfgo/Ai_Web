@@ -48,7 +48,7 @@ from app.models.meta import (
 )
 from app.models.user import User
 from app.services import sync_service
-from app.services.kb_service import sync_cards
+from app.services.kb_service import ActiveProfile, sync_cards
 from tests.conftest import load_script
 from tests.integration.conftest import Account
 from tests.integration.test_sync_pg import StubExtractor
@@ -170,6 +170,7 @@ async def _card_tables(
 
 
 async def test_注入一张表卡片构建抛错_终局partial_其余表卡片照常在场(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     stub: Callable[..., StubExtractor],
@@ -207,6 +208,7 @@ async def test_注入一张表卡片构建抛错_终局partial_其余表卡片�
 
 
 async def test_注入三张表卡片构建抛错_终局partial_errors含三张表名_其余五张在场(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     stub: Callable[..., StubExtractor],
@@ -236,6 +238,7 @@ async def test_注入三张表卡片构建抛错_终局partial_errors含三张�
 
 
 async def test_排在后面的表失败_前面已提交的卡片仍查得到(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     stub: Callable[..., StubExtractor],
@@ -289,6 +292,7 @@ async def _meta_counts(
 
 
 async def test_卡片失败隔离不漏到元数据侧_注入前后meta行数一行不差(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     stub: Callable[..., StubExtractor],
@@ -384,6 +388,7 @@ async def _texts_of(session: AsyncSession, table_id: int) -> list[str]:
 
 
 async def test_未注入时写进库的卡片文本与008golden快照逐字符相同(
+    active_profile: ActiveProfile,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """工单 019 验收 4：事务边界改成逐表提交之后，内容仍与 golden 一字不差。
@@ -547,6 +552,7 @@ async def test_未注入时写进库的卡片文本与008golden快照逐字符�
         mysql_ids = [t_nc.id, t_pk.id, view.id, wide.id]
         await sync_cards(
             session,
+            index_profile_id=active_profile.index_profile_id,
             datasource_id=ds.id,
             job_id=None,
             table_ids=mysql_ids,
@@ -555,6 +561,7 @@ async def test_未注入时写进库的卡片文本与008golden快照逐字符�
         )
         await sync_cards(
             session,
+            index_profile_id=active_profile.index_profile_id,
             datasource_id=ds.id,
             job_id=None,
             table_ids=[odd.id],

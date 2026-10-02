@@ -23,7 +23,9 @@ from sqlalchemy.pool import NullPool
 from app import deps
 from app.core.security import hash_password
 from app.main import create_app
+from app.models.kb import KbIndexProfile
 from app.models.user import User
+from app.services.kb_service import ActiveProfile, configured_triplet, profile_name
 from app.settings import get_settings
 
 BACKEND = Path(__file__).resolve().parents[2]
@@ -104,6 +106,72 @@ async def session_factory(
         yield async_sessionmaker(engine, expire_on_commit=False)
     finally:
         await engine.dispose()
+
+
+async def insert_active_profile(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    model: str,
+    dimensions: int,
+    card_template_version: int,
+) -> int:
+    """摆一行 `status='active'` 的档案并 commit，回它的 id。
+
+    027 关掉 `profile_row(is_active=True)` 那条后门之后的代价：同步链路上再也不会自己长出基准行，
+    想要卡片的用例就得自己把这一行摆出来。以前"先同步、卡片自己冒出来"那个前提已经不成立了。
+
+    这是**同步链路那一族**用例共用的"档案行长什么样"（要 worker 看得见、要 commit 的那一类）：
+    `provider` 的字面（§2.6 注④）、`name` 的三段拼法（`profile_name()`）只住这里。029 的
+    reindex 与 031 删 `is_active` 都要改这一行的形状，改一处就够。
+    读侧那几族（要 draft/retired、要在用例自己的会话里不提交的）各造各的，它们要的不是这一行。
+
+    **必须 commit**：worker 用的是另一条连接（工单 016 的进程分离），未提交的行在它眼里不存在。
+    `is_active` 故意**不写**（落列默认 false）：027 之后读写两侧都只认 `status`，
+    031 删列时这里不跟着改。
+    """
+    async with session_factory() as session:
+        profile = KbIndexProfile(
+            name=profile_name(
+                model, dimension=dimensions, card_template_version=card_template_version
+            ),
+            provider="openai_compatible",
+            model=model,
+            dimensions=dimensions,
+            card_template_version=card_template_version,
+            status="active",
+        )
+        session.add(profile)
+        await session.flush()
+        profile_id = int(profile.id)
+        await session.commit()
+        return profile_id
+
+
+@pytest.fixture
+async def active_profile(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> ActiveProfile:
+    """摆一行 `status='active'` 的档案当基准（工单 027 之后"卡片从哪来"的唯一答案）。
+
+    为什么每条想看到卡片的用例都要它：027 关掉了 `profile_row(is_active=True)` 那条后门，
+    同步链路上再也不会自己长出档案行——"先同步、卡片自己冒出来"的老前提已经不成立，
+    这是关掉后门的代价，不是回归（工单 027 已定口径）。
+
+    三元组取自 `configured_triplet()`：这条 fixture 的任务是"与这台机器的配置同意"，
+    让守卫放行。守卫那一族用例（"不一致时要告警不写卡"）走的是同一个
+    `insert_active_profile()`，只是把三元组显式摆成 `triplet` 夹具钉住的那一套，
+    再改配置侧 —— 形状共用、字面各自独立，否则用例的期望值就成了从夹具算出来的同义反复。
+    """
+    model, dimension, tplv = configured_triplet()
+    profile_id = await insert_active_profile(
+        session_factory, model=model, dimensions=dimension, card_template_version=tplv
+    )
+    return ActiveProfile(
+        index_profile_id=profile_id,
+        model=model,
+        dimensions=dimension,
+        card_template_version=tplv,
+    )
 
 
 @pytest.fixture

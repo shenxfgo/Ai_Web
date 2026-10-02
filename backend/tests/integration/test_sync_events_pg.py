@@ -23,6 +23,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.services.kb_service import ActiveProfile
 from app.settings import get_settings
 from tests.integration.test_sync_pg import (
     StubExtractor,
@@ -168,6 +169,7 @@ async def test_upsert_事件与元数据同事务_失败的库一条事件都不
 
 
 async def test_事件_counters_带全五键_分母来自带_scope_的那次计数(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     stub: Maker,

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 import app.models  # noqa: F401
 from app.models.datasource import DataSource
 from app.models.user import User
+from app.services.kb_service import ActiveProfile
 from app.services.nl2sql.prompt_builder import build_prompt
 from app.services.nl2sql.retriever import load_schema_tables
 from app.settings import get_settings
@@ -55,6 +56,7 @@ async def _prompt_text(
 
 
 async def test_枚举取值与两条硬约束真的出现在送出的prompt里(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
@@ -83,6 +85,7 @@ async def test_枚举取值与两条硬约束真的出现在送出的prompt里(
 
 
 async def test_真卡片全文远长于检索侧的二百字预览(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,

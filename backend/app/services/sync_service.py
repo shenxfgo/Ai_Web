@@ -60,7 +60,13 @@ from app.services.datasource_service import (
     table_scope_filter,
 )
 from app.services.job_queue import SYNC_EVENT_CHANNEL
-from app.services.kb_service import sync_cards
+from app.services.kb_service import (
+    ActiveProfile,
+    configured_triplet,
+    read_active_profile,
+    sync_cards,
+    triplet_drift,
+)
 from app.services.nl2sql import join_graph
 from app.services.relation_infer import high_degree_fields, infer_relations
 from app.settings import get_settings
@@ -954,6 +960,63 @@ async def _write_catalog(
     return database_id, part
 
 
+# ================================================== card_build 的档案守卫（工单 027）
+#
+# 「这一轮到底该用哪套档案」在同步链路上只准有这一个回答：库里那一行 status='active'，
+# 而且它必须和这台机器现在的配置是同一套。`run_sync` 只执行判决、不产生判决。
+
+
+@dataclass(frozen=True, slots=True)
+class CardBuildDecision:
+    """一次 card_build 的判决：写给哪套档案（`profile`），或为什么一张都不写（`warning`）。
+
+    两个字段是互斥的，但没折成 `ok: bool`：调用方既要拿 id 挂卡片，也要拿那条告警进
+    `sync_jobs.warnings` 与事件流——折成一个布尔就得在调用方补第三次判断，而那条判断
+    迟早会和这里的口径分家。
+    """
+
+    profile: ActiveProfile | None
+    warning: dict[str, Any] | None
+
+
+def card_build_guard(active: ActiveProfile | None) -> CardBuildDecision:
+    """两处守卫的唯一决策点：① 库里没有 active 档案；② settings 三元组与它对不上。
+
+    **不写卡 ≠ 作业失败**（决策 8 / spec 故事 9）：这里只回一条 `{code, detail}` 形状的告警，
+    终局状态仍由调用方原有的那套 `status` 逻辑决定——把"配置改了一半"这种可恢复状态判成
+    `failed`，等于把它伪装成事故，而正路是 reindex。
+
+    detail 里的下一步文案指向 `POST /api/kb/reindex`：这条告警是前端唯一显示得出来的说明，
+    而它要回答的是"那我该怎么办"，不是"为什么没卡片"。
+
+    每次现比、不缓存结论（工单 027 已定口径，对齐 011 那条"缓存分不清当时一致与后来被改"）。
+    """
+    if active is None:
+        return CardBuildDecision(
+            profile=None,
+            warning={
+                "code": "NO_ACTIVE_PROFILE",
+                "detail": (
+                    "库里没有 status='active' 的索引档案，本轮不写卡片（元数据已照常落库）。"
+                    "下一步：POST /api/kb/reindex 建一套档案并激活。"
+                ),
+            },
+        )
+    drift = triplet_drift(configured=configured_triplet(), active=active.triplet)
+    if drift:
+        return CardBuildDecision(
+            profile=None,
+            warning={
+                "code": "PROFILE_TRIPLET_MISMATCH",
+                "detail": (
+                    "配置与当前生效的索引档案不是同一套，本轮不写卡片：" + "；".join(drift) + "。"
+                    "下一步：POST /api/kb/reindex 建新档案并激活。"
+                ),
+            },
+        )
+    return CardBuildDecision(profile=active, warning=None)
+
+
 async def run_sync(
     session: AsyncSession,
     ds: DataSource,
@@ -1078,43 +1141,55 @@ async def run_sync(
             # 工单 008（kb-workflow §7）：card_build 是同步作业里第二个落库 phase。
             # 放在整段抽取之后而不是每个 catalog 内部，是因为它的输入是**本轮确认完整的库的集合**
             # （`completed_database_ids`），循环里任何一个都还没拿到这份名单。
+            #
+            # 工单 027：档案的来源只剩"库里那一行 active"，而且它要和这台机器现在的配置是同一套。
+            # 判决放在这一帧**之前**——"这一轮一张卡都不写"本身就是 card_build 这一帧要说的话，
+            # 说晚了就得为它多开一帧，而 §2.8 的帧数是进度条的依据。
+            decision = card_build_guard(await read_active_profile(session))
+            if decision.warning is not None:
+                warnings.append(decision.warning)
             await _set_phase(
                 session,
                 job_id,
                 "card_build",
                 counters=tally.as_dict(),
                 event_counters=progress.as_dict(),
+                event_payload=({"skipped": True, **decision.warning} if decision.warning else None),
             )
-            synced = await session.execute(
-                select(_TABLE.c.id).where(
-                    _TABLE.c.database_id.in_(completed_database_ids),
-                    _TABLE.c.synced_at >= synced_before,
+            if decision.profile is not None:
+                synced = await session.execute(
+                    select(_TABLE.c.id).where(
+                        _TABLE.c.database_id.in_(completed_database_ids),
+                        _TABLE.c.synced_at >= synced_before,
+                    )
                 )
-            )
-            # 只给"本轮真的落成了"的表建卡：陈旧表源库已无实体，给它刷一张新卡等于
-            # 继续向 AI 保证一张不存在的表。
-            card_result = await sync_cards(
-                session,
-                datasource_id=ds.id,
-                job_id=job_id,
-                table_ids=[int(i) for i in synced.scalars()],
-                dialect_name=ds.kind,
-                server_version=ds.server_version or "",
-                card_build_hook=card_build_hook,
-            )
-            tally.cards = card_result.cards
-            # 逐表提交（工单 019）之后这里**没有**统一 commit：每张表的成功或失败都在
-            # `sync_cards` 里各自收口了。单表失败不中断——与上面 per-catalog 的兜底同构：
-            # 错误按 `sync_jobs.errors` 的既有形状 `{code, detail}` 追加（§2.5 as-built P3-016），
-            # 表名进 `detail`（§2.8 的 payload 示例点名 `card_build_failed`），终局判 `partial`。
-            # 为什么不塞进 `_write_catalog`：`_set_phase` 自己会 commit，卡片提交与 phase
-            # 提交不许并进同一个事务——那等于把"每库一事务"当场切两半（§6 已定口径）。
-            for failure in card_result.failures:
-                status = "partial"
-                entry = _error_entry(failure.error, fallback_code="card_build_failed")
-                # 表名前缀：与库级失败那条同一条理由——一轮里几十张表，只说"注入故障"分不出炸了谁。
-                entry["detail"] = f"{failure.table_full_name}: {entry['detail']}"
-                errors.append(entry)
+                # 只给"本轮真的落成了"的表建卡：陈旧表源库已无实体，给它刷一张新卡等于
+                # 继续向 AI 保证一张不存在的表。
+                card_result = await sync_cards(
+                    session,
+                    index_profile_id=decision.profile.index_profile_id,
+                    datasource_id=ds.id,
+                    job_id=job_id,
+                    table_ids=[int(i) for i in synced.scalars()],
+                    dialect_name=ds.kind,
+                    server_version=ds.server_version or "",
+                    card_build_hook=card_build_hook,
+                )
+                tally.cards = card_result.cards
+                # 逐表提交（工单 019）之后这里**没有**统一 commit：每张表的成功或失败都在
+                # `sync_cards` 里各自收口了。单表失败不中断——与上面 per-catalog 的兜底同构：
+                # 错误按 `sync_jobs.errors` 的既有形状 `{code, detail}` 追加（§2.5 as-built
+                # P3-016），表名进 `detail`（§2.8 的 payload 示例点名 `card_build_failed`），
+                # 终局判 `partial`。
+                # 为什么不塞进 `_write_catalog`：`_set_phase` 自己会 commit，卡片提交与 phase
+                # 提交不许并进同一个事务——那等于把"每库一事务"当场切两半（§6 已定口径）。
+                for failure in card_result.failures:
+                    status = "partial"
+                    entry = _error_entry(failure.error, fallback_code="card_build_failed")
+                    # 表名前缀：与库级失败那条同一条理由——一轮里几十张表，
+                    # 只说"注入故障"分不出炸了谁。
+                    entry["detail"] = f"{failure.table_full_name}: {entry['detail']}"
+                    errors.append(entry)
             progress.cards = tally.cards
 
             stale = await session.execute(

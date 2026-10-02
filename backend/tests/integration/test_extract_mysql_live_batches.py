@@ -26,6 +26,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.extractor.mysql import MySQLExtractor
+from app.services.kb_service import ActiveProfile
 from app.settings import get_settings
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_events_pg import _events
@@ -223,6 +224,7 @@ async def test_批三发送时四条昂贵查询各发四条_批名单与间隔�
 
 
 async def test_分批没有改变落库结果_与不分批那一次逐行逐字相同(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,

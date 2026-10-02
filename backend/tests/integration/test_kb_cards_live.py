@@ -25,6 +25,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.services.kb_service import ActiveProfile
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_live import (
     TABLES,
@@ -60,6 +61,7 @@ async def _cards_of(
 
 
 async def test_验收1_十个对象各一条table卡_宽表切成三张(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
@@ -96,6 +98,7 @@ async def test_验收1_十个对象各一条table卡_宽表切成三张(
 
 
 async def test_验收2_枚举六值进卡片_varchar_的tags_不出取值段(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
@@ -129,6 +132,7 @@ async def test_验收2_枚举六值进卡片_varchar_的tags_不出取值段(
 
 
 async def test_验收3_视图卡片降级不报错且带降权系数(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
@@ -152,6 +156,7 @@ async def test_验收3_视图卡片降级不报错且带降权系数(
 
 
 async def test_验收4_未配向量端点时卡片照落_embedding_为_NULL(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
@@ -173,14 +178,17 @@ async def test_验收4_未配向量端点时卡片照落_embedding_为_NULL(
     )[0]
     assert row["total"] == row["nulls"] == CARDS
 
+    # 尺子是 `status`（ADR-0013），不是那条镜像列 `is_active`——工单 027 之后同步链路上
+    # 没有任何代码写它了，还按它断言就等于断"夹具没写的那一列是空的"。
     profiles = await _rows(
         session_factory,
-        'select count(*) as n from "{s}".kb_index_profile where is_active',
+        "select count(*) as n from \"{s}\".kb_index_profile where status = 'active'",
     )
-    assert profiles[0]["n"] == 1, "P2 只落一条 active profile（draft→切 active 属 P4）"
+    assert profiles[0]["n"] == 1, "一整轮真同步跑完，服务中的档案仍只有夹具摆的那一行"
 
 
 async def test_验收5_两次同步卡片不翻倍且人工注释进卡片(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,

@@ -20,6 +20,7 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import app.models  # noqa: F401
+from app.services.kb_service import ActiveProfile
 from tests.integration.conftest import Account
 from tests.integration.test_kb_cards_pg import _cards, _column, _data_source, _table
 
@@ -61,6 +62,7 @@ async def _seed(
 
 
 async def test_一句问句换来一张候选表并带命中理由(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -90,6 +92,7 @@ async def test_一句问句换来一张候选表并带命中理由(
 
 
 async def test_点名的源里没有我的权限时回403(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -114,6 +117,7 @@ async def test_点名的源里没有我的权限时回403(
 
 
 async def test_不点名源时在我看得见的全范围里找_global档算看得见(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -134,6 +138,7 @@ async def test_不点名源时在我看得见的全范围里找_global档算看�
 
 
 async def test_零命中时items是空数组(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -150,6 +155,7 @@ async def test_零命中时items是空数组(
 
 
 async def test_响应里不含数据源字段与口令(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -167,6 +173,7 @@ async def test_响应里不含数据源字段与口令(
 
 
 async def test_问句空或过长回422(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],
@@ -181,6 +188,7 @@ async def test_问句空或过长回422(
 
 
 async def test_传P4的检索旋钮时当场422而不是假装收下了(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     session_factory: async_sessionmaker[AsyncSession],

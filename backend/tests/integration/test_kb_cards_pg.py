@@ -25,7 +25,7 @@ from app.models.meta import (
     MetaTable,
 )
 from app.models.user import User
-from app.services.kb_service import card_doc_uid, sync_cards
+from app.services.kb_service import ActiveProfile, card_doc_uid, read_active_profile, sync_cards
 
 pytestmark = pytest.mark.pg
 
@@ -113,9 +113,16 @@ async def _cards(session: AsyncSession, src: DataSource, table_ids: list[int]) -
     排序键里不能出现 `doc_uid`：它是 md5，而 md5 拌进了 `index_profile_id`——profile 的 id
     在同一轮测试会话里是递增的（随机 schema 全会话共用，`Identity(always=True)`），
     前面多用例多建一条 profile 就会翻转 doc_uid 的字典序。按它排序的断言等于在赌运气。
+
+    档案 id 从库里的 active 那一行读（工单 027 之后同步链路上不再自己长档案行）：
+    想要卡片的用例必须先 request `active_profile` 夹具把基准摆出来，没摆就是这句断言红，
+    而不是某个 `sync_cards` 的签名错——后者会把"来源变了"误报成"接口变了"。
     """
+    active = await read_active_profile(session)
+    assert active is not None, "用例没摆 active 档案：请 request `active_profile` 夹具"
     await sync_cards(
         session,
+        index_profile_id=active.index_profile_id,
         datasource_id=src.id,
         job_id=None,
         table_ids=table_ids,
@@ -126,7 +133,9 @@ async def _cards(session: AsyncSession, src: DataSource, table_ids: list[int]) -
     return list(rows)
 
 
-async def test_一张窄表落一条table卡_中文注释进正文(session_factory) -> None:
+async def test_一张窄表落一条table卡_中文注释进正文(
+    session_factory, active_profile: ActiveProfile
+) -> None:
     """§5 的"一表一卡"：卡片文本取 `meta_table.comment_zh`，源库原文注释只是兜底。"""
     async with session_factory() as session:
         src = await _source(session)
@@ -169,7 +178,7 @@ async def test_一张窄表落一条table卡_中文注释进正文(session_facto
         assert cards[0].embedded_at is None
 
 
-async def test_同一轮跑两遍卡片不翻倍(session_factory) -> None:
+async def test_同一轮跑两遍卡片不翻倍(session_factory, active_profile: ActiveProfile) -> None:
     """§2.6 的 `doc_uid UNIQUE` + 落库走 upsert：幂等这一条只能在真库里证。
 
     第二遍还必须**洗掉** embedding——文本重算过了，旧向量已经描述不了新文本（§5）。
@@ -191,7 +200,9 @@ async def test_同一轮跑两遍卡片不翻倍(session_factory) -> None:
         assert second[0].embedded_at is None
 
 
-async def test_视图卡片带降权系数并降级规模行(session_factory) -> None:
+async def test_视图卡片带降权系数并降级规模行(
+    session_factory, active_profile: ActiveProfile
+) -> None:
     """§6 末行 + verification §1 的考点：视图卡与表卡同构，但 `meta.weight=0.6`。
 
     视图在 `information_schema.TABLES` 里没有 TABLE_ROWS，所以【规模】整行降级——
@@ -210,7 +221,9 @@ async def test_视图卡片带降权系数并降级规模行(session_factory) ->
         assert "【表】ai_web_demo.v_daily_sales（视图）" in cards[0].text_md
 
 
-async def test_索引与关系一起进主卡_目标表带库名(session_factory) -> None:
+async def test_索引与关系一起进主卡_目标表带库名(
+    session_factory, active_profile: ActiveProfile
+) -> None:
     """§5 的【索引】/【可关联】两段。
 
     `sub_part` 只能从 `meta_index_column` 读（父表没有这一列），关系的目标表全名只能
@@ -268,7 +281,7 @@ async def test_索引与关系一起进主卡_目标表带库名(session_factory
         assert "取值" not in tags_line
 
 
-async def test_宽表落主卡加切片(session_factory) -> None:
+async def test_宽表落主卡加切片(session_factory, active_profile: ActiveProfile) -> None:
     """§6：>40 列 → 主卡 + 每 30 列一张 `table_columns`，切片各自一条 `kb_card` 行。
 
     doc_uid 里拌了 seq，所以三张卡的 uid 互不相同——如果算 uid 时漏了 seq，
@@ -300,7 +313,7 @@ async def test_宽表落主卡加切片(session_factory) -> None:
         assert all(c.table_id == tbl.id for c in cards)
 
 
-async def test_只给本轮同步到的表建卡(session_factory) -> None:
+async def test_只给本轮同步到的表建卡(session_factory, active_profile: ActiveProfile) -> None:
     """§5/§7 的作用域：卡片是为"这一轮确认过的表"生成的，陈旧表不许被刷新。
 
     传全量 table_ids 的话，一张源库早已删掉的表（`is_stale=true`）会每轮拿到一张新卡，

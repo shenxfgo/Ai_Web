@@ -89,6 +89,9 @@ def test_profile指针与身份键不进set_() -> None:
     把 profile 指针放进 `DO UPDATE SET` 等于允许一条语句把卡片从旧 profile 搬到新 profile，
     而 §2.6 要的是"两套 profile 各自一批行"。`doc_uid` 同理：它是冲突键，改它没有意义，
     只是如果哪天写错了 set_，PG 会照改不误。
+
+    工单 027 之后仍成立：那一轮关掉的是档案的**来源**（`ensure_profile` 后门 → 只认 active 档案），
+    而本条断的是 upsert 语句**不回写**已拌进 `doc_uid` 的指针——来源变了，这条口径没变。
     """
     set_ = _set_clause(kb_service.kb_card_upsert())
     assert "index_profile_id" not in set_

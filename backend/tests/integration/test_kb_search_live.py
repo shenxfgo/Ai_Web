@@ -22,6 +22,7 @@ from typing import Any
 import pytest
 from httpx import AsyncClient
 
+from app.services.kb_service import ActiveProfile
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_live import SyncRun, _sync_once, _trigger
 
@@ -66,6 +67,7 @@ def _table_name(item: dict[str, Any]) -> str:
 
 
 async def test_验收1_问订单总金额_order_main排第一且payment_record进前5(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
@@ -99,6 +101,7 @@ async def test_验收1_问订单总金额_order_main排第一且payment_record�
 
 
 async def test_验收2_问客户手机号_命中列与注释字段说得清是谁(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
@@ -131,6 +134,7 @@ async def test_验收2_问客户手机号_命中列与注释字段说得清是�
 
 
 async def test_验收3_第二次同步后问句结果不变(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,

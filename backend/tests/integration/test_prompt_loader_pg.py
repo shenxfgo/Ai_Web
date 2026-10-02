@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.models  # noqa: F401
 from app.models.meta import MetaRelation
+from app.services.kb_service import ActiveProfile
 from app.services.nl2sql.retriever import load_schema_tables
 from tests.integration.test_kb_cards_pg import _cards, _column, _table
 from tests.integration.test_kb_search_pg import _actor, _source
@@ -57,7 +58,9 @@ async def _wide_and_target(session: AsyncSession) -> tuple:
     return actor, [wide.table_uid, target.table_uid]
 
 
-async def test_加载给的是卡片全文而不是检索侧的二百字预览(session_factory) -> None:
+async def test_加载给的是卡片全文而不是检索侧的二百字预览(
+    active_profile: ActiveProfile, session_factory
+) -> None:
     async with session_factory() as session:
         actor, uids = await _wide_and_target(session)
         tables = await load_schema_tables(session, actor=actor, table_uids=uids)
@@ -68,7 +71,9 @@ async def test_加载给的是卡片全文而不是检索侧的二百字预览(s
         assert "col_045" in joined, "宽表最后一列在切片里——切片没被丢掉才说明全文齐了"
 
 
-async def test_顺序按传入的_table_uid_而不是数据库返回顺序(session_factory) -> None:
+async def test_顺序按传入的_table_uid_而不是数据库返回顺序(
+    active_profile: ActiveProfile, session_factory
+) -> None:
     """传入顺序就是检索的相关度顺序，prompt 里的【候选表】要按它排（§4.1 ④）。"""
     async with session_factory() as session:
         actor, uids = await _wide_and_target(session)
@@ -76,7 +81,9 @@ async def test_顺序按传入的_table_uid_而不是数据库返回顺序(sessi
         assert [t.full_name for t in tables] == ["ai_web_demo.customer", "ai_web_demo.order_main"]
 
 
-async def test_装载侧不带关联边而节点身份是_table_uid(session_factory) -> None:
+async def test_装载侧不带关联边而节点身份是_table_uid(
+    active_profile: ActiveProfile, session_factory
+) -> None:
     """库里那条边还在，这里一条都不带（工单 014）：【可 JOIN】的唯一来源是 `join_graph`。
 
     两句各钉一半：

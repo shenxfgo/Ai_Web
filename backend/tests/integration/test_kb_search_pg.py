@@ -8,20 +8,26 @@ term 拼进 SQL 的方式、profile 隔离、权限过滤、召回窗口，每�
 as-built 0009 的口径修正）、§5.2 (2)(4)(5)（三路 max、同表多卡 boost、权限过滤）、
 §4.1 的"检索为空 → 不生成 SQL"。播种复用 008 的卡片落库，
 这样卡片文本是渲染器产的同一份东西，而不是我给检索器手搓的假料。
+
+工单 027 之后，"哪一套档案在服务"这件事在落卡侧和召回侧都只有一把尺子：`status='active'`
+那一行（ADR-0013）。用例因此必须先 request `active_profile` 夹具把基准摆出来——它只写
+`status`、不写那条镜像列 `is_active`，所以检索器如果还在读旧列，这一整文件会一起红，
+而不是只少一条断言。
 """
 
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import app.models  # noqa: F401
 from app.core.security import hash_password
 from app.models.datasource import DataSource
-from app.models.kb import KbIndexProfile
+from app.models.kb import KbCard, KbIndexProfile
 from app.models.meta import MetaTable
 from app.models.user import User
+from app.services.kb_service import ActiveProfile
 from app.services.nl2sql.retriever import LikeRetriever
 from tests.integration.test_kb_cards_pg import _cards, _column, _data_source, _table
 
@@ -56,7 +62,9 @@ async def _seed_order_main(session: AsyncSession, src: DataSource) -> MetaTable:
     return tbl
 
 
-async def test_一句中文问句命中持有该列的表并给出命中理由(session_factory) -> None:
+async def test_一句中文问句命中持有该列的表并给出命中理由(
+    session_factory, active_profile: ActiveProfile
+) -> None:
     async with session_factory() as session:
         actor = await _actor(session)
         src = await _source(session, actor)
@@ -80,7 +88,9 @@ async def test_一句中文问句命中持有该列的表并给出命中理由(s
     assert only.score_kw > 0.0
 
 
-async def test_问句里没有任何词命中时返回空列表而不是猜一张表(session_factory) -> None:
+async def test_问句里没有任何词命中时返回空列表而不是猜一张表(
+    session_factory, active_profile: ActiveProfile
+) -> None:
     """§4.1 的 fail-fast 依赖这一条：检索空 → 不生成 SQL（判据在 013 用）。"""
     async with session_factory() as session:
         actor = await _actor(session)
@@ -101,7 +111,7 @@ async def test_空问句不查库直接返回空(session_factory) -> None:
     assert found == []
 
 
-async def test_别人私有的源里的表不进候选(session_factory) -> None:
+async def test_别人私有的源里的表不进候选(session_factory, active_profile: ActiveProfile) -> None:
     """§5.2 (5)：权限过滤在召回这一层就做，不等 010 拼 prompt 时再补。
 
     别人那个源里放一张**更能命中**的表（注释一字不差就是问句），如果它出现在候选里，
@@ -131,7 +141,7 @@ async def test_别人私有的源里的表不进候选(session_factory) -> None:
     assert [(r.datasource_id, r.table_uid) for r in found] == [(my_src.id, tbl.table_uid)]
 
 
-async def test_命中词数多的表排在前面(session_factory) -> None:
+async def test_命中词数多的表排在前面(session_factory, active_profile: ActiveProfile) -> None:
     """§5.1 L1 的排序主键是"命中的不同词数"（as-built 0009），列数只是次键。
 
     `payment_record` 的卡片文本里"金额"出现得更密（表注释和列注释都有），单看分数它可能反超；
@@ -167,7 +177,9 @@ async def test_命中词数多的表排在前面(session_factory) -> None:
     assert [r.matched_column_count for r in found] == [2, 1]
 
 
-async def test_宽表用命中列数换词数换不来头名(session_factory) -> None:
+async def test_宽表用命中列数换词数换不来头名(
+    session_factory, active_profile: ActiveProfile
+) -> None:
     """§5.1 那条 as-built 注在真 SQL 召回上的回归位。
 
     `stats_wide` 拿 6 列去对，全是同一个词 `金额`；`order_main` 只有 2 列对上，
@@ -204,12 +216,13 @@ async def test_宽表用命中列数换词数换不来头名(session_factory) ->
     assert [r.matched_column_count for r in found] == [2, 6]
 
 
-async def test_只召回当前生效profile的卡(session_factory) -> None:
+async def test_只召回当前生效profile的卡(session_factory, active_profile: ActiveProfile) -> None:
     """§2.6 末：换 profile = 全量重建，新旧两套混在一个索引里不可解释。
 
-    做法是把老 profile 摘掉 active，再灌一套**空的**新 profile 顶上。此时库里"卡片有、
-    生效 profile 也有"，如果召回没带 `index_profile_id` 条件，老卡就会照样返回——
-    而"没有生效 profile 时返回空"这条更弱的判据根本分不出这两种写法。
+    做法是把老档案从 `active` 改成 `retired`，再灌一套**空的**新档案顶上（ADR-0013：
+    "在服务的那套"从此只有 `status` 一个词表，镜像列 `is_active` 在这一片根本不写）。
+    此时库里"卡片有、生效档案也有"，如果召回没带 `index_profile_id` 条件，老卡就会照样返回——
+    而"没有生效档案时返回空"这条更弱的判据根本分不出这两种写法。
     """
     async with session_factory() as session:
         actor = await _actor(session)
@@ -217,7 +230,7 @@ async def test_只召回当前生效profile的卡(session_factory) -> None:
         await _seed_order_main(session, src)
 
         await session.execute(
-            update(KbIndexProfile).where(KbIndexProfile.is_active).values(is_active=False)
+            update(KbIndexProfile).where(KbIndexProfile.status == "active").values(status="retired")
         )
         session.add(
             KbIndexProfile(
@@ -226,10 +239,12 @@ async def test_只召回当前生效profile的卡(session_factory) -> None:
                 model="text-embedding-3-small",
                 dimensions=1536,
                 card_template_version=9,
-                is_active=True,
+                status="active",
             )
         )
         await session.commit()
+        # 老卡必须还在库里：红的时候要先能分清"召回尺子错了"和"卡没了"
+        assert await session.scalar(select(func.count()).select_from(KbCard)) == 1
 
         found = await LikeRetriever().search(session, actor=actor, question="订单金额是多少", k=5)
 

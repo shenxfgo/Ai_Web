@@ -36,6 +36,7 @@ from app.schemas.kb import (
     KbSearchRequest,
 )
 from app.services import datasource_service
+from app.services.kb_service import read_active_profile
 from app.services.nl2sql.prompt_builder import SchemaTable
 from app.settings import get_settings
 
@@ -312,8 +313,14 @@ def _recall_statement(
 
 
 async def _active_profile_id(session: AsyncSession) -> int | None:
-    """当前生效的那套 profile。检索只命中它的卡（§2.6 末：新旧两套混在一个索引里不可解释）。"""
-    return await session.scalar(select(KbIndexProfile.id).where(KbIndexProfile.is_active).limit(1))
+    """当前生效的那套档案的 id。检索只命中它的卡（§2.6 末：新旧两套混在一个索引里不可解释）。
+
+    "哪一行在服务"这个问题在工单 027 之后全仓只有一个答案（`kb_service.read_active_profile`，
+    尺子是 `status='active'`）。这里留着这层投影，是因为召回和按表回读两处都只要 id——
+    要是两处各写一遍谓词，031 删 `is_active` 那把镜像列时就又要人肉数一遍调用点。
+    """
+    active = await read_active_profile(session)
+    return None if active is None else active.index_profile_id
 
 
 async def _candidate_columns(

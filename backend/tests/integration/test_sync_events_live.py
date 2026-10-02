@@ -33,6 +33,7 @@ from httpx import AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.services.kb_service import ActiveProfile
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_events_sse_pg import EVENT_KEYS, Frame, _frames
 from tests.integration.test_sync_live import TABLES, VIEWS
@@ -230,6 +231,7 @@ def _bodies(frames: list[Frame]) -> str:
 
 
 async def test_真子进程跑作业时进度帧就已经在流上了(
+    active_profile: ActiveProfile,
     api_url: str,
     subproc_env: dict[str, str],
     tmp_path: Path,

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.datasource import DataSource
 from app.models.user import User
+from app.services.kb_service import ActiveProfile
 from app.services.llm_client import LlmClient
 from app.services.nl2sql import pipeline
 from app.services.nl2sql.retriever import LikeRetriever
@@ -58,6 +59,7 @@ def _reply(request: httpx.Request) -> httpx.Response:
 
 @respx.mock
 async def test_真库全链跑通并且守卫注入的那条LIMIT真的生效(
+    active_profile: ActiveProfile,
     client: AsyncClient,
     login: Login,
     monkeypatch: pytest.MonkeyPatch,
