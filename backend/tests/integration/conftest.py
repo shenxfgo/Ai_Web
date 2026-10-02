@@ -10,10 +10,10 @@ import configparser
 import os
 import subprocess
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
 from fastapi import FastAPI
@@ -115,7 +115,7 @@ class FakeEmbedding:
             self.proc.stdout.close()
 
 
-def spawn_fake_embedding() -> FakeEmbedding:
+def spawn_fake_embedding(*, fail_on: Sequence[str] = ()) -> FakeEmbedding:
     """起一份替身并**等它把端口打出来**。
 
     为什么读 stdout 而不是自己挑端口：`--port 0` 让 OS 分配，两份 pytest 并行时固定端口
@@ -124,10 +124,17 @@ def spawn_fake_embedding() -> FakeEmbedding:
 
     `-u` 不是可选项：子进程的 stdout 连着管道时 Python 默认**块缓冲**，那一行会一直躺在
     缓冲区里，调用方就红成"读不到端口"。
+
+    `fail_on` 是工单 029 验收 6 的注入通道（"含这些文本的那一发回 500"）。它走**启动参数**
+    而不是给 `run_sync` 加第二个 test-only 形参，是工单里的已定口径：019 的 `card_build_hook`
+    已经是签名上的代价，别再叠一个——而且向量路的失败本来就该长在"端点自己坏了"那一侧。
     """
     stub = BACKEND / "scripts" / "fake_embedding_server.py"
+    cmd = [sys.executable, "-u", str(stub), "--port", "0"]
+    for token in fail_on:
+        cmd += ["--fail-on", token]
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(stub), "--port", "0"],
+        cmd,
         cwd=str(BACKEND),
         # cp936 控制台上子进程一打印中文就炸在解码里，真正的启动错误反而看不见
         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
@@ -162,6 +169,55 @@ def fake_embedding() -> Iterator[FakeEmbedding]:
         yield handle
     finally:
         handle.terminate()
+
+
+@pytest.fixture
+def fake_embedding_with_switches() -> Iterator[Callable[..., FakeEmbedding]]:
+    """要**启动开关**的替身（工单 029 验收 6 的 `--fail-on`；031 若要错宽度 model 也走这里）。
+
+    与 `fake_embedding` 分开而不是给它加参数：那条夹具的 13 处调用要的正是"默认那份成功的替身"，
+    加一个可选参数位就等于允许用例忘记杀——这里把杀的活收在夹具的 `finally` 里，用例只负责起。
+    """
+    spawned: list[FakeEmbedding] = []
+
+    def build(**kw: Any) -> FakeEmbedding:
+        handle = spawn_fake_embedding(**kw)
+        spawned.append(handle)
+        return handle
+
+    try:
+        yield build
+    finally:
+        for handle in spawned:
+            handle.terminate()
+
+
+@pytest.fixture(autouse=True)
+def embedding_endpoint_off(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """整条 integration 目录默认"没有向量端点"，要真端的用例自己盖回来。
+
+    工单 029 之后 embed 档是**真发 HTTP**的：四格齐（`settings.embedding.configured`）时
+    `run_sync` 会逐表去问端点。本机 `.env` 此刻是空的，所以闸看起来没事——而"看起来没事"
+    正是这条夹具的存在理由：换一台把这四格指向真端点的机器，几十条 pg 用例会在别人的账单上
+    跑几百次 embedding，而且用例之间还会互相抢那个端点的限流。测试不许花真钱，是 012 起
+    对 LLM 端点同一条纪律（那侧的形态是"live 用例只在自己的文件里打"）。
+
+    只钉 `BASE_URL` 与 `API_KEY` 两格而不是四格全钉：`configured` 判的是四格齐（`BASE_URL` /
+    `API_KEY` / `MODEL` / `DIMENSION`），而
+    `configured_triplet()`（027 那道守卫的 settings 那一侧）读的是 `MODEL` 与 `DIMENSION`——
+    把 MODEL 也清空会让"档案行与配置同意"那一族用例的档案名变成 `@1536@tplv1`，
+    夹具就顺手改掉了它不该改的一件事。
+
+    要真端点的用例（029 的 `configured`、031 的向量路）在同名键上再 `setenv` 一次：pytest
+    把 autouse 排在同作用域的其余夹具之前，所以后写的那一份赢，盖的方向是确定的。
+    """
+    monkeypatch.setenv("AIWEB_EMBEDDING__BASE_URL", "")
+    monkeypatch.setenv("AIWEB_EMBEDDING__API_KEY", "")
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.fixture

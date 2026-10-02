@@ -124,6 +124,52 @@ class ResultFileUnavailable(AppError):
     status_code = status.HTTP_404_NOT_FOUND
 
 
+class ReindexEmbeddingMissing(AppError):
+    """四键没配齐时 `POST /api/kb/reindex` 的那一档（工单 029 验收 8，spec 故事 16）。
+
+    400 而不是 503：请求本身合法，是这台机器此刻没端点可用，用户改一格 `.env` 就能自救——
+    与 `source_unreachable` 同一条理由。区别于 `services/embedding_client.py` 里那个
+    同名事实的 `EmbeddingNotConfigured`（503，作业跑起来才发现没配）：那一档的主语是"客户端
+    被使用时没配置"，这里的主语是"这个请求不该被受理"。共用一个 code 字符串是刻意的——
+    两件事实是同一件（这台机器没配向量端点），分两个 code 只会让前端为同一句话写两个分支。
+
+    detail 必须把**两条出路**都点名（故事 16 的字面）：配真端点，或者起闸内替身。
+    """
+
+    code = "embedding_not_configured"
+    status_code = status.HTTP_400_BAD_REQUEST
+
+
+class ReindexMatchesActive(Conflict):
+    """要建的那套三元组与库里 `status='active'` 那行**同名**（工单 029 撞名口径的补集）。
+
+    为什么不复用那一行：档案名是三元组拼的（§2.6），同名就是同一套基准；reindex 的作业会往
+    这套基准的卡上逐张改向量，于是 spec 故事 3 那句"重建中不影响线上检索"当场为假。
+    而"同一套三元组的新基准"本来就不存在——`uq_kb_index_profile_name` 说的正是这件事。
+
+    出路有两条且都不是 reindex：想换基准就改模型/维度（名字跟着变），想给现有卡片补向量就
+    跑一次普通同步（决策 15：四键配齐且三元组与 active 一致时，普通同步会把 embed 档真写完）。
+    """
+
+    code = "reindex_matches_active_profile"
+
+
+class VectorColumnMissing(AppError):
+    """档案那一维在 `kb_card` 上**没有预置的向量列**（工单 029 的 embed 档）。
+
+    为什么要单独一档：`core/vector_columns.py` 抬的是 `ValueError`，而 `sync_jobs.errors[]`
+    只收得到"分过类的"错误——非 `AppError` 会被 `_error_entry` 兜成 `sync_failed`，再经
+    `describe_source_error` 翻成"源库返回了无法识别的错误，请检查连接参数"。那句话的主语是
+    错的：该改的是**元数据库的列**（加一条迁移）或档案的维度（换 model），源库什么都没做错。
+
+    真会走到：`AIWEB_EMBEDDING__DIMENSION` 允许 1~2000 里任何值，而列只有迁移建过的那两维。
+    配置写个没预置的宽度再跑 reindex，这条路今天就有。
+    """
+
+    code = "vector_column_missing"
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
 # §6 的三条出路。放在错误类旁边而不是抛出点：编排层（sync_service）与测试桩都要引用同一份，
 # 于是"编排层把 detail 换成别的词"会当场红，而不是前端拿到任意三句话照样绿。
 # 第三条是 §6 原文（工单 021 换回：P2 那句"admin 改配置"是开关未落地时的替代话，不许撒谎）。

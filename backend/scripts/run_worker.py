@@ -292,6 +292,9 @@ async def run_once(
             # 工单 021：入队那一刻的"覆盖规模上限"由作业行带出来——worker 进程读不到请求，
             # 没有这一格，端点收到的 force 就死在 sync_jobs 那一列里。
             force=claimed.force,
+            # 工单 029：同一个转手位置上的第二个事实。没有它，`POST /api/kb/reindex` 的 202
+            # 里那个 profile_id 只活在响应体里，worker 会把"重建"静默做成"同步"。
+            reindex_profile_id=claimed.reindex_profile_id,
             # 工单 019：卡片构建的 test-only 注入点从进入点穿到 sync_cards，生产 loop() 不传。
             card_build_hook=card_build_hook,
         )

@@ -90,7 +90,10 @@ class KbCard(Base):
             postgresql_with={"m": 16, "ef_construction": 64},
         ),
         # 第二套维度的向量（ADR-0012）：调参与 ix_kb_card_emb 逐字同调，两条索引互不干扰。
-        # 1024 这个字面在本片只出现在 ORM 与迁移两处——"维度→列名"的映射归 031 那个唯一纯函数。
+        # `embedding_1024` 这个字面在源码里只有三处——那份唯一的映射（`core/vector_columns.py`，
+        # 工单 029 让它出生，031 的读侧复用同一个）、这里的列与索引定义、迁移 0008 的加列 DDL；
+        # 机械门是 `test_vector_columns.py::test_列名字面在源码里只出现在映射与列定义本身`，
+        # 第四处出现当场红（`1536 → embedding` 那一半扫不了，理由写在那条用例的头部）。
         Index(
             "ix_kb_card_emb_1024",
             "embedding_1024",
@@ -168,7 +171,8 @@ class KbCard(Base):
         Vector(get_settings().embedding.dimension)
     )
     # 第二套维度（ADR-0012）：换 embedding 模型时新旧两批向量必须同时在场，激活与回滚才走得通。
-    # 读哪一列由 active profile 的 dimensions 决定，而这层映射只住在一个纯函数里（031）。
+    # 读哪一列由**这一批卡所属档案**的 dimensions 决定（普通同步=active 那行，reindex=draft 那行），
+    # 而那层映射只住在一个纯函数里（`core/vector_columns.py`）。
     embedding_1024: Mapped[list[float] | None] = mapped_column(Vector(1024))
 
 

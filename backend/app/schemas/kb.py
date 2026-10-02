@@ -43,6 +43,31 @@ class KbCardOut(BaseModel):
     index_profile: KbCardProfileOut
 
 
+class KbReindexRequest(BaseModel):
+    """`POST /api/kb/reindex` 的 body（architecture §7，工单 029）。
+
+    只有 `datasource_id` 一个字段——reindex 是**按数据源**的一颗作业（spec 决策 ②），
+    不接受"顺手改一下这套档案的维度/模型"：那三格是 settings 的事实，改基准的办法是
+    改 `.env` 再 reindex，而不是让请求体绕过配置通道（ADR-0012 的"档案是历史事实"）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    datasource_id: int
+
+
+class KbReindexAccepted(BaseModel):
+    """202 那一帧：两颗 id，**没有**任何计数（同 `SyncJobAccepted` 的理由——作业还没跑）。
+
+    `profile_id` 是 spec 故事 7 的落点：030 的 `/kb/profiles/{id}/activate` 要知道"刚才建的
+    是那套 draft"，靠返回值而不是靠猜。它与 `job_id` 同源进行里（`sync_jobs.reindex_profile_id`），
+    所以重放 `sync_job_event` 也查得到它。
+    """
+
+    job_id: int
+    profile_id: int
+
+
 class KbSearchRequest(BaseModel):
     """`POST /kb/search` 的 body（§7）。
 

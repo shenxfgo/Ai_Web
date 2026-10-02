@@ -59,11 +59,20 @@ from app.services.datasource_service import (
     root_cause,
     table_scope_filter,
 )
+from app.services.embedding_client import (
+    EmbeddingClient,
+    EmbeddingDimensionMismatch,
+    EmbeddingNotConfigured,
+)
 from app.services.job_queue import SYNC_EVENT_CHANNEL
 from app.services.kb_service import (
     ActiveProfile,
+    card_vector_update,
     configured_triplet,
+    embed_batches,
+    mark_profile_built,
     read_active_profile,
+    read_vector_target,
     sync_cards,
     triplet_drift,
 )
@@ -756,22 +765,104 @@ async def _set_phase(
 
 
 def _embed_skipped() -> dict[str, Any]:
-    """embed 那一帧的理由（§2.8 的 payload：`{skipped, code, detail}`）。
+    """embed 那一帧"这一轮不灌向量"的理由（§2.8 的 payload：`{skipped, code, detail}`）。
 
-    两支分开写：「这台机器没配向量端点」和「配了但 P3 不实现向量化」是两件不同的事，
-    只说一支的话，另一支的读者会拿到一句假话——而这条 detail 是前端唯一能显示的说明。
+    **只有一支了**（工单 029 删掉 `embedding_not_implemented` 那一支）：它的原文是"P3 只建
+    元数据与卡片，向量化归 P4"，而 P4 已经在这儿——配了端点就真灌，剩下唯一不灌的理由就是
+    这台机器没配。留着它等于让这条 detail 变成假话，而它是前端在 embed 档显示得出来的全部说明。
+
+    `detail` 里点名四个键而不是说"未配置"：这一格的答案来自 `.env`，读的人要么去配要么起
+    闸内替身（`scripts/fake_embedding_server.py`），两句都在下面那条出路文案里。
     """
-    if get_settings().embedding.configured:
-        return {
-            "skipped": True,
-            "code": "embedding_not_implemented",
-            "detail": "P3 只建元数据与卡片，向量化归 P4",
-        }
     return {
         "skipped": True,
         "code": "embedding_not_configured",
-        "detail": "embedding 三键（base_url / api_key / model）为空，向量化归 P4",
+        "detail": (
+            "embedding 四键（AIWEB_EMBEDDING__BASE_URL / __API_KEY / __MODEL / __DIMENSION）"
+            "没配齐，本轮不写向量。出路：配真端点，或起 backend/scripts/fake_embedding_server.py。"
+        ),
     }
+
+
+async def _run_embed_stage(
+    session: AsyncSession,
+    *,
+    job_id: int,
+    profile_id: int,
+    table_ids: Sequence[int],
+    tally: _Tally,
+    progress: _Progress,
+) -> list[dict[str, Any]]:
+    """embed 档真写（工单 029）：**一张表一发 HTTP、一个事务、一帧事件**，回失败清单。
+
+    为什么粒度是表而不是整轮一发批量（决策 9 / spec 故事 14）：单表失败要能只作废那一表，
+    而"其余表的向量照常在场"这句话只有逐表提交才表达得出来。同一条理由写在 `sync_cards()` 的
+    逐表提交上（工单 019）——embed 与 card_build 是同一族失败语义，`errors[]` 的形状也共用。
+
+    两档失败不许混（工单 029 已定口径）：
+    - **维度不符**（`EmbeddingDimensionMismatch`）与**这台机器没配端点**
+      （`EmbeddingNotConfigured`）→ 往上抬，整颗作业 `failed`。前者重试一万次还是那个维度，
+      后者连 socket 都不会碰；两种都不是"某一表倒下了"，把它们记进 errors 判 partial 会
+      留下一套灌了一半的档案被 030 激活。
+    - 其余（端点 5xx / 连不上 / 超时 / 元数据库写不进去）→ 按表进 `errors[]`，终局 `partial`。
+
+    `expected_dimension` 传的是**档案**的维度而不是 settings 的：见 `read_vector_target`。
+    列名同理来自档案那一维（`core/vector_columns.py` 那份唯一映射），旧那一列一个字不动。
+    请求体里的 model 名也是档案那一格的（工单 029 双轴审查·规格轴：三元组不许一半认档案、
+    一半认配置），settings 在这条路上只剩"端点在哪、用什么凭证"两格。
+    """
+    batches = await embed_batches(session, index_profile_id=profile_id, table_ids=table_ids)
+    if not batches:
+        # 零批次也发一帧：§2.8 的"一帧一档"，进度条少一档就会以为 embed 没发生过。
+        # 理由若真是"没配端点"，调用方走的是 `_embed_skipped()` 那一支，不会到这里。
+        await _set_phase(
+            session,
+            job_id,
+            "embed",
+            counters=tally.as_dict(),
+            event_counters=progress.as_dict(),
+            event_payload={"embedded": 0},
+        )
+        return []
+
+    target = await read_vector_target(session, index_profile_id=profile_id)
+    # 只从 settings 拿"端点在哪 + 用什么凭证"，模型名换成档案那一格：这颗作业的靶是那一行
+    # 历史事实，跑之前有人把 `.env` 的 MODEL 改成别的名字也不改它该问谁。
+    client = EmbeddingClient(
+        embedding=get_settings().embedding.model_copy(update={"model": target.model})
+    )
+    failures: list[dict[str, Any]] = []
+    embedded = 0
+    for batch in batches:
+        try:
+            vectors = await client.embed(batch.texts, expected_dimension=target.dimensions)
+            for card_id, vector in zip(batch.card_ids, vectors, strict=True):
+                await session.execute(
+                    card_vector_update(target.column),
+                    {"card_id": card_id, "vector": vector},
+                )
+            await session.commit()
+        except (EmbeddingDimensionMismatch, EmbeddingNotConfigured):
+            # 回滚只作废这一表的 UPDATE：前面各表已 commit 的向量留着，反正作业已判 failed、
+            # `built_at` 不会被盖，030 那道门看得见的是后者。
+            await session.rollback()
+            raise
+        except Exception as exc:  # 宽是故意的，与 per-catalog / per-table 那两处同一条理由
+            await session.rollback()
+            entry = _error_entry(exc, fallback_code="embed_failed")
+            entry["detail"] = f"{batch.table_full_name}: {entry['detail']}"
+            failures.append(entry)
+            continue
+        embedded += len(batch.card_ids)
+        await _set_phase(
+            session,
+            job_id,
+            "embed",
+            counters=tally.as_dict(),
+            event_counters=progress.as_dict(),
+            event_payload={"table": batch.table_full_name, "embedded": embedded},
+        )
+    return failures
 
 
 def _why(exc: BaseException) -> str:
@@ -960,27 +1051,38 @@ async def _write_catalog(
     return database_id, part
 
 
-# ================================================== card_build 的档案守卫（工单 027）
+# ================================================== card_build 的档案来源（工单 027 / 029）
 #
-# 「这一轮到底该用哪套档案」在同步链路上只准有这一个回答：库里那一行 status='active'，
-# 而且它必须和这台机器现在的配置是同一套。`run_sync` 只执行判决、不产生判决。
+# 普通同步「这一轮该用哪套档案」只准有一个回答：库里那一行 status='active'，而且它必须和这台
+# 机器现在的配置是同一套。reindex 那一颗作业是**第二个来源**（入队那一刻定下的那一行档案，
+# 见工单 029 已定口径），它在 `run_sync` 的调用点分岔，不走这里的守卫。
+# `run_sync` 只执行判决、不产生判决。
 
 
 @dataclass(frozen=True, slots=True)
 class CardBuildDecision:
-    """一次 card_build 的判决：写给哪套档案（`profile`），或为什么一张都不写（`warning`）。
+    """一次 card_build 的判决：卡片挂到哪套档案（`profile_id`），或为什么一张都不写（`warning`）。
 
     两个字段是互斥的，但没折成 `ok: bool`：调用方既要拿 id 挂卡片，也要拿那条告警进
     `sync_jobs.warnings` 与事件流——折成一个布尔就得在调用方补第三次判断，而那条判断
     迟早会和这里的口径分家。
+
+    这里只留 id 而不是整个档案对象（工单 029）：card_build 这一步用到的只有那一格。
+    reindex 那颗作业的靶是从 `sync_jobs.reindex_profile_id` 直接来的，它没有经过
+    `read_active_profile`，也就没有那份三元组；为了拼一个 `ActiveProfile` 再去库里读一行，
+    换来的只是把三个没人比的数带在路上。
     """
 
-    profile: ActiveProfile | None
+    profile_id: int | None
     warning: dict[str, Any] | None
 
 
 def card_build_guard(active: ActiveProfile | None) -> CardBuildDecision:
     """两处守卫的唯一决策点：① 库里没有 active 档案；② settings 三元组与它对不上。
+
+    **只管普通同步**（工单 029 已定口径）：reindex 那颗作业的靶是入队那一刻就定下的那一行档案，
+    `kb_index_profile.dimensions` 是历史事实，建完 draft 之后有人改 `.env` 改的是配置不是靶，
+    所以那条路**不进这个函数**——它由 `run_sync` 在调用点分岔。
 
     **不写卡 ≠ 作业失败**（决策 8 / spec 故事 9）：这里只回一条 `{code, detail}` 形状的告警，
     终局状态仍由调用方原有的那套 `status` 逻辑决定——把"配置改了一半"这种可恢复状态判成
@@ -993,7 +1095,7 @@ def card_build_guard(active: ActiveProfile | None) -> CardBuildDecision:
     """
     if active is None:
         return CardBuildDecision(
-            profile=None,
+            profile_id=None,
             warning={
                 "code": "NO_ACTIVE_PROFILE",
                 "detail": (
@@ -1005,7 +1107,7 @@ def card_build_guard(active: ActiveProfile | None) -> CardBuildDecision:
     drift = triplet_drift(configured=configured_triplet(), active=active.triplet)
     if drift:
         return CardBuildDecision(
-            profile=None,
+            profile_id=None,
             warning={
                 "code": "PROFILE_TRIPLET_MISMATCH",
                 "detail": (
@@ -1014,7 +1116,7 @@ def card_build_guard(active: ActiveProfile | None) -> CardBuildDecision:
                 ),
             },
         )
-    return CardBuildDecision(profile=active, warning=None)
+    return CardBuildDecision(profile_id=active.index_profile_id, warning=None)
 
 
 async def run_sync(
@@ -1024,6 +1126,7 @@ async def run_sync(
     job_id: int,
     synced_before: dt.datetime,
     force: bool = False,
+    reindex_profile_id: int | None = None,
     card_build_hook: Callable[[str], None] | None = None,
 ) -> SyncOutcome:
     """一次完整同步：连源库 → 抽 → 落库 → 收尾写 `sync_jobs`。
@@ -1037,6 +1140,11 @@ async def run_sync(
     → `sync_jobs.force` → `ClaimedJob.force` → 这里）。它**只**关掉 `MAX_TABLES` 一档——
     scope 过滤（include/exclude）、删除差分、规模之外的行为一律不变，不是跳过所有保护的
     万能钥匙。
+
+    `reindex_profile_id` 是工单 029 的同一趟转手（请求 → `sync_jobs.reindex_profile_id` →
+    `ClaimedJob` → 这里），非 NULL 时 card_build 的靶就是**那一行档案本身**：027 那道 settings
+    守卫对它不插手（已定口径"reindex 用自己的三元组"）。为 NULL 时是普通同步，来源只有库里
+    active 那一行。
 
     `card_build_hook` 是工单 019 的 **test-only** 注入点：由 worker 的进入点按参数传进来、
     原样交给 `sync_cards`，生产路径（`loop()`）恒为 `None`。单表构建失败在卡片侧逐表收口
@@ -1062,7 +1170,16 @@ async def run_sync(
     # 在 try 之前声明：终局那一次清缓存要看得见它，而循环之前的任何一步
     # （解密、probe、discover）都可能直接抛出去，那时这个名字必须已经绑到一个空列表上。
     # `progress` 同一条理由：收尾那一帧事件也要看得见它，没数过就是全 0，不能是 NameError。
+    # `datasource_id` 也是：读它必须早于第一次 rollback。rollback 会把会话里的 ORM 实例**全部
+    # 过期**，此后 `ds.id` 就是一次同步上下文里的懒加载 IO——在 async 会话上它抬
+    # MissingGreenlet，而抬的位置是 finally，于是终局状态根本没写出去：那一行永远停在
+    # 'running'，`ux_sync_running` 把这条源锁死（不变量 1 的反面）。工单 029 的 embed 档
+    # 是全仓第一条"已经提交过至少一个库、之后整颗作业失败"的路径，所以它也是第一条撞上的。
+    datasource_id = int(ds.id)
     completed_database_ids: list[int] = []
+    # embed 档在 try 中部才被赋值（只有"本轮真的落成"的表才有卡），但 `_run_embed_stage`
+    # 与它同在一条调用链上，名字必须早于第一个分支就绑上——同理上面那两行。
+    synced_table_ids: list[int] = []
     progress = _Progress()
 
     extractor: Extractor | None = None
@@ -1142,10 +1259,16 @@ async def run_sync(
             # 放在整段抽取之后而不是每个 catalog 内部，是因为它的输入是**本轮确认完整的库的集合**
             # （`completed_database_ids`），循环里任何一个都还没拿到这份名单。
             #
-            # 工单 027：档案的来源只剩"库里那一行 active"，而且它要和这台机器现在的配置是同一套。
-            # 判决放在这一帧**之前**——"这一轮一张卡都不写"本身就是 card_build 这一帧要说的话，
-            # 说晚了就得为它多开一帧，而 §2.8 的帧数是进度条的依据。
-            decision = card_build_guard(await read_active_profile(session))
+            # 工单 027：普通同步的档案来源只剩"库里那一行 active"，而且它要和这台机器现在的
+            # 配置是同一套。工单 029：reindex 那颗作业是**第二个来源**——入队那一刻就定下的
+            # 那一行档案，不比 settings（建完 draft 之后有人改 `.env`，改的是配置而不是这颗
+            # 作业的靶）。判决放在这一帧**之前**——"这一轮一张卡都不写"本身就是 card_build
+            # 这一帧要说的话，说晚了就得为它多开一帧，而 §2.8 的帧数是进度条的依据。
+            decision = (
+                CardBuildDecision(profile_id=reindex_profile_id, warning=None)
+                if reindex_profile_id is not None
+                else card_build_guard(await read_active_profile(session))
+            )
             if decision.warning is not None:
                 warnings.append(decision.warning)
             await _set_phase(
@@ -1156,21 +1279,22 @@ async def run_sync(
                 event_counters=progress.as_dict(),
                 event_payload=({"skipped": True, **decision.warning} if decision.warning else None),
             )
-            if decision.profile is not None:
+            if decision.profile_id is not None:
                 synced = await session.execute(
                     select(_TABLE.c.id).where(
                         _TABLE.c.database_id.in_(completed_database_ids),
                         _TABLE.c.synced_at >= synced_before,
                     )
                 )
+                synced_table_ids = [int(i) for i in synced.scalars()]
                 # 只给"本轮真的落成了"的表建卡：陈旧表源库已无实体，给它刷一张新卡等于
                 # 继续向 AI 保证一张不存在的表。
                 card_result = await sync_cards(
                     session,
-                    index_profile_id=decision.profile.index_profile_id,
+                    index_profile_id=decision.profile_id,
                     datasource_id=ds.id,
                     job_id=job_id,
-                    table_ids=[int(i) for i in synced.scalars()],
+                    table_ids=synced_table_ids,
                     dialect_name=ds.kind,
                     server_version=ds.server_version or "",
                     card_build_hook=card_build_hook,
@@ -1201,17 +1325,45 @@ async def run_sync(
             )
             await session.commit()
             tally.tables_stale = int(stale.rowcount) if isinstance(stale, CursorResult) else 0
-            # embed 档在 P3 什么都不做（向量检索归 P4），但**这一帧照样发**：少了它，进度条会
-            # 从 card_build 直接跳到 done，"这台机器没配向量端点"这件事就永远说不出来（故事 11）。
-            # 它跟卡片那一步同进同退：一个库都没落成时没有卡片，也就没有"本来要向量化的东西"。
-            await _set_phase(
-                session,
-                job_id,
-                "embed",
-                counters=tally.as_dict(),
-                event_counters=progress.as_dict(),
-                event_payload=_embed_skipped(),
-            )
+            # embed 档（工单 029）：P3 以来这一档只发一帧 `{skipped:true}`，从这里起真灌。
+            # 三支分派，每种都发**恰好一帧以上**（§2.8 的"一帧一档"，进度条少一档就以为没跑过）：
+            # ① 本轮没写卡片 + 没配端点 → `{skipped:true, embedding_not_configured}`；
+            # ② 本轮没写卡片 + 配了端点 → `{embedded:0}`——不写卡的理由（027 那两处守卫之一）
+            #    已经由 card_build 那一帧的 payload 说过，这里再复述一句"三键为空"就是假话；
+            # ③ 写了卡片 → 逐表真灌。reindex 那颗作业即使**没**配端点也走 ③：它的存在理由就是
+            #    给那套新档案灌向量，灌不了就是没完成使命（静默 skipped 会留下一行 `built_at`
+            #    已盖、零向量的 draft，而 030 那道"卡片行数齐"拦不住它）。
+            embedding_on = get_settings().embedding.configured
+            if decision.profile_id is None:
+                payload = {"embedded": 0} if embedding_on else _embed_skipped()
+                await _set_phase(
+                    session,
+                    job_id,
+                    "embed",
+                    counters=tally.as_dict(),
+                    event_counters=progress.as_dict(),
+                    event_payload=payload,
+                )
+            elif embedding_on or reindex_profile_id is not None:
+                for entry in await _run_embed_stage(
+                    session,
+                    job_id=job_id,
+                    profile_id=decision.profile_id,
+                    table_ids=synced_table_ids,
+                    tally=tally,
+                    progress=progress,
+                ):
+                    status = "partial"
+                    errors.append(entry)
+            else:
+                await _set_phase(
+                    session,
+                    job_id,
+                    "embed",
+                    counters=tally.as_dict(),
+                    event_counters=progress.as_dict(),
+                    event_payload=_embed_skipped(),
+                )
         # 只有走完全程才更新它：失败的同步不该把"最近一次同步"往前推（UI 拿它判断新鲜度）
         ds.last_sync_at = dt.datetime.now(dt.UTC)
     except (AppError, SQLAlchemyError) as exc:
@@ -1236,9 +1388,16 @@ async def run_sync(
         # 不变量 3：本轮提交过的每个库各清一次，键精确到 `(源, 库)` 而不是整源——
         # 一次只同步一个源的作业，把别的源的图一起清掉是白工（它们没人动过）。
         for database_id in completed_database_ids:
-            join_graph.invalidate(ds.id, database_id)
+            join_graph.invalidate(datasource_id, database_id)
         # 收尾写在 finally 里而不是 try 的末尾：上面三条 raise 路径都必须有终局状态。
         duration_ms = round((monotonic() - started) * 1000)
+        # `built_at` 与终局状态同一条 UPDATE 链（同一个 commit，工单 029「已定口径」第 5 条）：
+        # 分开提交就会留下"作业已 success 而档案仍未跑完"的可激活窗口——030 那道
+        # "未跑完不许激活"的门认的就是这一格，它必须和作业终局同时翻转。
+        # `partial` 也算盖：某些表灌失败由 `errors[]` 逐表说清，而"整颗作业没跑过"
+        # 才是这里要排除的那种状态。
+        if reindex_profile_id is not None and status in ("success", "partial"):
+            await session.execute(mark_profile_built(reindex_profile_id))
         await _set_phase(
             session,
             job_id,
@@ -1249,6 +1408,12 @@ async def run_sync(
             errors=errors,
             finished=True,
             event_counters=progress.as_dict(),
+            # 靶要能从事件流里查到（spec 故事 7，021 给 `force` 立过的同一环）：重放
+            # `sync_job_event` 就能定位这套档案，不需要靠猜 202 的返回值。普通同步没有靶，
+            # 这一格保持 NULL 而不是 `{profile_id: null}`——读侧据此区分"没靶"与"有靶但查不到"。
+            event_payload=(
+                {"profile_id": reindex_profile_id} if reindex_profile_id is not None else None
+            ),
         )
 
     return SyncOutcome(

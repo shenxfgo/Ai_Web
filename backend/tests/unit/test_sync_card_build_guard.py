@@ -1,8 +1,10 @@
 """card_build 那两处守卫的唯一决策点（工单 027-C / spec 故事 9 / 决策 8）。
 
-接缝：`card_build_guard(active)` 回一个 `CardBuildDecision`——`profile` 非空就写卡（挂那一套
+接缝：`card_build_guard(active)` 回一个 `CardBuildDecision`——`profile_id` 非空就写卡（挂那一套
 档案），`warning` 非空就不写卡。它是"这次能不能写卡"的唯一答案住在的地方：`sync_cards` 那边
 不许再有第二种判断，否则同一个问题两处口径，改一处漏一处。
+**只管普通同步**：reindex 那颗作业的靶由 `run_sync` 在调用点直接用 `sync_jobs.reindex_profile_id`，
+不进这个函数（工单 029 已定口径）。
 
 期望值口径（工单 027 字面，不是从实现反推）：
 - ① 库里没有 active 档案 → 不写卡、不建档案（"没有 active 就自动建一套"那条兜底是被关掉的
@@ -68,7 +70,7 @@ def test_三元组一致时判决就是用那一套档案(configured: Any) -> No
     configured(model="text-embedding-3-small", dimension=1536, card_template_version=1)
     active = _active()
     decision = card_build_guard(active)
-    assert decision.profile is active
+    assert decision.profile_id == active.index_profile_id
     assert decision.warning is None
 
 
@@ -80,7 +82,7 @@ def test_没有_active_档案时给一条告警并指得出下一步(configured:
     """
     configured(model="text-embedding-3-small", dimension=1536, card_template_version=1)
     decision = card_build_guard(None)
-    assert decision.profile is None
+    assert decision.profile_id is None
     assert decision.warning is not None
     assert decision.warning["code"] == "NO_ACTIVE_PROFILE"
     assert REINDEX in decision.warning["detail"], decision.warning
@@ -94,7 +96,7 @@ def test_只改维度时detail点得出两个数(configured: Any) -> None:
     """
     configured(model="text-embedding-3-small", dimension=1024, card_template_version=1)
     decision = card_build_guard(_active())
-    assert decision.profile is None
+    assert decision.profile_id is None
     assert decision.warning is not None
     assert decision.warning["code"] == "PROFILE_TRIPLET_MISMATCH"
     assert "1024" in decision.warning["detail"] and "1536" in decision.warning["detail"]

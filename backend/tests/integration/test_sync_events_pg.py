@@ -83,27 +83,11 @@ async def _one_run(
     return run.body, await _events(session_factory, job_id)
 
 
-@pytest.fixture
-def embedding_off(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """把 embedding 钉成"没配置"：本机 `.env` 三键为空是**现状**，不是用例的前提。
-
-    不钉住的话，换一台配了端点的机器上 skipped 那条断言就凭空红。
-    """
-    for key in ("AIWEB_EMBEDDING__BASE_URL", "AIWEB_EMBEDDING__API_KEY", "AIWEB_EMBEDDING__MODEL"):
-        monkeypatch.setenv(key, "")
-    get_settings.cache_clear()
-    try:
-        yield
-    finally:
-        get_settings.cache_clear()
-
-
 async def test_一次同步把每一步落成事件行_stage_序列单调不倒退(
     client: AsyncClient,
     login: Login,
     stub: Maker,
     session_factory: Factory,
-    embedding_off: None,
 ) -> None:
     """验收 1：粗档序列是 extract → upsert → card_build → embed → done，seq 从 1 起连续 +1。
 
@@ -139,7 +123,6 @@ async def test_upsert_事件与元数据同事务_失败的库一条事件都不
     login: Login,
     stub: Maker,
     session_factory: Factory,
-    embedding_off: None,
 ) -> None:
     """§2.8 的"只追加"要能被撤销：事件行和它所宣布的那次提交在**同一个事务**里。
 
@@ -174,7 +157,6 @@ async def test_事件_counters_带全五键_分母来自带_scope_的那次计�
     login: Login,
     stub: Maker,
     session_factory: Factory,
-    embedding_off: None,
 ) -> None:
     """验收 2 的写侧一半：帧负载那五个键在**落库那一刻**就得齐，端点只是把它们投影出去。
 
@@ -223,7 +205,6 @@ async def test_分批的两个配置键真有读取点_每批的表名随_tables
     login: Login,
     stub: Maker,
     session_factory: Factory,
-    embedding_off: None,
     batch_size_three: None,
 ) -> None:
     """工单 020 验收 6 的编排层一半：4 张表在 `BATCH_SIZE=3` 下是**两批**，名单进事件。
@@ -255,7 +236,6 @@ async def test_embed_档未配置时以_skipped_出现_作业终局仍是_succes
     login: Login,
     stub: Maker,
     session_factory: Factory,
-    embedding_off: None,
 ) -> None:
     """验收 6 + spec 故事 11：跳过要**说得出来**，而不是把这一档悄悄删掉。
 
@@ -276,7 +256,6 @@ async def test_作业行被删掉时事件行跟着消失_不留孤儿(
     login: Login,
     stub: Maker,
     session_factory: Factory,
-    embedding_off: None,
 ) -> None:
     """§2.8 第 ④ 条的 CASCADE 要在**已经应用的 DDL** 里成立，这一条只能打真库。
 

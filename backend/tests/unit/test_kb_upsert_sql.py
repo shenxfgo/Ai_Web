@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import re
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects import postgresql
 
+from app.models.kb import KbCard
 from app.services import kb_service
 
 
@@ -74,12 +76,22 @@ def test_重建把向量清成NULL等下一次灌() -> None:
     写成"不动这两列"的话，旧向量会顶着新文本一直用到下次换 profile，
     而检索结果里看不出它已经过期——这是"AI 答非所问"最难查的一种成因。
     置 NULL 之后，向量路和关键词路的降级都由 `embedding IS NULL` 一个条件描述（ADR-0003）。
+
+    **列名来自 ORM 那张表，不是来自 `core/vector_columns` 那份映射**：实现里那个 `set_`
+    正是从映射投影出来的，用例若也读同一份，断言就退化成"映射自己等于自己"——第三条向量列
+    进了映射却漏进 `set_` 时照样绿。从 `__table__` 里捞 `Vector` 类型的列是一份独立真相：
+    建了列没人洗，这里就红。
     """
     set_ = _set_clause(kb_service.kb_card_upsert())
+    vector_columns = [
+        column.name for column in KbCard.__table__.columns if isinstance(column.type, Vector)
+    ]
+    assert vector_columns, "KbCard 上至少要有一根向量列，否则这条断言是空的"
     # 必须是语句文本里的 `NULL`（literal_column），不是绑定参数——写成绑参的话语句形状
     # 看着一样，但 PG 收到的类型是 untyped parameter，向量的清理照样成立，
     # 而"这里被刻意清空"这件事从 SQL 里读不出来了。
-    assert set_["embedding"] == "NULL"
+    for name in vector_columns:
+        assert set_[name] == "NULL", name
     assert set_["embedded_at"] == "NULL"
 
 

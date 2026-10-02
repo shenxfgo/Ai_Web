@@ -50,6 +50,22 @@ def test_入队写的是_pending_行而且不许顺手打_running() -> None:
     assert sql.endswith("RETURNING id"), sql
 
 
+def test_入队把请求那一刻的两个事实一起写进行() -> None:
+    """工单 021 的 `force` 与工单 029 的 `reindex_profile_id`：都是"请求读过、worker 读不到"的事。
+
+    断形状而不是断默认值：`enqueue_stmt(7, 3)` 不带这两个关键字时，语句里照样得出现这两列
+    （渲染成 NULL/false）——列从 `values` 里漏掉，worker 那一侧拿到的是**列默认值**，
+    而"这颗作业没有靶"与"这颗作业的靶没人写"在库里长得一模一样，事后翻 job 行分不出来。
+    """
+    sql = _sql(job_queue.enqueue_stmt(7, 3, reindex_profile_id=42))
+    assert "reindex_profile_id" in sql, sql
+    assert "VALUES (7, 3, 'pending'" in sql, sql
+    assert "42" in sql, sql
+
+    plain = _sql(job_queue.enqueue_stmt(7, 3))
+    assert "reindex_profile_id" in plain, plain
+
+
 def test_claim_的互斥由_skip_locked_与_pending_条件共同保证() -> None:
     """两个 worker 各拿一个作业靠 `FOR UPDATE SKIP LOCKED`，"我抢到了"这件事靠**这一语句
     真正改到了几行**（`claim` 读的是 `RETURNING` 带回的行，PG 保证带回的就是被改写的行）。
@@ -70,3 +86,17 @@ def test_claim_的互斥由_skip_locked_与_pending_条件共同保证() -> None
     assert re.search(r"WHERE status = 'pending'.*FOR UPDATE", sql), sql
     assert "AND status = 'pending' RETURNING" in sql, sql
     assert "finished_at" not in sql and "counters" not in sql, sql
+
+
+def test_claim_把靶随行带回但绝不在_claim_里改写它() -> None:
+    """工单 029 验收 2 的第一跳：`reindex_profile_id` 得出现在 `RETURNING` 里。
+
+    为什么在 SET 那一侧再断一次"没有它"：这一列的生命周期只到入队为止（靶是请求那一刻定的
+    事实，worker 只是转手），而"顺手在 claim 里改靶"能把一颗普通同步偷偷变成 reindex。
+    它与 `force` 同形，所以写法也同形——两列都只出现在带回的那一半。
+    """
+    sql = _sql(job_queue.claim_stmt())
+    set_clause, _, returning = sql.partition(" WHERE ")
+    assert "reindex_profile_id" in returning, sql
+    assert "force" in returning, sql
+    assert "reindex_profile_id" not in set_clause, set_clause

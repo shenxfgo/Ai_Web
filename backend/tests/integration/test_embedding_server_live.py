@@ -45,10 +45,11 @@ _MODEL_1024 = "bge-large-zh-v1.5"
 
 
 def _group(base_url: str, *, model: str = _MODEL_1536, dimension: int = 1536) -> EmbeddingGroup:
-    """一个"三键齐了"的配置组，指向替身。
+    """一个"四格都齐了"的配置组，指向替身。
 
-    `api_key` 填的是假值而不是留空：`settings.embedding.configured` 要求四格齐
-    （`app/settings.py:122`），留空的话这里测的就变成"未配置"那一档了。替身不校验它。
+    `api_key` 填的是假值而不是留空：`EmbeddingGroup.configured`（`app/settings.py`）要求四格齐
+    （`base_url` / `api_key` / `model` / `dimension>0`），留空的话这里测的就变成"未配置"那一档了。
+    替身不校验它。
     """
     return EmbeddingGroup(base_url=base_url, api_key="fake-key", model=model, dimension=dimension)
 
@@ -67,10 +68,10 @@ async def test_同一句问句两次调用逐位相同换一个问句就不同(f
     向量的替身照样绿，而 031 的名次会全部并列。
     """
     client = _client(fake_embedding)
-    first = await client.embed(["订单主表 order_main 销售额"])
-    second = await client.embed(["订单主表 order_main 销售额"])
+    first = await client.embed(["订单主表 order_main 销售额"], expected_dimension=1536)
+    second = await client.embed(["订单主表 order_main 销售额"], expected_dimension=1536)
     assert first == second
-    assert first[0] != (await client.embed(["客户表 customer 手机号"]))[0]
+    assert first[0] != (await client.embed(["客户表 customer 手机号"], expected_dimension=1536))[0]
 
 
 async def test_一批里的一条与它单发时是同一个点(fake_embedding: FakeEmbedding) -> None:
@@ -80,8 +81,10 @@ async def test_一批里的一条与它单发时是同一个点(fake_embedding: 
     向量就不在同一个位置上，而 `<=>` 仍然回一个像模像样的距离。
     """
     client = _client(fake_embedding)
-    alone = await client.embed(["支付记录 payment_record"])
-    in_batch = await client.embed(["无关的一句", "支付记录 payment_record", "另一句"])
+    alone = await client.embed(["支付记录 payment_record"], expected_dimension=1536)
+    in_batch = await client.embed(
+        ["无关的一句", "支付记录 payment_record", "另一句"], expected_dimension=1536
+    )
     assert in_batch[1] == alone[0]
 
 
@@ -95,8 +98,10 @@ async def test_换一个替身进程同一个问句还是同一个点(fake_embed
     """
     other = spawn_fake_embedding()
     try:
-        first = await _client(fake_embedding).embed(["订单主表 order_main 销售额"])
-        again = await _client(other).embed(["订单主表 order_main 销售额"])
+        first = await _client(fake_embedding).embed(
+            ["订单主表 order_main 销售额"], expected_dimension=1536
+        )
+        again = await _client(other).embed(["订单主表 order_main 销售额"], expected_dimension=1536)
         assert first == again
     finally:
         other.terminate()
@@ -117,11 +122,13 @@ async def test_按_model_名返回两套宽度且期望值是测试自己声明�
     1024 那一套里落在另一个位置上。
     """
     vectors = await _client(fake_embedding, model=model, dimension=expected_dimension).embed(
-        ["订单表"]
+        ["订单表"], expected_dimension=expected_dimension
     )
     assert len(vectors[0]) == expected_dimension
     if expected_dimension == 1024:
-        other = await _client(fake_embedding, model=_MODEL_1536, dimension=1536).embed(["订单表"])
+        other = await _client(fake_embedding, model=_MODEL_1536, dimension=1536).embed(
+            ["订单表"], expected_dimension=1536
+        )
         # 不同宽度的两个点根本不在同一个空间里，这里只钉"替身确实按名字分了套"
         assert len(other[0]) == 1536
 
@@ -136,7 +143,9 @@ async def test_未知_model_名落成可辨识的一档而不是_JSON_解析错(
     端点不认识"。文案里要带出那个名字，否则运维要自己去猜是哪一格拼错了。
     """
     with pytest.raises(EmbeddingBadRequest) as caught:
-        await _client(fake_embedding, model="text-embedding-9-huge").embed(["订单表"])
+        await _client(fake_embedding, model="text-embedding-9-huge").embed(
+            ["订单表"], expected_dimension=1536
+        )
     assert "text-embedding-9-huge" in str(caught.value), str(caught.value)
 
 
@@ -148,9 +157,25 @@ async def test_维度不符时那一档专属错误里两个数都在场(fake_em
     该改 `.env` 还是该建新档案。
     """
     with pytest.raises(EmbeddingDimensionMismatch) as caught:
-        await _client(fake_embedding, model=_MODEL_1536, dimension=1024).embed(["订单表"])
+        await _client(fake_embedding, model=_MODEL_1536, dimension=1024).embed(
+            ["订单表"], expected_dimension=1024
+        )
     message = str(caught.value)
     assert "1536" in message and "1024" in message, message
+
+
+async def test_期望宽度由调用方给_客户端不读自己配置里那一格(fake_embedding: FakeEmbedding) -> None:
+    """工单 029 已定口径「reindex 用 draft 档案自己的三元组」落在客户端签名上的这一半。
+
+    配置组写 1024、调用方要 1536：按老写法（宽度取自 `self._embedding.dimension`）这里会抬
+    维度不符，于是"这台机器的 `.env` 与那套档案不同宽"的一颗 reindex 作业整颗死于维度不符，
+    而该改的是配置、不是这颗作业。**这一条专门盖住那条退路**：签名收必填关键字参数由
+    `tests/unit/test_sync_embed_sql.py` 钉形状，这里钉的是"真的按它判"。
+    """
+    vectors = await _client(fake_embedding, model=_MODEL_1536, dimension=1024).embed(
+        ["订单表"], expected_dimension=1536
+    )
+    assert len(vectors[0]) == 1536, len(vectors[0])
 
 
 async def test_端点没在听时落连不上那一档且秒回(fake_embedding: FakeEmbedding) -> None:
@@ -168,7 +193,7 @@ async def test_端点没在听时落连不上那一档且秒回(fake_embedding: 
 
     started = time.monotonic()
     with pytest.raises(EmbeddingUnreachable):
-        await _client(fake_embedding).embed(["订单表"])
+        await _client(fake_embedding).embed(["订单表"], expected_dimension=1536)
     assert time.monotonic() - started < 10.0, "连不上不该等满超时"
 
 
@@ -183,7 +208,7 @@ async def test_自己起的替身杀完之后那个端口上再没有第二个�
     """
     extra = spawn_fake_embedding()
     try:
-        assert await _client(extra).embed(["临时起的一份"]) != []
+        assert await _client(extra).embed(["临时起的一份"], expected_dimension=1536) != []
     finally:
         extra.terminate()
     with pytest.raises(httpx.TransportError):
@@ -199,7 +224,7 @@ async def test_三键没齐时抬未配置而不是去撞空_url() -> None:
     """
     client = EmbeddingClient(embedding=EmbeddingGroup())
     with pytest.raises(EmbeddingNotConfigured):
-        await client.embed(["订单表"])
+        await client.embed(["订单表"], expected_dimension=1536)
 
 
 def test_探针在替身上报_ok_而不是只有真端点才过(fake_embedding: FakeEmbedding) -> None:

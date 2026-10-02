@@ -152,7 +152,7 @@ def embeddings_from_response(
         vector = _as_vector(item["embedding"], what=index)
         if len(vector) != expected_dimension:
             raise EmbeddingDimensionMismatch(
-                f"端点返回 {len(vector)} 维，配置是 {expected_dimension} 维"
+                f"端点返回 {len(vector)} 维，这套档案期望 {expected_dimension} 维"
             )
         by_index[index] = vector
     try:
@@ -240,7 +240,7 @@ class EmbeddingClient:
             return
         raise EmbeddingNotConfigured(
             "embedding 未配置：请设置 AIWEB_EMBEDDING__{BASE_URL,API_KEY,MODEL,DIMENSION} 四格"
-            "（本机没有真端点时，起 scripts/fake_embedding_server.py 把三键指过去）"
+            "（本机没有真端点时，起 scripts/fake_embedding_server.py 把这四格指过去）"
         )
 
     @property
@@ -258,8 +258,15 @@ class EmbeddingClient:
             return {}
         return {"authorization": f"Bearer {self._embed.api_key}"}
 
-    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        """一批文本 → 与输入同序的向量批。
+    async def embed(self, texts: Sequence[str], *, expected_dimension: int) -> list[list[float]]:
+        """一批文本 → 与输入同序的向量批。`expected_dimension` 由调用方给。
+
+        **宽度为什么是入参而不是 `settings.embedding.dimension`**（工单 029 的已定口径落在这里）：
+        要验的是"这批向量配不配得上**目标档案**"，而档案那一行的 `dimensions` 是历史事实。
+        reindex 的靶在入队那一刻就定下了，之后有人把 `.env` 改成别的宽度，改的是配置不是这颗
+        作业该灌的宽度——客户端若自己读 settings，1024 的档案配 1536 的 .env 时整颗作业会死于
+        "维度不符"，而该改的是配置。留一个缺省值等于留一条"忘了传就回到 settings"的退路，
+        所以它是必填关键字参数（`test_sync_embed_sql.py` 钉着这条签名）。
 
         每次调用建一条自己的连接（`async with httpx.AsyncClient()`）：这是"不收 transport"
         这条口径的直接代价——客户端自己 own 生命周期，就没有"忘了 aclose、把连接池漏在
@@ -282,7 +289,7 @@ class EmbeddingClient:
                     if attempt == _MAX_RETRIES:
                         raise _final_error(exc) from exc
                     await asyncio.sleep(_BACKOFF_BASE_S * 2**attempt)
-        return embeddings_from_response(body, expected_dimension=self._embed.dimension, count=count)
+        return embeddings_from_response(body, expected_dimension=expected_dimension, count=count)
 
     async def _post(self, http: httpx.AsyncClient, payload: dict[str, Any]) -> Any:
         try:

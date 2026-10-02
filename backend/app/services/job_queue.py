@@ -34,7 +34,9 @@ _JOB = cast("Table", SyncJob.__table__)
 SYNC_EVENT_CHANNEL: Final = "sync_job_event"
 
 
-def enqueue_stmt(datasource_id: int, actor_id: int, *, force: bool = False) -> Insert:
+def enqueue_stmt(
+    datasource_id: int, actor_id: int, *, force: bool = False, reindex_profile_id: int | None = None
+) -> Insert:
     """入队那一行的语句：只写 pending，钟（`started_at`）留给 claim 那一步。
 
     不写 `started_at` 是这条缝的关键证据：响应返回时那一列还是 NULL，
@@ -42,6 +44,10 @@ def enqueue_stmt(datasource_id: int, actor_id: int, *, force: bool = False) -> I
 
     `force` 显式写而不是靠列默认（工单 021）：这一格记的是"入队那一刻请求有没有说过
     覆盖规模上限"，是这一行的事实，语句该把它带上——列默认只兜"没人说过"的情况。
+
+    `reindex_profile_id` 同一个道理（工单 029）：它是请求那一刻就定下的事实（"这颗作业建的是
+    哪套 draft"），而 worker 是另一个进程、读不到请求。没有这一格，202 里那个 `profile_id`
+    就只活在响应体里，重放 `sync_job_event` 查不到它（spec 故事 7 明确不许这样）。
     """
     return (
         pg_insert(_JOB)
@@ -50,6 +56,7 @@ def enqueue_stmt(datasource_id: int, actor_id: int, *, force: bool = False) -> I
             triggered_by=actor_id,
             status="pending",
             force=force,
+            reindex_profile_id=reindex_profile_id,
         )
         .returning(_JOB.c.id)
     )
@@ -67,6 +74,9 @@ def claim_stmt() -> Update:
       判据就只剩"我动了一行"，两个 worker 会同时抽同一个源。`claim` 读的是 `RETURNING`
       带回的行：PG 保证带回的就是本语句改写的那些行，所以"带回一行"与"更新行数为 1"
       是同一件事，而前者顺带把 `started_at` 一起拿回来（不需要第二条 SQL）。
+
+    带回的那几列都是**入队那一刻就定下的事实**（`force` 021、`reindex_profile_id` 029），
+    worker 只转手不改写——SET 里不许出现它们，否则一颗排好的普通同步能被领成 reindex。
     """
     picked = (
         select(_JOB.c.id)
@@ -85,7 +95,13 @@ def claim_stmt() -> Update:
             started_at=func.now(),
             heartbeat_at=func.now(),
         )
-        .returning(_JOB.c.id, _JOB.c.datasource_id, _JOB.c.started_at, _JOB.c.force)
+        .returning(
+            _JOB.c.id,
+            _JOB.c.datasource_id,
+            _JOB.c.started_at,
+            _JOB.c.force,
+            _JOB.c.reindex_profile_id,
+        )
     )
 
 
@@ -99,6 +115,11 @@ class ClaimedJob:
     # 工单 021：入队那一刻落进行里的"覆盖规模上限"。它是这条缝对 force 的唯一转手——
     # worker 读不到请求，没有这一格，端点收到的那个布尔就到不了 `run_sync`。
     force: bool
+    # 工单 029：同一个转手位置上的第二个事实——这颗作业是给哪一行档案建卡的。
+    # NULL = 普通同步（只服务库里 active 那一套）；非 NULL = reindex（靶是那一行本身，
+    # 与这台机器现在的配置无关）。它到不了 `run_sync` 的话，202 里那个 profile_id
+    # 就只活在响应体里，而 worker 会静默地把"重建"做成"同步"。
+    reindex_profile_id: int | None
 
 
 class JobQueue(Protocol):
@@ -108,11 +129,23 @@ class JobQueue(Protocol):
     第三个换的是**读**的方向（谁在听作业）。它们都只认 `job_id`，介质细节一律不外露。
     """
 
-    async def enqueue(self, datasource_id: int, actor_id: int, *, force: bool = False) -> int:
+    async def enqueue(
+        self,
+        datasource_id: int,
+        actor_id: int,
+        *,
+        force: bool = False,
+        reindex_profile_id: int | None = None,
+    ) -> int:
         """落一行待办并返回 job_id；同数据源已有未结束作业时抛 `SyncAlreadyRunning`。
 
         `force` 是工单 021 的入队布尔（"超限了，admin 当场说过照常开工"），默认 false——
         不带它的老调用形状（016 的两个位置参）逐字照旧。
+
+        `reindex_profile_id` 是工单 029 的载体：非 NULL 的那一行说的是"这颗作业的目标基准是
+        这一行 draft 档案"，而不是"跟着库里 active 那套走"。它为 NULL 时作业就是普通同步。
+        **互斥复用同一个 `ux_sync_running`**——reindex 不新开一档并发语义，同源的普通同步还没跑完
+        时它照样 409。
         """
         ...
 
@@ -135,10 +168,21 @@ class PostgresJobQueue:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def enqueue(self, datasource_id: int, actor_id: int, *, force: bool = False) -> int:
+    async def enqueue(
+        self,
+        datasource_id: int,
+        actor_id: int,
+        *,
+        force: bool = False,
+        reindex_profile_id: int | None = None,
+    ) -> int:
         # 单独提交：撞锁要**立刻**回 409 让请求结束，而不是等抽取跑完再说
         try:
-            result = await self._session.execute(enqueue_stmt(datasource_id, actor_id, force=force))
+            result = await self._session.execute(
+                enqueue_stmt(
+                    datasource_id, actor_id, force=force, reindex_profile_id=reindex_profile_id
+                )
+            )
             job_id = result.scalar_one()
             await self._session.commit()
         except IntegrityError as exc:
@@ -164,6 +208,9 @@ class PostgresJobQueue:
             datasource_id=int(row.datasource_id),
             started_at=row.started_at,
             force=bool(row.force),
+            reindex_profile_id=None
+            if row.reindex_profile_id is None
+            else int(row.reindex_profile_id),
         )
 
     async def subscribe(self, job_id: int) -> JobWake:

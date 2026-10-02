@@ -19,12 +19,19 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from jinja2 import Environment, FileSystemLoader
-from sqlalchemy import Table, func, literal_column, select
+from sqlalchemy import Table, bindparam, func, literal_column, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.engine import MappingResult
+from sqlalchemy.engine import MappingResult, RowMapping
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.errors import NotFound
+from app.core.errors import (
+    NotFound,
+    ReindexEmbeddingMissing,
+    ReindexMatchesActive,
+    VectorColumnMissing,
+)
+from app.core.vector_columns import ALL_VECTOR_COLUMNS, vector_column_for
 from app.models.kb import KbCard, KbIndexProfile
 from app.models.meta import (
     MetaColumn,
@@ -36,6 +43,7 @@ from app.models.meta import (
 from app.models.user import User
 from app.schemas.kb import KbCardOut, KbCardProfileOut
 from app.services import datasource_service
+from app.services.embedding_client import EMBEDDING_PROVIDER
 from app.services.token_estimate import estimate_tokens
 from app.settings import get_settings
 
@@ -328,9 +336,13 @@ def kb_card_upsert() -> Any:
     """§2.6 的 `doc_uid` 唯一键 upsert：同一轮同步跑两遍，卡片不翻倍。
 
     两个细节是有意的：
-    ① `embedding`/`embedded_at` 被显式清成 NULL——卡片文本变了，旧向量就不再描述它了
+    ① **全部向量列**与 `embedded_at` 被显式清成 NULL——卡片文本变了，旧向量就不再描述它了
        （§5 的"编辑后触发该表 embedding 重算"是同一条语义）。留着不洗是最坏的选择，
        它会让检索拿旧向量匹配新内容，而且从结果里看不出过期。
+       清单从 `core/vector_columns.py` 那份映射投影（`ALL_VECTOR_COLUMNS`）而不是在这里点名：
+       自 0008 起这根柱子有两根向量列，**只洗第一列等于对第二列说"过期也算有效"**——
+       而 029 之前第二列从没有写入点，那条不对称一直藏着没现形（工单 029 双轴审查·规格轴第一条）。
+       列名不写在这里还有第二个理由：`test_vector_columns.py` 那条 allowlist 只让三个文件出现字面。
     ② `meta` 整值替换：卡片没有人工列（术语卡的人工性在 `term` 那一行，P2 不构建），
        所以不需要 §3 那套 COALESCE 保护。
     """
@@ -339,7 +351,7 @@ def kb_card_upsert() -> Any:
         index_elements=[_CARD.c.doc_uid],
         set_={
             **_card_new(stmt, _CARD_CONTENT_COLS),
-            "embedding": literal_column("NULL"),
+            **dict.fromkeys(ALL_VECTOR_COLUMNS, literal_column("NULL")),
             "embedded_at": literal_column("NULL"),
             "updated_at": func.now(),
         },
@@ -404,6 +416,99 @@ async def read_active_profile(session: AsyncSession) -> ActiveProfile | None:
         dimensions=int(row["dimensions"]),
         card_template_version=int(row["card_template_version"]),
     )
+
+
+# ============================================================ 档案的出生（工单 029 / 决策 5）
+#
+# ADR-0013 之后这张表的 INSERT 点**只有这里**：027 关掉了"读不到就顺手建一套"那条后门，
+# 于是"该用哪套基准"只剩库里 active 那一行能答，而新基准的出生必须由人显式发起。
+# 这就是为什么 400/409 都在这一步判：出生一个空壳、或出生到线上那套头上，都比不出生更糟。
+
+
+async def create_draft_profile(session: AsyncSession) -> int:
+    """按 settings 的三元组出生（或复用）一行档案，返回它的 id。
+
+    三条口径都在这一句里，各自有用例钉着（工单 029 验收 1/8/9）：
+
+    1. **四键没配齐 → 400 且不建空壳**（spec 故事 16）。留一行永远不会被灌完的 draft 的后果比
+       报错重：030 会看到它并诱导人去激活一套零结果的基准。
+    2. **撞名复用**（拆工时补的口径）：`profile_name()` 里没有 datasource，档案是**全局**的，
+       两个源同三元组各发一次 reindex 必然撞 `uq_kb_index_profile_name`。复用那一行、回同一个
+       id、不建第二行、不抬 409——"两个源共用一套基准"是正常状态，不是事故。
+    3. **撞到的那行是 active → 409**（撞名口径的补集）：复用它等于往线上基准上原地改向量，
+       spec 故事 3 那句"重建中不影响线上检索"当场为假。
+
+    `is_active` 不写：027 之后读写两侧都只认 `status`，那一列 031 要删。
+    `provider` 读 `embedding_client.EMBEDDING_PROVIDER`，不在这再抄一遍字面（§2.6 注④）。
+
+    **必须 commit**：worker 是另一个进程（ADR-0011），未提交的档案行在它眼里不存在，
+    而它拿 `sync_jobs.reindex_profile_id` 去读的就是这一行。
+    """
+    settings = get_settings()
+    if not settings.embedding.configured:
+        raise ReindexEmbeddingMissing(
+            "embedding 四键（AIWEB_EMBEDDING__BASE_URL / __API_KEY / __MODEL / __DIMENSION）"
+            "没配齐，reindex 建不出灌得进向量的档案",
+            detail="出路两条：把这四键配成真端点，或起闸内替身 "
+            "backend/scripts/fake_embedding_server.py 并把 AIWEB_EMBEDDING__BASE_URL 指向它。",
+        )
+    model, dimension, tplv = configured_triplet()
+    name = profile_name(model, dimension=dimension, card_template_version=tplv)
+
+    existing = await _profile_by_name(session, name)
+    if existing is not None:
+        return _accept_existing_profile(existing, name=name)
+
+    row = KbIndexProfile(
+        name=name,
+        provider=EMBEDDING_PROVIDER,
+        model=model,
+        dimensions=dimension,
+        card_template_version=tplv,
+        status="draft",
+    )
+    session.add(row)
+    try:
+        # id 在 flush 之后就拿下了：`commit()` 会让 ORM 对象过期，之后再读 `row.id`
+        # 是一次隐式 IO（async 会话上直接 MissingGreenlet）。与 conftest 的
+        # `insert_active_profile` 同写法。
+        await session.flush()
+        profile_id = int(row.id)
+        await session.commit()
+    except IntegrityError as exc:
+        # 只有并发会走到这里（两个请求同三元组同时进来）：唯一索引替我们决出胜负，
+        # 输的一方复用的就是赢的那一行。与 `PostgresJobQueue.enqueue` 认 `ux_sync_running`
+        # 同一条纪律——只认这个约束名，FK/CHECK 之类的失败不许被说成"撞名"。
+        await session.rollback()
+        if "uq_kb_index_profile_name" not in str(getattr(exc, "orig", exc)):
+            raise
+        raced = await _profile_by_name(session, name)
+        if raced is None:
+            raise
+        return _accept_existing_profile(raced, name=name)
+    return profile_id
+
+
+async def _profile_by_name(session: AsyncSession, name: str) -> RowMapping | None:
+    stmt = select(_PROFILE.c.id, _PROFILE.c.status).where(_PROFILE.c.name == name)
+    return (await session.execute(stmt)).mappings().one_or_none()
+
+
+def _accept_existing_profile(existing: RowMapping, *, name: str) -> int:
+    """撞名那一行的去向：active 拒绝，其余（draft / retired）复用。
+
+    `status` 的词表由库的 CHECK 守住（§2.6 / 迁移 0008），所以这里只分"是不是 active"，
+    不再为第四种状态写分支——真出现了，上面那句 `status == "active"` 为假、复用它的 id，
+    而 030 的激活与检索两侧都会各自撞上那一态，比在这里再判一次诚实。
+    """
+    if str(existing["status"]) == "active":
+        raise ReindexMatchesActive(
+            f"要重建的这套基准与当前生效的档案是同一套（{name}）：reindex 会原地改线上检索的向量，"
+            "而同一套三元组没有新基准可建",
+            detail="想换基准就改 AIWEB_EMBEDDING__MODEL / __DIMENSION（档案名跟着变）；"
+            "想给现有卡片补向量就跑一次普通同步（四键配齐且三元组一致时它会真写完 embed 档）。",
+        )
+    return int(existing["id"])
 
 
 # ================================================== meta_* 行 → TableMeta
@@ -762,6 +867,183 @@ async def sync_cards(
             await session.rollback()
             failures.append(CardBuildFailure(table_full_name=full_name, error=exc))
     return CardBuildOutcome(cards=cards, failures=tuple(failures))
+
+
+# ============================================================ 向量的落点与灌法（工单 029）
+#
+# 这一节只回答两件事：**往哪一列**、**灌哪些卡**。发 HTTP 的不在这里（`embedding_client`），
+# 逐表推进与事务边界也不在这里（`sync_service` 的 embed 段）——它跟 `meta_table_mark_stale()`
+# 是同一族：语句在这里造好，执行与提交在编排层，测试直接编译语句钉它的形状。
+#
+# 为什么"往哪一列"要经过这里而不是让编排层自己拼：`vector_column_for()` 是纯映射，它抬
+# `ValueError`；而 `sync_jobs.errors[]` 只分得出 `AppError`。翻译只许有一次，所以放在离库
+# 最近的这一层，编出来的 `VectorTarget` 已经是"这一颗作业能用的落点"。
+
+
+@dataclass(frozen=True, slots=True)
+class VectorTarget:
+    """一次 embed 的落点：档案那一维 + 它对应的那一列 + 该问端点哪个模型。
+
+    三格永远一起用（写向量的语句要列名，客户端校验要宽度，请求体要 model 名），所以不拆成
+    三个返回值。没有 `profile_id`：调用方本来就知道靶是哪一行，带上只是多一个可能被读错的字段。
+
+    `model` 为什么在这而不是让编排层自己读 settings：已定口径是"reindex 用 draft 档案**自己
+    的三元组**"，而三元组里 `dimensions` 走这条路之后，`model` 若还从 settings 拿，同一颗作业
+    就会**一半认档案、一半认配置**——改过 `.env` 的那一轮实际问的是新模型、验的却是旧模型的宽度，
+    两边恰好对上时静默写进一批来自另一个语义空间的向量（工单 029 双轴审查·规格轴）。
+    """
+
+    dimensions: int
+    model: str
+    column: str
+
+
+def vector_target_for(*, dimensions: int, model: str) -> VectorTarget:
+    """档案的维度 → 落点；没有预置列时抬可辨识的一档。`model` 原样带着走，不参与翻译。"""
+    try:
+        column = vector_column_for(dimensions)
+    except ValueError as exc:
+        raise VectorColumnMissing(str(exc)) from exc
+    return VectorTarget(dimensions=dimensions, model=model, column=column)
+
+
+async def read_vector_target(session: AsyncSession, *, index_profile_id: int) -> VectorTarget:
+    """按 id 读那一行档案的 `dimensions` 与 `model` 并翻成落点。
+
+    **只读这一行，不读 settings**（工单 029 已定口径"reindex 用自己的三元组"）：
+    档案那两格是历史事实，`.env` 后来改成多宽、换成哪个模型都不改这颗作业该怎么问、该灌多宽。
+    也不读 `status`：这里不问"这套档案能不能上线"（那是 030 的门槛），只问"它要哪一列"。
+
+    行读不到时 `scalar_one()`/`one()` 当场抬 `NoResultFound`。调用方**不需要**为这一格写分支：
+    `kb_card.index_profile_id` 是 ON DELETE RESTRICT，而这一句只在"本轮真有卡片"时才发——
+    有卡就没有、也不可能有"档案已删"的那种行。
+    """
+    row = (
+        await session.execute(
+            select(_PROFILE.c.dimensions, _PROFILE.c.model).where(_PROFILE.c.id == index_profile_id)
+        )
+    ).one()
+    return vector_target_for(dimensions=int(row.dimensions), model=str(row.model))
+
+
+@dataclass(frozen=True, slots=True)
+class EmbedBatch:
+    """一张表的待灌卡片。`card_ids[i]` 与 `texts[i]` 一一对应，顺序就是写回的顺序。
+
+    表全名（`db.t` 形状）跟着走：单表失败要进 `sync_jobs.errors[]`，而那里要的是一句人话
+    读得出的"哪张表"（§2.8 的 `card_build_failed` 同一条口径），table_id 到了库里没人认得。
+    """
+
+    table_full_name: str
+    card_ids: tuple[int, ...]
+    texts: tuple[str, ...]
+
+
+async def embed_batches(
+    session: AsyncSession, *, index_profile_id: int, table_ids: Sequence[int]
+) -> list[EmbedBatch]:
+    """本轮这几张表的、挂在目标档案下的卡片，按表分成批。
+
+    三个筛选条件各有各的理由：
+    - `index_profile_id`：**只灌这套基准的卡**。同一张表在两套档案下各有一批行（§2.6 末），
+      漏掉这一格就会把新向量写到旧档案的卡上，而旧档案还在被线上检索用着。
+    - `table_id = ANY(本轮落成的表)`：陈旧表（源库已无实体）不参与，与 card_build 同一把尺。
+    - `deleted_at IS NULL`：软删的卡不会再被检索命中，给它取向量是白烧额度。
+
+    **不按"向量列还是 NULL"筛**：看着像省一次调用，实际是把"上一轮灌过、这一轮文本没变"
+    的卡当成已完成——而 `kb_card_upsert()` 每轮都把两个向量列显式清成 NULL，这一轮真该重灌的
+    卡恰好在 NULL 那一侧；靠它筛等于给未来的改道人留一条"漏灌也不红"的路。
+
+    排序按 `(table_id, seq)`：`seq` 是同一张表的段号，卡片文本按段递增，批次内容因此与
+    库里行序无关——两次跑出同一份请求体，替身才回得出同一批向量。
+    """
+    ids = sorted(set(table_ids))
+    if not ids:
+        return []
+    rows = (
+        await session.execute(
+            select(
+                _CARD.c.id,
+                _CARD.c.table_id,
+                _CARD.c.text_md,
+                _META_TABLE.c.catalog_name,
+                _META_TABLE.c.schema_name,
+                _META_TABLE.c.table_name,
+            )
+            .join(_META_TABLE, _META_TABLE.c.id == _CARD.c.table_id)
+            .where(
+                _CARD.c.index_profile_id == index_profile_id,
+                _CARD.c.table_id.in_(ids),
+                _CARD.c.deleted_at.is_(None),
+            )
+            .order_by(_CARD.c.table_id, _CARD.c.seq)
+        )
+    ).mappings()
+    grouped: dict[int, list[tuple[int, str, str]]] = {}
+    for row in rows:
+        table_id = int(row["table_id"])
+        grouped.setdefault(table_id, []).append(
+            (
+                int(row["id"]),
+                str(row["text_md"]),
+                _full_name(
+                    str(row["catalog_name"]), str(row["schema_name"]), str(row["table_name"])
+                ),
+            )
+        )
+    return [
+        EmbedBatch(
+            table_full_name=items[0][2],
+            card_ids=tuple(card_id for card_id, _, _ in items),
+            texts=tuple(text for _, text, _ in items),
+        )
+        for items in grouped.values()
+    ]
+
+
+def card_vector_update(column: str) -> Any:
+    """一张卡的向量落库：`SET <档案那一维的列>=:vector, embedded_at=now(), updated_at=now()`。
+
+    `column` 只准来自 `vector_column_for()` 那两格受控字面（`test_vector_columns.py` 的 allowlist
+    钉着"除映射与列定义本身之外没有第四处落点"），**不是**用户输入。列名也不是拼进 SQL 文本的：
+    这里取的是 `_CARD.c[column]` 这个**列对象**，编译时由 SQLAlchemy 按方言 quoting 输出，
+    传一个不存在的列名会在属性查找上就 `KeyError`，而不是一句能跑的 SQL。
+    向量和卡片 id 走绑定参数：一条 1536 维向量拼成字面量是几十 KB 的语句文本。
+
+    写哪一列由档案的维度决定，另一列一个字都不动（ADR-0012）：同一张卡的两根向量列不在
+    同一个语义空间里，覆盖另一列等于把线上检索的向量换成另一套基准的数，而库里两行都合法、
+    没有任何一层会报错。这里不写第二列的名字是故意的——`test_vector_columns.py` 那条 allowlist
+    要的是"只有映射那一处知道维度翻成哪个列名"，注释里多点一次名就在多点一份会过期的账。
+    形状由 `test_sync_embed_sql.py` 钉。
+
+    只写 `embedded_at`，不写 `text_md`/`search_text`：embed 档不改文本，文本没变向量才有效
+    （改文本洗 NULL 的那条在 `kb_card_upsert()`，两边不许互相代劳）。
+    """
+    return (
+        update(_CARD)
+        .where(_CARD.c.id == bindparam("card_id"))
+        .values(
+            {
+                _CARD.c[column]: bindparam("vector"),
+                "embedded_at": func.now(),
+                "updated_at": func.now(),
+            }
+        )
+    )
+
+
+def mark_profile_built(profile_id: int) -> Any:
+    """作业终局时给目标档案盖上 `built_at`（工单 029 已定口径：success 与 partial 都盖）。
+
+    **只有这一格**：`status` 不在射程内。draft→active 是 030 那道激活门槛的权力，同步链路
+    自己改状态等于把"重建中不影响线上检索"做成"重建完自动上线"。只动这一格由
+    `test_sync_embed_sql.py` 钉在语句形状上。
+
+    执行点在 `run_sync` 的 finally 里、终局那次 `_set_phase` **之前**：`_set_phase` 末尾自己
+    commit，这一句就搭同一次车。分开的两次提交会留出一刻"status='success' 而 built_at 还空着"
+    （或反过来），而 030 读的就是这两格的合取。
+    """
+    return update(_PROFILE).where(_PROFILE.c.id == profile_id).values(built_at=func.now())
 
 
 # ============================================================ 读取路径

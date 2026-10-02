@@ -2,7 +2,8 @@
 
 它是一个**真 HTTP 服务**：真监听端口、真收 POST `/v1/embeddings`、真按 OpenAI 的形状回话。
 它不是 `EmbeddingClient` 的第二个实现——生产代码里那一个实现从头到尾不知道对面是谁，
-把三键指到本脚本，`settings.embedding.configured` 就变真，于是 base_url 拼接、超时、
+把 `.env` 里那四格（BASE_URL / API_KEY / MODEL / DIMENSION）指到本脚本，
+`settings.embedding.configured` 就变真，于是 base_url 拼接、超时、
 非 200、维度不符这四件事在闸里全部可达（ADR-0015 选它的正是这一条）。
 
 向量内容是**字符 n-gram 哈希**，不是语义。它证的是形状与链路（名次齐、列宽对、档案切换
@@ -18,7 +19,7 @@
 
 ```
 uv run python scripts/fake_embedding_server.py --port 8111
-# 然后把 backend/.env 的三键指过去（DIMENSION 要与 model 对上）：
+# 然后把 backend/.env 的四格指过去（DIMENSION 要与 --dimension 对上）：
 #   AIWEB_EMBEDDING__BASE_URL=http://127.0.0.1:8111/v1
 #   AIWEB_EMBEDDING__API_KEY=fake            # 探针只要求非空，服务端不校验
 #   AIWEB_EMBEDDING__MODEL=text-embedding-3-small
@@ -27,6 +28,13 @@ uv run python scripts/fake_embedding_server.py --port 8111
 
 `--port 0`（默认）让 OS 挑空闲端口，并把实际地址打成 `LISTENING <host> <port>` 一行——
 用例要的就是这一行，并行跑两份 pytest 时固定端口一定被人占着。
+
+两个注入开关（工单 029 的失败语义要用，都不影响默认那条成功路）：
+
+```
+--fail-on shop_t2          # 含该子串的那一发回 500（可重复）→ 单表失败落 partial
+MODEL=mismatched-width     # 该名字回 999 维，没有任何档案配得上 → 维度不符整颗 failed
+```
 """
 
 from __future__ import annotations
@@ -40,13 +48,22 @@ from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Final
 
-# model 名 → 维度。**只有这两套**，未知名字当场 400：静默给一个默认宽度，等于让
-# "配置里的维度"与"端点回的维度"两件事各自漂——那正是 §2.6 三元组要拦的东西。
-# 名字取自仓库里已经在用的两个（`text-embedding-3-small` 是 1536 那一套，
+# model 名 → 维度。未知名字当场 400：静默给一个默认宽度，等于让"配置里的维度"与"端点回的
+# 维度"两件事各自漂——那正是 §2.6 三元组要拦的东西。
+# 前两个名字取自仓库里已经在用的两个（`text-embedding-3-small` 是 1536 那一套，
 # `bge-large-zh-v1.5` 是 027 用例里"只改模型名"那一档用的 1024 那一套）。
+# 第三个不是"第三套基准"，是工单 029 验收 7 的靶：**没有任何预置向量列配得上它**。999 不在
+# `core/vector_columns.py` 的允许集合里，所以走真链路时它只会以两种形态出现——`.env` 里
+# MODEL 与 DIMENSION 都写成 999 那一套（档案的 `dimensions` 只读 `AIWEB_EMBEDDING__DIMENSION`，
+# 本替身的 model 表不参与出生，所以两种形态是**分别**造出来的，不是同一个配置引发两次），
+# 于是 `vector_target_for` 当场抬 `vector_column_missing`；或者档案是 1536 而 model 写了这个
+# 名字（端点回 999，客户端抬 `embedding_dimension_mismatch`，整颗作业 `failed`）。
+# 第二条正是"不截断、不补零、不降级"
+# 那条口径唯一的闸内证据：没有这一行字面，那一档只有配真端点才测得到，而闸就不绿也不行。
 MODEL_DIMENSIONS: Final[dict[str, int]] = {
     "text-embedding-3-small": 1536,
     "bge-large-zh-v1.5": 1024,
+    "mismatched-width": 999,
 }
 
 # n-gram 的窗口：中文卡片大多是一到两个字的字段名/表名注释，unigram+bigram 才分得开
@@ -127,6 +144,9 @@ class _Handler(BaseHTTPRequestHandler):
     """
 
     server_version = "AiWebFakeEmbedding/1.0"
+    # 由 `_make_handler` 在起服务时绑上（`BaseHTTPRequestHandler` 的构造参数在 server 手里，
+    # 启动期的配置只能挂类属性）。空元组 = 每一发都正常回。
+    fail_on: tuple[str, ...] = ()
 
     def log_message(self, format: str, *args: Any) -> None:
         """静音每请求一行的访问日志。
@@ -145,11 +165,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, status: int, message: str, code: str) -> None:
-        """形状照 OpenAI：`{"error":{message,type,code}}`，客户端的取词逻辑才不用分两种端点。"""
+    def _error(
+        self, status: int, message: str, code: str, *, kind: str = "invalid_request_error"
+    ) -> None:
+        """形状照 OpenAI：`{"error":{message,type,code}}`，客户端的取词逻辑才不用分两种端点。
+
+        `kind`（= OpenAI 的 `type`）默认是 `invalid_request_error`，只有 500 那一档要换成
+        `server_error`：一个"请求写错了"的类型挂在 500 上是假话，而客户端读的是状态码不是它，
+        所以改类型不改变任何行为，只是让替身别教会后人"500 也该带 invalid_request_error"。
+        """
         self._send(
             status,
-            {"error": {"message": message, "type": "invalid_request_error", "code": code}},
+            {"error": {"message": message, "type": kind, "code": code}},
         )
 
     def do_GET(self) -> None:
@@ -181,6 +208,18 @@ class _Handler(BaseHTTPRequestHandler):
         if inputs is None:
             self._error(400, "input 必须是字符串或字符串数组", "bad_input")
             return
+        # 工单 029 验收 6 的注入点：**按文本子串**炸，不按表名、不按卡片 id。
+        # 理由是"替身不知道本项目的表叫什么"——它只认 OpenAI 那一层的输入形状。表名之所以够用，
+        # 是因为卡片正文里就带着 `schema.table`（kb-workflow §5 的表头），所以用例传
+        # `--fail-on shop_t2` 就等于"含那张表的那一发回 500"。
+        # 500 而不是 400：可重试那一档（`RETRYABLE_STATUS`）才会真的把退避重试运行一遍，
+        # 而"单表失败其余照落"要的是端点自己坏掉的形状，不是请求写错的形状。
+        hit = next((token for token in self.fail_on if any(token in t for t in inputs)), None)
+        if hit is not None:
+            self._error(
+                500, f"替身按 --fail-on {hit!r} 注入的失败", "server_error", kind="server_error"
+            )
+            return
         self._send(200, embeddings_response(model, inputs))
 
 
@@ -201,15 +240,34 @@ def _as_input_list(value: Any) -> list[str] | None:
     return None
 
 
+def _make_handler(fail_on: Sequence[str]) -> type[_Handler]:
+    """把启动参数绑到 handler 的类上：`BaseHTTPRequestHandler` 由 server 自己实例化，
+    构造参数不在我们手里，所以注入开关只能挂类属性。返回的是**子类**，`_Handler` 本身不动——
+    两份替身并行跑时（两条 pytest 同时跑闸）各自的类里各自的 `fail_on`，不共享状态。
+    """
+    return type("_HandlerWithSwitches", (_Handler,), {"fail_on": tuple(fail_on)})
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="闸内伪向量端点（只服务测试，不写元数据库）")
     parser.add_argument("--host", default="127.0.0.1")
     # 默认 0 = 让 OS 挑：并行跑两份 pytest 时固定端口一定被人占着，而那件事在 CI 之外
     # 天天发生，所以"自己挑一个没人用的"必须是默认值而不是选项。
     parser.add_argument("--port", type=int, default=0)
+    parser.add_argument(
+        "--fail-on",
+        action="append",
+        # `default` 必须是 None 而不是 `()`：argparse 的 append 动作往 default 那个对象上
+        # `append`，给一个元组就在**第一条 `--fail-on`** 上炸 `AttributeError: 'tuple' object
+        # has no attribute 'append'`。这里踩过一次——用例看到的是一根没起来的替身，
+        # 而替身自己吐出的 traceback 才是真原因。
+        default=None,
+        metavar="TEXT",
+        help="含 TEXT 的那一发回 500（可重复）：工单 029 验收 6 的单表失败注入点",
+    )
     args = parser.parse_args(argv)
 
-    server = ThreadingHTTPServer((args.host, args.port), _Handler)
+    server = ThreadingHTTPServer((args.host, args.port), _make_handler(args.fail_on or ()))
     host, port = server.server_address[:2]
     # 这一行是用例的**就绪协议**：绑定完成后才打印，所以看到它就等于看到"能连了"。
     # 不带 -u 时子进程的 stdout 是块缓冲，这一行会一直躺在缓冲区里，等着它的用例会红成超时。
