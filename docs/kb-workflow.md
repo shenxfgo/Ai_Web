@@ -285,15 +285,15 @@ token 估算**不引真 tokenizer 到写入路径**：`CJK 字符数×1 + ASCII 
 
 | 键 | 默认 | 语义 |
 |---|---|---|
-| `AIWEB_EXTRACT__SAMPLE_DISTINCT` | `true`（演示库）/ 计划建议真实大库**默认关**、按数据源在 UI 勾选 | 采样会**扫源库数据**，涉及"是否读了业务数据"的合规边界与同步耗时 |
+| `AIWEB_EXTRACT__SAMPLE_DISTINCT` | **`false`** | 采样会**扫源库数据**，涉及"是否读了业务数据"的合规边界与同步耗时 |
 | `AIWEB_EXTRACT__SAMPLE_DISTINCT_MAX_DISTINCT` | `30` | 只有 NDV ≤ 该值才视为枚举列 |
-| `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` | `1000` | 单次采样扫描上限 |
+| `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` | `1000` | 单次采样扫描上限（内层窗口） |
 
 执行顺序（先过滤再扫，别拿全表试）：
 
 1. 先按列类型筛候选：`information_schema.columns.data_type IN ('enum','set','varchar','char','boolean','tinyint')`
    （只挑 enum/短文本，且低基数）。
-2. 再判基数：`SELECT col, COUNT(*) ... GROUP BY col LIMIT 40` —— 一旦超过阈值即放弃该列。
+2. 再判基数：`SELECT col, COUNT(*) ... GROUP BY col LIMIT (MAX_DISTINCT + 10)` —— 一旦超过阈值即放弃该列。
 3. 通过的列写入 `meta_column.enum_values`（`["待支付","已支付"]`）与 `sample_values`，
    并由卡片模板的 `取值: …` 段落带进检索文本与 prompt。
 
@@ -303,6 +303,72 @@ token 估算**不引真 tokenizer 到写入路径**：`CJK 字符数×1 + ASCII 
 代价与取舍（原文明确记录）：开采样会显著上升同步时长与源库读压力（演示库可忽略，真实大库可能翻倍），
 但"中文到枚举值的映射"是用户第一周就会遇到的主要 bad case，所以演示/验收期建议开、
 真实大库按数据源单独勾。`SourceDialect.sample_distinct()` 在接口上是可选方法，默认 disabled。
+
+> as-built(P4-033)。上面那张表与那三步在 2026-10-03 之前**一个字都没有被实现过**——三枚键全仓
+> 只有 `app/settings.py` 的字段声明，`sample_distinct` 在抽取接口上不存在，`meta_column` 两列的
+> 写入点只有 ENUM/SET 定义那一路。本片把三步穿通一遍，下面这些是钉住的实物口径。
+>
+> **开关是 `false`，不是"演示库开"**。`.env.example` 里那行 `true（演示库）` 随本片一并改判：
+> 默认关、按数据源在 UI 勾选是 P9 的账（`app_settings` 那一层 L3 运行参数今天没有地基），
+> 所以现在唯一的开法就是进程环境变量。默认关还有一层测试地基层的作用：
+> `tests/integration/conftest.py` 的 autouse 夹具 `sampling_off_by_default` 在**目录内**把开关按成
+> false，此后任何一条用例拿到的值域都只能是它自己 `setenv` 出来的，不会从邻居的进程环境串味。
+>
+> **`LIMIT 40` 是表达式不是字面量**。`ndv_query_limit(max_distinct) = max_distinct + 10`：
+> 30 时恰好 40，而把阈值抄成常量之后，改阈值那一格就成假话。余量必须有实物：真 MySQL 与真 PG
+> 两个演示源里的 `category.name` 都是**表只有 40 行、40 个不同取值**，外层若写 `LIMIT 30`，
+> 那一列只回 30 组、`adjudicate` 看不出"超了"，40 个取值的自由文本列就被当成枚举列写进卡片
+> （两条 live 用例各钉一次）。
+>
+> **窗口 ≠ 全表**。内层那个 `LIMIT :row_limit` 没有 `ORDER BY`——§8 说的是"扫描上限"，不是"最新的
+> 一批"，加排序等于让源库为这个上限再排一次。代价的实物在真 MySQL 那一轮：`customer.city` 全表
+> distinct 是 12 个城市，值域里只有 4 个（`SELECT city ... LIMIT 1000` 走覆盖索引 `idx_customer_city`，
+> 按索引序回来的前 1000 行只摊到 4 个城市）。省下的排序换走的是"少见取值可能没进窗口"。
+>
+> **两枚闸，缺一不可**：用户开关（`extract_cfg.sample_distinct`）× 方言能力位
+> （`_SourceDialect.can_sample_distinct`）。能力位是数据不是 `isinstance` 分支（沿用 024 摘掉
+> "按类型判断"那颗边角的结论），两方言今天都是 `True`。两处都关时**静默跳过**，不发 SQL、
+> 不写 `errors[]`、不动进度帧。
+>
+> **失败按表隔离，code 是新的一档 `sample_failed`**：与 029 的 `embed_failed` 分档，因为它们失效
+> 的东西不同（值域只影响卡片文本，向量影响检索本身）。发数是**一列一条**（不是每表一条、
+> 也没有 `UNION ALL`：`sample_distinct()` 里对候选列逐个 `build_sql_sample` + `_fetch`），
+> 但**失败粒度是整表**——那一条抛错时整张表的事务一起回滚，同表其他列即使已经写好也一起回 NULL，
+> 而其余表已提交的值域照常在场（逐表事务与卡片那一路同一口径）。`detail` 以 `schema.table:` 开头，
+> 整轮终局 `partial`。发包数 = 候选列数：真 MySQL 那一轮 16 列各发一条、只有 7 列拿到值域，
+> "发了多少条"与"写了多少列"是两道闸各自的实物。这与 `collect()` 那条"查询条数与表数量无关"
+> 是**相反**的口径，换的正是这个失败粒度。
+>
+> **采样不属于档案**：这一步排在 active 档案那个分支**之前**。无档案的一轮真同步里 7 列照样拿到
+> 值域、`counters["cards"]` 照样是 0，这两格在同一轮里同时成立，就是这条口径的实物。
+>
+> **`sample_values` 随 `enum_values` 进 `_COLUMN_SYNC_COLS`**：一轮不采样的同步会把两格一起抹回
+> NULL。少了这一格的话，卡片少一行「取值:」而界面下拉里还摆着上一轮的值域——两处读同一列的说法
+> 当场分家（真 MySQL 那一轮的第二回合钉的就是这个）。
+>
+> 三处清单与实物对不上，都是**记账不是修文档圆场**：
+> 1. 第 1 步那句 `information_schema.columns.data_type IN (...)` 在 MySQL 上对得上，在 PG 上
+>    `pg_catalog` 给的是 `boolean` / `character varying` / `text`，不是 IS 那些名字。实现按
+>    **归一后的 `data_type`** 的基名判（归一是 023 的事，基名不吃括号）。
+> 2. **PG 的 `text` 不在清单里**。演示库 5 列 `text`（`customer.gender`=3、`customer.level`=4、
+>    `order_main.status`=6、`payment_record.channel`=4、`product.status`=3，五个数逐列抄自
+>    `init_demo_pg.sql:653-657` 那条枚举覆盖断言的 `want`），全部远低于阈值 30，
+>    是最像枚举的那一批，却因为类型进不了候选、两格恒空。补它要改的是第 1 步那行清单（跨方言
+>    口径），本片没动，差异记在工单 033 的交付记录里。
+> 3. `boolean` 只在 PG 侧有意义（MySQL 无原生布尔），MySQL 那一侧的 `tinyint` 已在拍板清单；
+>    第 3 步"写入 `meta_column.enum_values` 与 `sample_values`"只对**采样**这一路成立——真
+>    ENUM/SET 列由定义那一路写 `enum_values`，采样不许碰它们，且 `sample_values` 恒空。
+>
+> 两处"文档说了、实物还没有"，别把上面那段当全交付。其一是**分辨力只在桩上**：`is_generated`
+> 这一支两个演示源都没有生成列（015 自检数的是注释与类型，不数生成列），`has_declared_enum`
+> 那一支在 PG 侧空转（`typtype='e'` 实测 0 行，见 verification §1.5.4 末注），两者都只有
+> `tests/unit/test_extract_sample_distinct.py` 里 `test_生成列不扫` 与
+> `test_已经从定义拿到值域的列不覆盖` 两条桩用例在钉。其二是**归属写法不同**：
+> §8 末那句 `SourceDialect.sample_distinct()` 与实物不是同一个住处——方法名是同一个，但它不挂在
+> `_SourceDialect`（那里只有一个 `can_sample_distinct: bool` 能力位），而是独立成 `base.py` 的
+> `SupportsSampleDistinct` 可选协议，编排层拿能力位判、拿协议类型的形参调。为什么不挂进
+> `Extractor`：挂上来第三种源库一登记就得先交一个空实现，而 §8 要的语义是"没有这档 = 整步跳过"，
+> 注释在 `base.py` 那个协议自己身上。
 
 ## 9. 术语与 few-shot
 

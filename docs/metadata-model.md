@@ -216,7 +216,7 @@ nullable bool / default_value text / is_generated bool
 comment_raw text / comment_zh text / business_desc text
 is_primary_key bool / is_unique bool / is_indexed bool
 enum_values jsonb NULL    -- ["待支付","已支付"] —— 中文枚举值直接决定 where 条件能否命中
-sample_values jsonb NULL  -- 少量低基数distinct值（可选，默认关）
+sample_values jsonb NULL  -- 少量低基数distinct值（默认关；写入点是 §8 三步，见 §6 第 10 条 as-built）
 char_length int / numeric_precision int / numeric_scale int
 synced_at
 UNIQUE (table_id, column_name)
@@ -746,7 +746,7 @@ VALUES (...)
 ON CONFLICT (table_id, column_name) DO UPDATE SET
   ordinal_position = EXCLUDED.ordinal_position,
   data_type / raw_data_type / nullable / default_value / is_generated /
-  comment_raw / is_primary_key / is_unique / is_indexed / enum_values /
+  comment_raw / is_primary_key / is_unique / is_indexed / enum_values / sample_values /
   char_length / numeric_precision / numeric_scale   = EXCLUDED.<同名列>,
   comment_zh    = COALESCE(aiweb.meta_column.comment_zh,    EXCLUDED.comment_zh),
   business_desc = COALESCE(aiweb.meta_column.business_desc, EXCLUDED.business_desc),
@@ -779,6 +779,12 @@ DELETE FROM aiweb.meta_relation
   `now()`：PG 的 `now()` 是事务时间戳，同一事务内恒定，拿它和自己比永远不成立。
 - `enum_values` 归同步列而不是人工列：它是源库 `COLUMN_TYPE` 的投影（§8.1 C 的 `enum_def`），
   同步每次都能重算出来，人工改它没有意义（要改语义写 `comment_zh`）。
+- **as-built(P4-033)：`sample_values` 随本片进 `_COLUMN_SYNC_COLS`，与 `enum_values` 同一条命运**
+  （整列覆盖，不是 `COALESCE` 保旧）。理由不是"它也是同步算出来的"这一句抽象话，是一个批次事实：
+  §8 第二步的裁决一次返回两格、一条 UPDATE 一起写，所以**失效也得是一个批次**。它之前不在同步列里，
+  一轮不采样的同步就会把 `enum_values` 抹成 NULL 而让隔壁那格留着上一轮的值域。
+  另一处不对称也一并写明：采样那一条 UPDATE（`meta_column_sample_update`）**不刷 `synced_at`**——
+  时间戳归主 upsert 那一趟，采样只改内容，否则"这一列本轮有没有被清扫放过"就有了第二个答案。
 - **as-built(P3-024)：`enum_values`/`sample_values` 两格的"没有值域"是 SQL NULL，不是 JSON `null`。**
   SQLAlchemy 的 `JSON`/`JSONB` 默认 `none_as_null=False`，它把 Python `None` 序列成 `'null'::jsonb`
   落库，于是 `IS NOT NULL` 成立、`count(*) filter (where enum_values is not null)` 会把每一列都数进去
@@ -933,6 +939,25 @@ DELETE FROM aiweb.meta_relation
 >    > 键没有读取点时"默认 true"只是文档噪音，有了读取点它就变成每次同步都真去源库跑 `GROUP BY`，
 >    > 而抽取层至今没有 `SET statement_timeout` 那一格保护，见 P3 无主账 ①）。
 >    > 认下的后果照写：默认配置下 §8 三步不跑，非 ENUM 的中文枚举列仍进不了卡片。
+>    > > **as-built(P4-033)（2026-10-03，工单 033）：这一整块交付完了，上面那句"后果"从今天起
+>    > > 只在默认值下成立。**三键的读取点是 `run_sync` 里那**两枚闸**（用户开关 ×
+>    > > `_SourceDialect.can_sample_distinct` 能力位，能力位是数据不是 `isinstance`——024 摘掉的
+>    > > 那颗边角不许装回去），两处都开时**一列发一条**（发数 = 候选列数，没有 `UNION ALL`；
+>    > > 事务边界仍是逐表）、关时**静默跳过**（不发 SQL、
+>    > > 不写 `errors[]`、不动进度帧）。`meta_column.sample_values` 的写入点与 `enum_values`
+>    > > 那一格的追加写在 `app/extractor/sampling.py`（候选筛子 + 裁决 + 渲染，纯函数）与
+>    > > `sync_service._run_sample_stage`（编排骨架）两处；SQL 形状两家方言各自 `build_sql_sample`。
+>    > > 三条与上面那段口径不同的地方，都记在这里而不是埋在代码注释里：
+>    > > ① **失败档是新增的一档 `sample_failed`**，不与 029 的 `embed_failed` 合用（失效的东西
+>    > > 不同：值域只影响卡片文本，向量影响检索本身）。发数一列一条、**失败粒度整表**：抛错那一张表
+>    > > 连同表其他列一起回滚，其余表已提交的值域照常在场，整轮 `partial`；
+>    > > ② **`sample_values` 随本片进 `_COLUMN_SYNC_COLS`**，于是 §2.4 注（P3-024 那条"整列覆盖
+>    > > 不是 `COALESCE` 保旧"）管的两格一起回 NULL——少了这一格会做出"卡片少一行取值而界面下拉
+>    > > 还摆着旧值域"的分家；③ **采样这一步排在 active 档案分支之前**，不属于档案：
+>    > > 无档案的一轮里 7 列拿到值域而 `counters["cards"]==0` 同时成立（真 MySQL 那一轮的实物）。
+>    > > 两格仍然没有实物的：`is_generated` 那一支两个演示源都没有生成列，`has_declared_enum`
+>    > > 那一支在 PG 侧没有实物（`typtype='e'` 0 行），两者分辨力都只在桩上。
+>    > > §8 那份类型清单在 PG 侧够不到 `text` 这件事记在 kb-workflow §8 的 as-built 第 2 条。
 > 11. **读侧真分批**：`collect()` 按 `BATCH_SIZE` 切片循环发那几条 `IN (...)` SQL，批间
 >    `sleep(BATCH_INTERVAL_MS)`。演示库只有 11 个对象，所以用例把 `BATCH_SIZE` 降到 3，
 >    在真库上跑出 4 批——这两个键不再是空转，而"分批"这件事也因此真的被验过。
@@ -1275,6 +1300,17 @@ class SourceDialect(Protocol):
 >    cancel 回调）、`render_create_sql`、`sample_distinct` 属 P3，没有实现也没有桩——
 >    与其留一个永不通过的假实现，不如让 Protocol 显式小一点（`app/extractor/base.py` 的
 >    `Extractor` 就是这个子集，注释里写着少掉的三个）。
+>    > **as-built(P4-033)：这一格里三个"属 P3"的账今天分两半。**`stream_manifest` 与
+>    > `render_create_sql` 仍然无实现无桩（前者等 `cancel` 有写入点、后者等 P8 的"查看建表语句"）；
+>    > `sample_distinct` **已由工单 033 落地**，但形状与上面那份草稿不同三处，逐条抄在这里免得读者按草稿找：
+>    > ① 它是**独立可选协议** `SupportsSampleDistinct` 上的方法，不挂在 `Extractor` 上（"这家方言没有
+>    > 这档能力"因此是类型层面看得见的事，编排层读 `_SourceDialect.can_sample_distinct` 那颗数据位）；
+>    > ② 入参是 `SampleTarget(schema_name, table_name, columns)` 加两个**必填** kwargs
+>    > `max_distinct` / `row_limit`——草稿的 `cols: Sequence[RawColumn]` 改成列名三元组，因为采样住在
+>    > 落库之后、手里只有 `meta_column` 的行；草稿的 `max_ndv: int = 30` 去掉默认值并改名，因为默认值
+>    > 会有第二个定义点（30 的口径住在 `Settings.extract`）；③ 返回 `list[ColumnSample]` 是**组**
+>    > （`(值, 次数)`）而不是草稿那个 `dict[str, list[str]]` 值域——裁决归 `sampling.adjudicate`，
+>    > 方言层只负责"把这列数一遍"。口径全文在 §6 第 10 条的 as-built 与 `kb-workflow` §8 的 as-built。
 > 3. **`collect` 的抽取范围是调用方渲染好的 SQL 片段 + 绑定参数**（`table_sql`/`table_params`），
 >    而不是原文的 `include_tables/exclude_tables` 两个序列。原因是这两列的口径必须由 006 的
 >    `test_connection` 与 007 的抽取共用同一个渲染函数（§8.1 B 的 as-built 注），

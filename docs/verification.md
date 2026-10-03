@@ -693,6 +693,47 @@ Success: no issues found in 54 source files
 | 7 | `POST /api/kb/search {"query":"销售额","mode":"vector"}`（真端点在位） | 200 且 `items` 非空、次序是余弦距离的次序；`took_ms` 有量（一发 HTTP + 一条索引查询）。**这一格是 roadmap §P4 验收 2 的语义那一格**，替身证不了（下面"留白"第一条） | 未跑（等真端点；闸内 `mode='vector'` 的形状已由 `test_kb_search_hybrid_pg.py` 钉住） |
 | 8 | 同一句问句在**真语料**（几千张卡）上分别给 `ef_search=64` 与 `400`，比两次向量名次集合 | 64 的集合 ⊆ 400 的集合，且 400 那一发**真的多召回**几张 | 未跑。**为什么这条必须在真数据量上手工重做**：闸内 200 行 `kb_card` 上规划器选的是 scan + top-N 排序，`ef_search` 根本不参与，用例只能靠 `SET LOCAL enable_sort = off` 把计划钉到 HNSW 上（详见 architecture §5.2 as-built(P4-031) 实测第 2、3 条）——所以"名次集合真变大"这句验收今天**没有闸内等价物**，只有"下发值可查 + 集合包含关系" |
 
+### 1.9 P4 枚举采样手测（工单 033 验收 4/5）
+
+§8 那三步的默认值是 `false`，所以"开了才扫源库"这件事必须有人手工跑一遍两遍——闸内它绿，
+只说明**用例自己**把开关按开了。本节两张表分别对应"闸内已证"与"手测才证"。
+
+**已在闸内有证据（不需要手工重做）**：
+
+| 格 | 闸内靶 | 它凭什么算证据 |
+|---|---|---|
+| 三枚键的默认值：`false` / `30` / `1000` | `tests/unit/test_settings.py`（字段默认那三行 + §8 键表来源注释） | 默认值与文档字面一对；`sample_distinct` 从 `true` 改判 `false` 是 P4 决策 ⑩，真相源写在断言旁边（roadmap 分组 7「扫源库数据，默认关」） |
+| 候选筛子的四档：清单内六类都认 / `bool` 是 `boolean` 归一后的写法 / 清单外一概不认 / 数组后缀不认，再加生成列与"定义已给值域"两档不进 | `tests/unit/test_extract_sample_distinct.py`（七条） | 纯函数，带长度的归一写法（`varchar(64)`、`numeric(10,2)`）按基名判那一条钉的是"括号不许把候选筛掉" |
+| 裁决口径：频次降序、同频次按字面升序、NULL 桶占一个分组但不进值域、全 NULL 不写空值域、去重后才算阈值、超阈值**什么都不写** | 同文件（七条，含"恰好等于阈值仍写 / 超一个就不写"那一对，以及"两格今天写同一份值域"） | 期望值是手算的字符串列表，不是从实现 dump；阈值非正数当场抛而不是安静不写 |
+| `LIMIT` 是 `阈值 + 10` 的表达式而不是字面 40 | 同文件两条（默认阈值那条对文档字面 40，改阈值那条钉"它不是 40"） | 只写第二条的话第一条会跟着一起漂，所以两条成对 |
+| SQL 形状：先扫窗再分组、两个键各自真的进语句、标识符在文本里而数值走绑定参数、名字里带引号时成对写进语句、只有读且一个会话变量都不碰 | 同文件五条（`test_采样语句逐字对得上_先扫窗再分组` 一族） | 逐字对语句，内层那个 `LIMIT :row_limit` 没有 `ORDER BY` 就是在这里被钉住的 |
+| 三件小工具各自的边界：标识符转义（三种引号写法 + doubling + 空标识符当场抛）、值文本化（`bytes`/`bool`/`int`/超长按 SQL 字面那一份来）、行→组（`None` 留成 NULL 桶、次数收成 `int`） | 同文件五条（转义三条 + 文本化一条 + 行→组一条） | 这三件都在"发 SQL 之前 / 收结果之后"那两侧，方言各错各的，所以不并入形状那五条 |
+| 一列发一条、没有候选时一条都不发 | 同文件两条（`test_一个候选列发一条_而且组挂回自己那一列` / `test_没有候选列时一条都不发`，两方言参数化） | 断的是**发包数与列的对应**，以及组挂回自己那一列——挂错列的话值域会张冠李戴，而两件事在"结果非空"上都看不出来 |
+| 采样能力位不许成为第二份真相 | `tests/unit/test_sync_dialect_dispatch.py::test_采样能力位与工厂真产出的那个对象成对` | 断的是 `can_sample_distinct == isinstance(factory(...), SupportsSampleDistinct)`，防的是加一种源只改一张表 |
+| 开关那两向与两键下发：打开后候选列的值域**第一次有写入点**、默认配置下一次都不发而作业照样 `success`、`max_distinct`/`row_limit` 改配置后下发的那一份跟着变 | `tests/integration/test_sync_sample_distinct_pg.py` 三条（`test_开关打开后_候选列的值域第一次有了写入点` / `test_默认配置下一次采样都不发_作业照样success` / `test_阈值与行数上限两键真的下发_改配置下发的那一份跟着变`） | 走真元数据库 + 真编排，看的是发出去的语句清单与**库里那一格**，不是"返回值没变"；两键那一条是 `monkeypatch.setenv` + `cache_clear` 走完 `run_sync`，钉的是"改了配置真生效" |
+| 逐表失败隔离与 `partial`（`sample_failed` 新档）、失败不碰元数据行数、方言无能力时整步跳过 | 同文件三条 | 失败注入在 extractor 桩上，断的是**库里那一列这一轮的内容**与 `errors[].detail` 的 `schema.table:` 前缀 |
+| 超阈值那一列什么都不写（验收 4 的编排那一半） | 同文件 `test_超阈值那一列什么都不写_阈值两侧各一列` | 同一张表两列**一写一不写**摆在一条用例里：只测"超的不写"会放过"整列一律不写"那种写法 |
+| 同一轮内新采的值域就出现在卡片「取值」段；卡片那一步失败也带不走已提交的值域 | 同文件两条 | 前者是 §8 三步到 prompt 的那一跨（回整行文本逐字对，不是"有没有"），后者钉的是逐表事务边界 |
+| 真 MySQL 上开了才扫：16 条采样 SQL、7 列拿到值域、关掉那一轮两格回 NULL | `tests/integration/test_sync_live.py::test_工单033_开采样跑真MySQL_短文本列首次出现值域_关掉那一轮又抹回NULL` | 期望值全部来自 `init_demo_mysql.sql` 的 `ELT(...)` 字面清单与写用例前的只读探针；含窗口≠全表那一格（`customer.city` 窗口 4 / 全表 12）与真 ENUM 列反证（`sample_values` 恒 `NULL`）；同一轮里 `counters["cards"]==0` 与"7 列有值域"同时成立，那是"采样不属于档案"的实物 |
+| 真 PG 上开了才扫：只有 2 列拿到值域、`text` 与数组一律不碰 | `tests/integration/test_extract_pg_live.py::test_工单033_开采样跑真PG演示源_两列拿到值域_text与数组列一律不采` | 布尔那列经真 psycopg 回 Python `bool`，值域字面是**小写** `false`/`true`，与 MySQL 那侧的 `"0"`/`"1"` 同一归一值不同字面——这一点只有各跑一次真库才看得见；四个事件值在窗口里各 250 次全同频，所以那一格的次序由 tie-break 决定 |
+
+> 一处形状留白，写在这里而不是埋在断言里：被采样命中的那一列，`enum_values` 与 `sample_values`
+> 今天**内容相同**（`adjudicate` 一次返回、两格一起写，`test_两格今天写的是同一份值域` 钉的就是
+> 这个事实本身）。两格的分家要等到"值域只进下拉、不进 prompt"或反之那一天——现在把它们写成
+> 两个不同的东西会是假话。
+
+**手测怎么跑（两步，都不需要新命令）**：
+
+| # | 动作 | 期望证据 |
+|---|---|---|
+| 1 | 什么都不改（`AIWEB_EXTRACT__SAMPLE_DISTINCT`  absent 或 `false`），按 §1.7 那条命令起 worker、点一次"同步" | 源库侧 `general_log`（或 `pg_stat_statements`）里**没有** `AS sample_value` 那条语句；元数据库 `select count(*) from meta_column where sample_values is not null` = 0 |
+| 2 | `backend/.env` 加一行 `AIWEB_EXTRACT__SAMPLE_DISTINCT=true` 重启后端，再点一次"同步" | 同一句 count 变成 7（MySQL 源）或 2（PG 源）；卡片正文里对应列多出一行「取值:」；终局仍是 `success` 而不是 `partial` |
+
+第 2 步那一格的"卡片多一行"是 §8 三步的**唯一用户可见收益**，值域本身在 `meta_column` 里躺着
+没人读就等于没做。它不在闸内的 live 用例里重复一遍：live 那一轮没有 active 档案（工单 033
+把"采样不属于档案"钉成了同一轮里 `counters["cards"]==0` 与"7 列有值域"同时成立），而渲染那一跨
+在 `test_sync_sample_distinct_pg.py` 里已经按整行文本逐字钉过。
+
 ---
 
 ## 2. 测试分层
@@ -706,6 +747,16 @@ Success: no issues found in 54 source files
 | `join_graph` BFS | 图与路径（as-built(P2-0010)：**整行不属于 010**。全仓没有 `join_graph` 实现，010 只渲染候选表之间的直连边；图算法与 architecture §5.3 的边权重/环/多路径歧义/降级四条一起归**工单 014 JOIN 图切片**） | ① 无 FK 但按命名约定推出边、`confidence` 按 §5.3 加权公式算（as-built(P2-0010)：两处口径都改了。常数"=0.7"与公式互斥，已由 010 闭环——0.7 现在是**公式地板**；原举例 `order_item.order_id → order_main.id` 在演示库**推不出来**：`order_id` 的名词是 `order`，库里没有 `order`/`orders` 表（真表叫 `order_main`），命名约定不认"前缀加后缀"的自由变体。库里真实存在的那条推断边是 `user_activity_log.product_id → product.id`（两侧同为 `INT`，实测算得 **1.00**），拿它当例）；② 自环 `parent_id` 不产生 1-hop 自引用；③ hops=2 时最长路径不超 2；④ 环（A→B→C→A）不死循环、路径去重；⑤ 桥表扩展：问 A、D 两表时能拉进 B/C，且 `path=[A,B,C,D]` 顺序可渲染进 prompt；⑥ 不可达时返回"需笛卡尔积"标记而不是硬连；⑦（010 转来的债）表度 > `MAX_JOIN_DEGREE` 的表**只禁当桥、不禁当端点**（它的直连边照旧进【可 JOIN】）——as-built(P2-0014)：本行**由 014 认领并加了第七行**；`hops` 数的是**桥表张数**（不是边数），跳数定上限、§5.3 的边权重只在上限内定胜负、权重再并列才算 `ambiguous`；图**存方向、按无向扩展**（真实 FK 恒为子→父，按有向可达则演示库除"子→父"一跳外一律不可达）；缓存键 `(datasource_id, database_id)`、同步终局后按库精确失效。**用例落点**：①~⑦ 全部在 `tests/unit/test_join_graph.py` 用手算图跑纯函数（本行口径"不依赖真库"），另加 `tests/integration/test_join_graph_rows.py` 钉唯一真 IO——读 `meta_relation` 的查询：演示库真边上 `payment_record↔product` 经 `order_main`+`order_item` 两张桥表可达、`category.parent_id` 自环不产生 1-hop 自引用、`user_activity_log→product` 带 1.00。写侧的字段度只做**告警**不丢边（丢弃分支在现行减法下不可达，理由见 architecture §5.3 的 as-built(P2-0014)），钉在 `tests/unit/test_sync_infer.py`（六条，`high_degree_fields` 的门槛是**严格大于**）+ `tests/integration/test_sync_pg.py`（断的是同步**响应**里的 `warnings`：`join_field_too_generic` 恰好一条、detail 带"出现在 10 张表"，而 `counters.relations_inferred == 9` 一条不少）。**as-built(P2-014)：本行已交付**——公共表面是 `join_graph.py` 的 `load_relations`/`graph_for`/`expansion_for`/`structure_hints`/`joinable_edges`/`invalidate` **六个**入口（纯函数 `build_graph`/`expand` 由单测直接钉）。①~⑦ 落 `tests/unit/test_join_graph.py`（**20 条**，全手算图）：验收 ①~⑦ 各一条，加的是门槛边界那一格（度 8 不抑制、度 9 抑制，且用例先断"度确实是 9"再断行为——门槛写成 `>=` 时不会假过）、自环那条钉的是 `number_of_edges() == 0`（"进图后被特殊对待"和"根本不进图"在路径断言上分不出来）、**同一对列上 `manual` 与 `extracted` 并存**时的覆盖顺序（真库的 `uq_meta_relation_key` 认这三档，不钉就是后加入的悄悄赢）、结构提示不受度门槛管、缓存三条（按库分键 / 失效只清那一个库 / 有条数上限）与"命中缓存不查库、但边变了只能靠失效"。真库那一半落 `tests/integration/test_join_graph_rows.py`（**8 条**，用例自己插行、不依赖演示库当前状态）：`payment_record↔product` 穿两张桥表、`hops=1` 时那一对就是连不上、`category` 自环照常参与跨表、0.700 那档被门槛筛掉、候选跨两个库时那一对按 `needs_cartesian` 报、新落库的边要等同步失效才进图。缓存失效落 `tests/integration/test_sync_cache_pg.py`（3 条：成功清、partial 只清提交过的库、一个都没写成则一个都不清），接线那一半落 `tests/integration/test_pipeline_orchestration.py`（**5 条**：桥表卡片被补查且进守卫白名单、**补不出卡片时整条路径撤下而不是留半条**、`hops`/`max_degree` 真从 `Settings` 传下去而 `structure_hints` 两个都不吃、单候选不降级、两候选零路径才降级）。真链路一条实录见 architecture §4.1 的 as-built(P2-014)。 |
 | `chart_advisor` | 规则决策表 | 时间+数值→line、类别(NDV≤12)+数值→bar、NDV>12+数值→bar(取 top10 + "其他")、双数值→scatter、单行单值→`kpi`、全 NULL 列→table only、行数 >200→不画图；`EChartsOption` 结构快照（键存在性，不比像素）。as-built(P2-012 开工前拍板)：本行**由 012 认领**（此前 architecture §2 的目录树里挂着 `chart_advisor.py` 却没有任何工单写它，roadmap P8 验收 5 是它的 UI 双证、不是它的出生地）。两处字面改了：① "单行单值→number" 与 architecture §4.2 的 `kpi` 是同一样东西的两个名字，**统一写 `kpi`**（`chart_spec.type` 是要进 golden 的字面，两个名字等于两条对不上的断言）；② 快照对象是**自有形状** `{type,x,series,title}`（metadata-model §2.7），不是 `EChartsOption`——翻译那一层归 P8，理由见 architecture §6.1 的 as-built |
 | PG/MySQL 类型归一 | 映射表（as-built(P3-023)：本行**由 023 交付**。用例三张——`tests/unit/test_pg_type_normalize.py`（PG 原料）、`tests/unit/test_mysql_type_normalize.py`（MySQL 原料 + `rows_to_columns()` 的接线）、`tests/unit/test_type_domain.py`（两方言共用的**那张断言表**，文件名以 `test_` 开头是为了让它真被收集执行）。规范字面全仓唯一住在 `app/extractor/type_normalize.py`（`VALUE_DOMAIN` + 两张 SYNONYMS + `compose`），`postgres_types.py`/`mysql_types.py` 只做方言原料的解析。归一落**抽取层（写侧）**：`data_type` 存归一值、`raw_data_type` 存 `COLUMN_TYPE` 原文）| PG `_text[]`/`numeric(10,2)`/`varchar(64)`/`timestamptz`/`jsonb`/`serial`/`generated always`；MySQL `decimal(10,0) unsigned zerofill`→**`numeric(10,0)`**、`enum('a','b')`→`enum`、`set`、`tinyint(1)`→**`bool`**（原行的"→bool 与否"问号已收，理由见 §9 as-built(P3-023)）、`datetime(3)`、生成列、`utf8mb4_0900_ai_ci`(8.0) 出现在 5.7 时的容错。跨方言塌成一个字面的两族：布尔（`boolean`/`tinyint(1)`→`bool`）与任意精度小数（`numeric`/`decimal`/`dec`/`fixed`→`numeric`，**值域里没有 `decimal`**，由 `test_decimal_不是归一值域的成员` 钉）。真跑那一半落 `tests/integration/test_sync_live.py` 的最后一张用例（工单 023 验收 5：演示库每一列的 `data_type` 过共享值域断言、不含空格即无修饰残留，再对八列点名比对 `(data_type, raw_data_type)` 成对）。**PG 侧的接线归 024**（PG 抽取器本体），本片只交付纯函数 + 用例 |
+| §8 三步采样的**三层**（as-built(P4-033)：纯半边 `app/extractor/sampling.py`、两方言的 `build_sql_sample`、编排 `sync_service._run_sample_stage`） | 三层分开钉，因为三处会各错各的：筛子错在"谁进了候选"，裁决错在"值域的顺序与要不要写"，编排错在"发了几条、失败时丢了谁"。SQL 形状仍钉在**假连接**上（`_rows` 是方言层唯一 I/O 出口，同上面 020/024 那两行的理由），值域**真落库**只能走 `pg`，而"真源库给的类型是什么"只有 `live` 答得出 | 纯函数 28 个用例函数（参数化展开为 **55** 条）在 `tests/unit/test_extract_sample_distinct.py`：候选筛子七条（六类都认 / `bool` 是 `boolean` 归一后的写法 / 清单外不认 / 带长度按基名判 / 数组后缀不认 / 生成列与"定义已给值域"两档不进）、裁决七条（频次降序 + 同频字面升序、恰好等于阈值仍写与超一个就不写**成对**、NULL 桶占分组但不进值域、全 NULL 不写空值域、去重后才算阈值、阈值非正数当场抛、**两格今天写同一份值域**）、`LIMIT` 表达式两条（默认阈值那条对 §8 字面 40，改阈值那条钉"它不是 40"——只写后者会两条一起漂）、SQL 形状五条 + 逐列发包与"无候选一条不发"两条 + 标识符转义三条 + 值文本化一条 + 行→组一条。编排九条在 `tests/integration/test_sync_sample_distinct_pg.py`（真元数据库 + extractor 桩）：开关那两向各一条（打开才第一次有写入点 / 默认配置下语句清单为空而作业仍 `success`）、两键真下发且改配置跟着变、超阈值那一列什么都不写且**阈值两侧各摆一列**、单表失败时其余表已写入的值域照常在场（`partial` + `errors[].detail` 的 `schema.table:` 前缀）、采样失败不碰元数据行数（注入前后同一份，钉的是"丢列不丢表"）、同一轮内新采的值域就出现在卡片「取值」段（回**整行文本**逐字对，012 那条老教训：「取值」与列名分开断会放过"取值行来自别的列"）、卡片那一步失败也带不走已提交的值域（逐表事务边界）、方言无这档能力时整步跳过不报错。**live 两条**（各跑一次真库，同 §1.9 表末两行）：真 MySQL 16 条采样 SQL / 7 列值域 / 关掉那一轮两格回 NULL，真 PG 只有 2 列拿到值域、`text` 与数组一律不碰。三条分辨力**都实跑过**（改一处、跑那一族、再改回来，结果记在这里而不是写在预期里）：
+① 把 `_COLUMN_SYNC_COLS` 里的 `sample_values` 摘掉 → **两条**红：真 MySQL 那条"关掉那一轮抹回 NULL"，
+外加 `test_单表采样失败_其余表已写入的值域照常在场`——后者红在"失败那张表的值域没被抹掉"，
+也就是分家的那个形状；
+② 把 `errors[].code` 从 `sample_failed` 改成复用 `embed_failed` → 只有那一条失败隔离红
+（`detail` 的 `schema.table:` 前缀照旧对得上，所以动的确实只有 code 那一格）；
+③ 把候选筛子的数组分支写松（`_base_name` 见 `[` 也切）→ 红的**只有**纯函数那一条
+`test_归一值里带数组后缀的不认`，**真 PG 那一发反而没红**：`product_stats_wide.top_keywords`
+那 40 行数组每行都不同，跨过阈值什么都不写，两格照样是 NULL。所以"数组不进候选"这一档的证据
+在闸内而不在 live——本片的 live 增量靠的是类型字面（`bool` 的小写、`text` 不进清单），不是这一格 |
 | 卡片模板 golden | 快照 | `tests/fixtures/prompts/kb_card__{table}.expected.txt`，`{{ }}` 空白控制要断言（不然 diff 全是空白）；覆盖：无注释表、60 列宽表、纯视图、含 enum 列、无 PK 表、中文/反引号/`a b` 空格表名（转义必须可见）。as-built(0008)：宽表的第 2/3 段各多一份快照，命名 `kb_card__{table}__seq{n}.expected.txt`（原模式只有一个 `{table}` 槽位，而一张宽表要出 3 份文本）；快照是**按 §5 模板手写**的，不是从渲染器 dump 的——dump 只能证明"以后没变"，手写才证明"渲染出来的就是文档那一份"。六个场景落 `tests/unit/test_kb_card_golden.py`，空白控制是一条独立断言（首尾裸换行 / 空行 / 行尾空白 / 行首缩进四类各钉一次） |
 | `prompt_builder` | 结构断言 | 段落顺序（角色→硬约束→schema→JOIN→术语→示例→问题→输出格式）、"必须带 LIMIT"与"只能引用给定的表"两句恒定存在（as-built(P2-0010)：原写的是"禁止引用未给出表"，与 roadmap §P2 踩坑 ④ 的措辞不一致，而 golden 要锁字面，用户拍板统一成后者）、few-shot 段在预算不足时被**整段**丢弃。<br>as-built(P2-010 双轴审查后补三条)：① **golden 逐字节**锁整段 user 消息（`tests/fixtures/prompts/nl2sql__order_main.expected.txt`，手写不是 dump）；② 预算估算用的**行形状**与 j2 模板渲染出的行**同源**——`_term_line` / `_example_line` 各由一条"手写期望行 == 渲染在场 == 估算式产出"的三段断言钉住，改模板改不出漂移；③ ≥0.8 门槛的辖区**只是【可 JOIN】清单**，卡片【可关联】行里的同一条低置信边照旧在场（口径见 architecture §5.3）；边按**起点**筛不按终点筛，目标表被裁掉时标题那句"不要写进 SQL"就是唯一防线 |
 | `pipeline` 编排 | 接缝在 `pipeline.ask()`，LLM 走 respx、检索走 `Retriever` Protocol 的桩 | as-built(P2-012)：本行由 012 新增。① 顺序：检索 → 组装 → 生成 → 守卫 → 执行，**守卫在 executor 被调用之前**（spy 断言"守卫拒绝时 executor 一次都没进"，不是看日志）；② 早退三类各留一行 `chat_messages`：`NO_SCHEMA_FOUND` / 畸形返回 / `sql_guard_rejected`，且都不落 CSV；③ 素材齐料：`build_prompt` 收到的 `token_budget`/`few_shot_budget` 来自 `Settings`（010 的硬接线义务，漏传就是静默不裁切，用例直接断言装配点传给 `build_prompt` 的关键字参数值）；④ 畸形返回四档：围栏与前后附解释**能恢复**出同一条 SQL、截断**不恢复**且抬 `llm_bad_response`、`clarify` 非空不执行；⑤ 每步耗时在场（roadmap P2 踩坑 ② 那句"卡在哪一步"的可观测面）；⑥ **⑦ 的入参键集合被钉死**（多一个键就是调用方能传进来的一个入参，`row_limit`/`max_cell_chars`/`result_dir` 一旦被请求体摸到，L4/L3 口径与 ADR-0004 同时作废），`password` 断的是 `decrypt_secret` 那条线；⑦ **跨源只取相关度第一名的那个源**，断的是"补卡片的请求只带同源 uid"（断 prompt 里没它是桩造的假象——桩对任何 uid 都回同一张表）。<br>as-built(P2-012 施工后)：用例落点**不是工单原写的 `tests/unit/test_pipeline.py`**，而是 `tests/integration/test_pipeline_orchestration.py`（`pg` marker）——早退三类的验收本体是"留下一行 `chat_messages`"，不落库的断言只证明了返回值、没证明留痕。真跑一次 LLM 的那条是 `test_pipeline_live.py`（`live` marker）。**当时已知的洞**：模型按 ④ 模板写了 `LIMIT` 时守卫不补 `+1` 探针，`truncated` 恒假，本行 ⑤ 的耗时与 ② 的早退都真、只有这一格是死的——**2026-09-29 同日拍板闭环**，守卫改成"钳位 + 探针"（safety §1.2 ⑦ / §9.2 ⑧），撞上限那一支的 `truncated` 活了；模型自己写小于上限的 `LIMIT n` 那一支仍无探针、恒假，是有意的语义。<br>**as-built(P2-013)**：本行 ② 的三类早退补了两件东西。① **守卫拒绝那一支打了真 SQL**——用例 `test_模型硬产出_DROP_时守卫拦下且一次都不进执行器` 让路线回复直接产出 `DROP TABLE orders`，断 `executor` spy **零调用**、`sql_final is None`、违规 code `top_level_not_select`、落库行保留模型 `sql_raw` 原文、且结果目录**空**（没执行就不该有文件）。② **拒答文案有断言**——`no_schema_found` 那一行的 message 必须同时含"补录表注释 / 检查授权 / 同步"三个词（用例断的是这三个**词**，不是整句），CLI 侧另由 `test_demo_ask_print.py` 三条用例钉"每一种拒答都跟一行下一步动作"、"守卫拒绝那步说清了没执行也没落文件"、"无匹配表那步给的是今天真能走的三条动作"（`POST /api/sync/jobs` 而不是界面按钮）；分层本身还有一条反断言——服务端 message 里**不许出现"点此"**（界面话属于 P8 那一层，见 architecture §4.1 的 as-built(P2-013)） |
@@ -735,7 +786,9 @@ Success: no issues found in 54 source files
 
 配置层的已落地单测：嵌套 `__` 解析、DSN 凭据转义（`u@site` / `p@ss#w/1` → `%40`/`%23`/`%2F`）、
 `masked_dsn` 不出明文、embedding 维度 >2000 被拒、部分配置时 `configured=False`、
-默认 JWT secret 被标记、本地默认值（`host=127.0.0.1`、`allow_sql_edit=admin`、`sample_distinct=true`）、
+默认 JWT secret 被标记、本地默认值（`host=127.0.0.1`、`allow_sql_edit=admin`、`sample_distinct=false`
+——as-built(P4-033)：这一格原写 `true`。键没有读取点时那个默认值只是文档噪音，033 给了它读取点，
+它就变成"每次同步真去源库跑 `GROUP BY`"，于是随 P4 决策 ⑩ 改判 `false`，见 §1.9 与 §6 第 10 条）、
 `/api/healthz` 不碰数据库 + `X-Request-Id` 头存在。
 > **as-built(P2-013)**：新增三条目录基准用例（`tests/unit/test_settings.py`）——读出来就是绝对路径、
 > 相对路径按**仓库根**解析而与 cwd 无关、绝对路径原样保留。期望根由测试文件自己的
