@@ -631,6 +631,17 @@ aiweb.chat_feedback : id / message_id FK UNIQUE / user_id / verdict CHECK('up','
 > > 见 ADR-0014）；`mode='keyword'`（向量路整体下线的降级路径）时 `score_vec` 回到 `NULL`——
 > > 本条原文那句"区分没命中与没算"继续成立，它现在是 P4 的**分岔依据**而不只是留列的理由。
 > > 字段名保持 `score_*`/`fused` 不改：改名会牵动本节 §2.7 的列定义与还没写的 P8 前端契约。
+> >
+> > **as-built(P4-032)：这一格开始真写了**，三种 `mode` 各一条用例（`tests/integration/test_pipeline_orchestration.py`，
+> > 桩的形状就是两条腿真实出门的形状）。上面那段订正只说了"`mode='keyword'` 时 `score_vec` 回到 NULL"，
+> > 实物还多一条它没讲的判据：**`fused` 读的是 `fuse_rankings` 亲自盖的 `RetrievedTable.fused_rank`，
+> > 不是消费者在那里数清单位次**——融合没跑过（两条单腿）那一格就是 NULL，所以 `mode='vector'`
+> > 那一支是 `score_vec` 有名次而 `fused` 仍 NULL。这一支必须单独存在：
+> > `fused` 若写成"跟着向量名次走"，keyword 与 hybrid 两支恰好都对，只有它红。
+> > （`architecture.md` §5.2 的 as-built(P4-032) 还记着一格不修饰的后果：hybrid 而关键词腿
+> > 切不出词时融合照跑，`fused` 于是等于向量腿自己的次序。）
+> > `tests/integration/test_chat_pg.py` 里那一行手写的 `retrieved` 仍是全 null 形状，它钉的是
+> > **这一列存得下这五个键**（列定义），不是写入点，两者不互替。
 > ③ `prompt_tokens`/`completion_tokens` P2 恒 `0`（列建 NOT NULL）。不是忘了，是原料不存在：
 > `llm_client.complete()` 只返回 `choices[0].message.content`，响应体里的 `usage` 被丢掉了。
 > 真 usage 归 P8（流式那侧本来就要从末帧取）， heuristic 估算**不许**写进这一列——它是审计列，

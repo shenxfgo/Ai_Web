@@ -186,17 +186,39 @@ roadmap §P4 这一片要的是"向量能真跑、档案能原子切换"。今�
     §7 那句"目标形态是卡粒度"由本片正式订正为表粒度（依据是 §5.2 (4) 的聚合语义与 009 的既有形状）。
 30. `hops_used` 的原料已由 014 交付（`join_graph`），`aggregated_tables` 的形状已由 009 交付；
     本片只把这两格填上，**不重做图、不重做聚合**。
+    > **as-built(P4-032)：填完了，但"只填不造"这一句在 `aggregated_tables` 上留了一格要人拍板**。
+    > 实现取的是本次 `items` 的那串 `table_uid`（同序、不含桥表）。另一种读法是"009 那一步聚合出来的
+    > 全部候选"，含被 `k` 砍掉的——那一格 `Retriever.search()` 现在根本不返回，要就得把它的返回值
+    > 拆成两格，牵动 009/031 已交付的二十来处调用面。**按哪一句落由用户认**，两种读法在这条链路上
+    > 的区别只有"被砍掉的那几张露不露"。`hops_used` 同源但**入参不同源**：pipeline 先把候选收窄到
+    > 第一名那个源，预览没有这条规矩，跨源问句下两处会不一致（详见 architecture §5.2 as-built 那一条）。
 31. `chat_messages.retrieved` 里 012 留成 NULL 的 `score_vec`/`fused`（`pipeline.py:215-221`）
     开始写**名次**，**字段名不改**（改名会牵动 §2.7 的列定义与未来前端契约）。
     `mode='keyword'` 时 `score_vec` 回到 NULL——012 那句"留 null 才能把'没命中'和'没算'分开"的口径继续成立。
+    > **as-built(P4-032)：已交付，实物比这条字面多一格判据。** 两格的名次都由**算它的那一层**盖在
+    > 表对象上（`score_vec` 来自向量腿、`fused` 来自 `fuse_rankings` 新盖的 `fused_rank`），
+    > 消费者不 `enumerate`——"跟着有没有向量名次走"那种写法在 keyword 与 hybrid 下恰好都对，
+    > 只有 `mode='vector'` 那一支会红，所以三种 `mode` 各一条用例
+    > （`tests/integration/test_pipeline_orchestration.py`），判据理由与一处不修饰的后果
+    > （hybrid 而关键词腿切不出词时 `fused` 等于向量腿自己的次序）见 metadata-model §2.7 与
+    > architecture §5.2 的 as-built(P4-032)。
 
 ### F. 权限（决策 ⑨，对齐 ADR-0008）
 
 32. 可见源集合来自 `datasource_service.list_visible`，与关键词路同一把尺；过滤条件进**向量 SQL**，
     应用层那一次保留作二次保险。用例要能证明"把应用层那刀摘掉，无权源的卡也不在结果里"。
+    > **as-built(P4-032)：后半句按实物改了判据，前半句原样成立。** 这条链路上**没有**"应用层那一次"
+    > 可摘——`_search_scope()` 算出的可见源集合就是喂给召回 SQL 的那个参数，摘掉它等于摘掉 WHERE 那一格。
+    > 链路上唯一还在应用层判权限的是 `get_authorized`，它长在预览端点的点名 403、`load_schema_tables`
+    > 的逐表检查、`pipeline` 取源那三处，都不在召回路上。所以那条用例是三幕（基线 / 把 `get_authorized`
+    > 换成"一被调用就抬错" / 把 id 清单放宽到全部源），第三幕是前两幕不是假绿的证人。
+    > 形状、用例名与为什么这么摆，见 architecture §5.2 的 as-built(P4-032)。
 33. 粒度**到数据源、不到表**：本片不建 `datasource_grants`（§2.3 那张表继续无主，归 P6）。
 34. `/kb/search` 点名一个看不见的源仍 **403**（009 的边界口径不动）；真检索路径（`/chat/ask`）
     仍按 §5.2 (5) 静默过滤——两件事继续分开。
+    > **as-built(P4-032)：分开这件事仍是两条用例，各断一件。** 403 那一条在接上向量路之后多了一种
+    > 失效模式——门若挪到 `_retriever_for()` 之后，没配向量端点的机器上它会先被 503
+    > `EmbeddingNotConfigured` 顶掉，"越权"反而没人说；所以那条用例把 `mode:'vector'` 也点了一次名。
 
 ### G. 枚举 NDV 采样（决策 ⑩，`kb-workflow §8`）
 

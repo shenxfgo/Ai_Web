@@ -657,7 +657,7 @@ Success: no issues found in 54 source files
 `kb_card` 的那一根列，以及一套新基准诞生时**线上那套一个字都不动**。本节现在只是起头——
 029 交付的是"闸内能证的全部证了"，下面那几格真端点才有的东西是留白，不是没做完。
 
-**已在闸内有证据（029 交付时逐条复跑过，不需要手工重做）**：
+**已在闸内有证据（每一行在它自己那片交付时逐条复跑过，不需要手工重做；行末那格写了片号）**：
 
 | 格 | 闸内靶 | 它凭什么算证据 |
 |---|---|---|
@@ -671,6 +671,7 @@ Success: no issues found in 54 source files
 | **向量路与 RRF 的装配**：三条 `mode`、融合次序、`ef_search` 下发、未预置维度显式报错 | `tests/integration/test_kb_search_hybrid_pg.py`（12 条）+ `tests/unit/test_retriever_rrf.py` + `tests/unit/test_retriever_vector_sql.py` | 向量名次是**用例自己摆出来的**（`q / one-hot / -q`，余弦距离严格 `0<中<2`），融合次序是手算的 `1/62+1/61` 那一串，都不从实现反推；`set_config` 那条与召回同事务由"四次 `SHOW` 夹一次 `search()`、全在同一条连接"钉。**激活换到哪一维就读哪一列**（030 欠的真口径）在这里补回：两列的次序反着摆，读错列必红 |
 | 实现切换缝：`pipeline` 与端点都不认识实现的名字 | `tests/unit/test_retriever_seam.py` | 机械检查 `Hybrid`/`ef_search`/维度字面不出现在调用方，且测试里换一个实现后 pipeline 用例不改而仍绿（工单 031 验收 5） |
 | 收缩迁移 0009：`is_active` 从库里消失，且回滚能按 `status` 把内容恢复回来 | `tests/integration/test_kb_is_active_shrink_pg.py` | 在自建的临时 schema 里真跑 `alembic` 的 `0007→0008→head→downgrade 0008→head`，读的是 `information_schema` 的列名而不是 ORM 属性。**跑的是迁移本体**，不是把那句 SQL 重抄一遍 |
+| **对外那一面**（032）：`/kb/search` 的三格（两路名次 + 融合分）与顶层三格、权限那两格分开、留痕写名次 | `tests/integration/test_kb_search_api_pg.py`（18 条）+ `test_kb_search_hybrid_pg.py`（14 条）+ `test_pipeline_orchestration.py`（新增 3 条） | 摘刀那条（工单 032 验收 2）是**三幕**：基线 → 把链路上唯一那道应用层权限门换成"一被调用就抬错"→ 把喂给 SQL 的 id 清单放宽到全部源。第三幕让那张越权卡当场出头名，前两幕的"结果不变"才不是"根本没人在筛"；它**只有在向量 SQL 那一格写对时**才绿。名次由用例摆出来（越权卡距离摆 0 而不是"差不多近"），`rrf_score` 不 round 而 `score_kw` round（头两名常差 1e-5，抹平就与融合层的次序不是同一个）。`used_profile.dimensions` 与 030 那条回滚用例连着跑（激活 1024 → 报 1024，回滚 → 报 1536）。403 那条把 `mode:'vector'` 也点一次名，钉的是"门在取实现之前"——挪到后面就会先被 503 顶掉。`retrieved` 三种 `mode` 各一条：把 `fused` 改成直接跟着 `vector_rank` 走时 hybrid 与 vector 两支同红， 而"非空就给位次"那种写法只有 vector 红——后一族里前两条钉不住的那一档由 `mode='vector'` 那条守着 |
 
 **留白（必须真端点，闸内造不出语义）**：
 

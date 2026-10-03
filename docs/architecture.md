@@ -605,6 +605,50 @@ as-built(P4-031)，上面那张流程表第一次有了 (1) 与 (3) 两步的实
 >    `pg_stat_user_indexes.idx_scan` 在这轮对已确认的 index scan 仍回 0，不能拿它当"走没走索引"的证据；
 >    连接池是 FIFO，commit 之后再 `SHOW` 必须自己钉住同一条连接。
 
+as-built(P4-032)，(5) 与 (8) 这两步第一次有了**对外**的那一面；其中 (5) 的记账与本节原话有出入，
+出入摆在最前面而不是埋在测试名里：
+
+- **本节 (5) 说的"应用层二次保险"在这条链路上没有实体**。`_search_scope()` 算出的那个可见源集合
+  **就是**喂给两条召回 SQL 的参数本身（主刀与尺共用一处），"摘掉它"等于摘掉 WHERE 里那一格。
+  链路上唯一还在应用层判权限的代码是 `datasource_service.get_authorized`，而它长在三个**别的地方**：
+  预览端点点名不可见源时那道 403、`load_schema_tables()` 的逐表检查、`pipeline` 取源那一次。
+  所以验收 2 那条摘刀用例的形状不是"删一段过滤再比结果"，而是三幕：① 基线跑一次；
+  ② 把 `get_authorized` 换成"**一被调用就抬错**"再跑一次，结果不变——这才证明了召回没经过那道门；
+  ③ 把**喂给 SQL 的 id 清单**换成"库里全部源"再跑一次，那张与问句同向的越权卡当场出头名。
+  没有第三幕，前两幕的"不变"分不清是"SQL 那一格写对了"还是"根本没人在筛、而夹具里恰好没人越权"。
+  用例：`tests/integration/test_kb_search_hybrid_pg.py::test_摘掉应用层那道门之后无权源的卡仍不在向量结果里`。
+  越权那份夹具是 031 那条抽出来的 `_invisible_source_with_head_card()`，距离摆 **0**（全场最相关）
+  而不是"差不多近"：越权召回时它必须出头名，否则"少一张别人的表"这种断言会被"它本来就排不上"洗掉。
+- **403 与静默过滤仍是两条用例**（决策 ⑨ 的另一半，工单字面"不许合并成一条"）。接上向量路之后
+  403 那一条多了一种失效模式：这道门一旦挪到 `_retriever_for()` **之后**，没配向量端点的机器上
+  它会先被 503 `EmbeddingNotConfigured` 顶掉（`resolve_tuning` 对明确给出的 `mode` 不改口，
+  失败留给那一次真调用去说），"越权"这件事反而没人说了。所以那条用例把 `mode:'vector'` 也点了一次名：
+  `test_kb_search_api_pg.py::test_点名不可见源在vector模式下同样是403_那道门在取实现之前`。
+- **(8) 落的 `retrieved` 两格写名次，且名次由算它的那一层亲自盖**：`score_vec` 来自
+  `_vector_ranking`，`fused` 来自 `fuse_rankings` 新盖的 `RetrievedTable.fused_rank`——**不在消费者那里
+  `enumerate`**。消费者现数的写法（`index + 1`）在 keyword 与 hybrid 两支下都对、只在
+  `mode='vector'` 那一支露，且它把"`_final_limit` 只砍尾巴"这个调用方的性质反推成了一次排序。
+  三种 `mode` 的形状：hybrid 两格都有值、keyword 两格都 NULL、`mode='vector'` 只有 `score_vec` 有值。
+  第三种是前两种钉不住的那个错法——`fused` 若写成"跟着向量名次走"，hybrid 与 keyword 恰好都对。
+  **一处不修饰**：`mode='hybrid'` 而关键词腿切不出词时（问句全标点）融合照跑，于是 `fused`
+  等于向量腿自己的次序——那是 RRF 在一条空次序下给出的结论而不是谁编的，但它确实不是两路折出来的位次。
+  这一形状今天只有纯函数那一层的用例（`test_retriever_rrf.py`），端点那一层没有。
+  键名仍是 §2.7 那五个，用例直接断键集合；`fused_rank` **不进契约**。
+- **`aggregated_tables` 落成的形状与"聚合原料"那句字面差一格，这一格留给用户认**：实现取的是
+  本次 `items` 的 `table_uid` 序列（次序一致、**不含桥表**），**不是**"聚合出但被 `k` 砍掉"的那份
+  预 `k` 候选集。后者要把 `Retriever.search()` 的返回值拆成两格，牵动 009/031 已交付的二十来处
+  调用面，而本片字面是"只填不造"。两读的差别只在"被 `k` 砍掉的那几张要不要露出来"，
+  要露就得改协议——工单 032 交付记录的偏离 1 记的是同一件事，这里是不依赖那份 gitignored
+  文件的正面说明。
+- **`hops_used` 的尺与 pipeline 那一次同源，但入参的候选集合不同源**：同一个 `expansion_for()`、
+  同一对配置键（`join_hops` / `max_join_degree`），数的仍是**桥表张数**（014 的口径）——预览报 1
+  而真链路按 2 走，界面上就成了"预览说连得上、真跑说连不上"。**跨源候选是已知差异**：
+  pipeline 在喂图前把候选收窄到第一名那个源（一条连接串连不了两个库），预览没有这条规矩，
+  于是同一句跨源问句在预览里是"各源内部桥表数之和"，在真链路里只有主源那一份。
+  候选同源的问句下两者逐字相等，演示库与闸内用例都在这一档；跨源那一档要等 P8 的问句面一起收。
+- 一处 test-only：`test_kb_search_api_pg.py` 加了条 autouse 夹具清 `join_graph._CACHE`——缓存是
+  模块级、按 `(源, 库)` 分键，不清的话前一条用例建过的图会让本文件看不见刚插的那两条边。
+
 ### 5.3 JOIN 路径推导
 
 - 边权重：`manual` = 0.1、`extracted` = 0.5、`inferred` = 1/confidence；两两 targets 求最短简单路径后取并集。
@@ -838,7 +882,7 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | GET | `/kb/status` | read 权 | `?datasource_id` | `{active_profile, card_count, embedded_count, pending_count, last_build_at, dim}` |
 | POST | `/kb/reindex` | admin | `{datasource_id}` | 202 job。**订正(P4 决策 ⑥，2026-10-02)：本行原写 `POST /kb/rebuild`，旧名废弃、不留别名。** 理由不是措辞偏好：`rebuild` 读起来像"把现有那套档案重灌一遍"，而这正是 ADR-0013 要排除的误解——档案的**唯一出生入口**就是这条端点（它产出一行 `draft`，激活另走下面那行）。一个数据源一颗作业，复用 `sync_jobs` + JobQueue + worker + `sync_job_event` + SSE 那一整套，phase 九值词表不加值；那颗 draft 档案的 id 落在载体列 `sync_jobs.reindex_profile_id` 上（ADR-0011：执行体在另一个进程里，读不到请求）。**as-built(P4-029 已交付)**：路径就是 `POST /api/kb/reindex`，请求体只有 `{datasource_id}`（`extra="forbid"`，多字段 422），202 回**两颗 id** `{job_id, profile_id}`——作业还在队列里，任何计数都是编的（016 的口径）。鉴权档位是 **owner 档**（`datasource_service.get_owned`，与 `POST /api/sync/jobs` 同一把尺），**不是本行原来写的 admin**：reindex 会派 worker 拿这个源的凭据去连库、并烧真端点的 embedding 额度，`global` 档的人不该有这个能力；而 admin-only 会把"谁能重建自己登记的源"这条线抬到只有管理员能动，与同步那一条不对称。这是**一处对工单字面的偏离**，理由与差异记在工单 029 交付记录。三键（工单字面；实际判 `EmbeddingGroup.configured` 那**四格**，含 `DIMENSION>0`）没配齐 → **400**（`ReindexEmbeddingMissing`，出路文案点名"配真端点，或起闸内替身 `scripts/fake_embedding_server.py`"）且**不建 draft 空壳**；撞 `uq_kb_index_profile_name` 时**复用**那一行（档案是全局的，两个源同三元组是正常状态），撞到的那行是 `active` → **409**（原地改线上基准）。顺序是"先建档案、后入队"：反过来会留下一颗**没有靶**的作业，worker 领到它就按普通同步跑，把"重建"悄悄做成"同步"。执行侧：`embed` 那一档从 `{skipped:true}` 变成**逐表真写**（一表一发 HTTP、一个事务、一帧 `{table, embedded}`；发多宽、写哪一列、问哪个模型三格都取自靶那一行，`kb_service.VectorTarget`，见 metadata-model §2.6 末注第 3 条），终局 `success`/`partial` 才给靶盖 `built_at`，`failed` 不盖；单表失败落 `errors[]`+`partial`，维度不符整颗 `failed`。进度帧与 `progress` 的口径差异见 metadata-model §2.8 注 ⑥ 的 as-built(P4-029)。`/kb/profiles/{id}/activate` 归 **030**，本片没有它。 |
 | POST | `/kb/profiles/{id}/activate` | admin | — | 200 档案行。**订正(P4 决策 ②/⑤)**：三态流转 `draft → active`，旧的 active 在同一条 `UPDATE … CASE` 里转 `retired`，"恰好一个 active"由库里那条 partial unique 背书而不是代码分支。校验**只有一项**——该档案的卡片行数与源内表数齐（回填时的单表失败已经落进那颗作业的 `errors[]`/`partial`，不在这里重判）。回滚 = 把某一枚 `retired` 重新 activate。**as-built(P4-030 已交付)**：路径就是 `POST /api/kb/profiles/{profile_id}/activate`，无请求体；200 回 `{activated, retired}` 两个档案摘要（同一形状的五格 `id/name/model/dimensions/card_template_version`，不整行倒出 `provider`/`created_at`/`built_at`），`retired` 可为 `null`——库里本来没有 active 的那一次上线确实没有"被换下去的那一行"。鉴权 **admin-only 成立**（`app/deps.py:require_admin`，仓库第一个按角色判的写端点：它不挂在任何单个资源上，换的是**全库**的检索基准；这一格工单列为"待认的一格"并写默认 admin-only，本轮按默认落）。上面那句"同一条 `UPDATE … CASE`"**在真库上被证伪**：partial unique 的键是表达式，PG 在语句内部逐行写索引项，单条 CASE 先扫到 draft 那行就当场撞约束（本轮探过四种形状，生死取决于 heap 扫描顺序），实物是同一个事务里固定顺序的**两条**（先降级旧 active、再升级新那行）；这条订正不丢 ADR-0013 要的那件事——仍是单一写入点、外部读者只看得见切换前或切换后、"至多一个 active"仍由库背书——丢的只是"一条语句"那个措辞，细节与用例见 metadata-model §2.6 末注 as-built(P4-030) 第 2 条。前置其实是**三格**而不是"只有一项"：404（那行不存在）/ 400 `profile_not_built`（`draft` 且 `built_at IS NULL`，主语只有 draft，retired 回滚不附加它）/ 400 `profile_cards_incomplete`（那把尺的三格口径与"只判少不判多"都在 metadata-model §2.6 第 4 条）；已经 active 的自己激活自己 → 幂等 200。不发事件、不入队（ADR-0010）。**验收 2 的降级**：本行说的"读的向量列跟着档案维度变"要等 031 的读侧，030 只验到"两根向量列内容各自未变"，降级理由写在工单 030 交付记录。**as-built(P4-031)：那一格的真口径已补回**——激活换到 1024 那套档案后向量路读的就是 `embedding_1024`，再激活回旧档案读回 `embedding`，用例是 `tests/integration/test_kb_search_hybrid_pg.py::test_激活换到另一维之后向量路读的就是那一维的那一列`（两列的次序是**反着摆**的，同次序的话读错列照样绿）；`used_profile` 那一格仍属 032 的响应契约，本行不预支。 |
-| POST | `/kb/search` | read 权 | `{query,datasource_ids[],k=5,trgm_threshold,mode:'hybrid'\|'vector'\|'keyword',top_vector,ef_search}`（**订正(P4 决策 ⑧/故事 27)：那两个向量旋钮的默认值字面从 schema 里拿掉**——原这行写着 `top_vector=80`/`ef_search=100`，其中 100 与 roadmap 验收 3 的 64 直接打架。改口为"缺省即取配置"：`ef_search` 取 `AIWEB_RETRIEVAL__HNSW_EF_SEARCH`（64）、`top_vector` 取向量路自己那个召回窗口常量（与关键词路的 `_RECALL_LIMIT=80` **不共用**，否则调一个窗口会同时动两路，诊断分不清是谁的功劳）、`trgm_threshold` 本来就只取配置；`rrf_k` 只进 `.env`，**不进请求体**；"请求给了用请求的、没给用配置的"这层裁决只住一个地方。`k=5`（1..50）是已交付的实际默认值，不动） | `{items:[{table_uid,title,vector_rank,keyword_rank,rrf_score,score_kw,matched_term_count,matched_column_count,hits:[…],cards:[…]}],took_ms,used_profile,aggregated_tables,hops_used}` **← 目标形态（P4 决策 ⑧ 订正：仍是表粒度，一行都不改成卡粒度）**。原这行的"目标形态"写的是卡粒度 `{card_id,…,score_vec,score_kw,fused}`，与 §5.2 (4)"聚合到表"和 009 已交付的实际响应互相矛盾，作废；表粒度上补的是**三列名次**（`vector_rank`/`keyword_rank`/`rrf_score`，来自 §5.2 (3) 的 RRF——它吃名次不吃分数，见 ADR-0014）而不是换粒度，顶层补 `used_profile`（哪套档案在服务）、`aggregated_tables`（009 已交付的聚合原料）、`hops_used`（014 已交付的图原料，本片只填不重做）。**as-built(0009)**：P2 这颗只实现关键词路，请求侧只认 `{query,datasource_ids[],k}`（`query` 1..200 字、`k` 1..50；`top_vector/ef_search/trgm_threshold/mode` 传了直接 **422**（`extra="forbid"`——P2 不认这些旋钮，静默忽略等于假装它能调，前端只会得到"我传了 vector 怎么结果没变"这种查不出来的错），`trgm_threshold` 一律取配置值）；响应 `items` 是**表粒度**不是卡粒度（§5.2 (4)），每项 = `{table_uid,title,score_kw,matched_term_count,matched_column_count,hits:[{column_name,field,term}],cards:[{card_id,kind,seq,score,text_preview}]}` + 顶层 `took_ms`。`score_vec/fused/used_profile` **P2 不给**——向量路没接，给了就是编的；P4 起 `used_profile` 与三列名次开始有值，`text_preview` 是卡片正文前 200 字（预览端点给人眼判断用，010 拼 prompt 用的是 `cards` 里带回的完整段）。边界口径：点名的源无 read 权 → **403**（不是静默少一张表，理由见 §5.2 (5) 那条注）；不点名 → 在该用户看得见的所有源里找；零命中 → `items:[]`；`query` 空或超长 → 422；带未知字段 → 422；未登录 → 401。**as-built(P4-031)**：本行那几个旋钮今天**真的生效了**——请求体收 `mode`/`top_vector`/`ef_search` 三个（`trgm_threshold` 与 `rrf_k` 仍不进请求体，传上来 422 而不是静默忽略），上面那段 as-built(0009) 说的"传了直接 422"从此只对那两个旋钮成立；`mode` 不给时的缺省是"配齐向量端点四格 → `hybrid`，没配 → `keyword`"（与 `/api/healthz` 的 `retrieval_mode` 同一判据）。**响应形状一个字没改**：`vector_rank`/`keyword_rank`/`rrf_score`/`used_profile` 这四格仍是 032 的契约面，今天融合次序确实算出来了，但它没地方放——给了就是编的。所以"我传了 `mode:'vector'` 怎么结果没变"这一类问句，031 之后的答案是"次序变了，只是响应里看不出来"（`_vector_table` 那条口径见 §5.2 的 as-built(P4-031)）。 |
+| POST | `/kb/search` | read 权 | `{query,datasource_ids[],k=5,trgm_threshold,mode:'hybrid'\|'vector'\|'keyword',top_vector,ef_search}`（**订正(P4 决策 ⑧/故事 27)：那两个向量旋钮的默认值字面从 schema 里拿掉**——原这行写着 `top_vector=80`/`ef_search=100`，其中 100 与 roadmap 验收 3 的 64 直接打架。改口为"缺省即取配置"：`ef_search` 取 `AIWEB_RETRIEVAL__HNSW_EF_SEARCH`（64）、`top_vector` 取向量路自己那个召回窗口常量（与关键词路的 `_RECALL_LIMIT=80` **不共用**，否则调一个窗口会同时动两路，诊断分不清是谁的功劳）、`trgm_threshold` 本来就只取配置；`rrf_k` 只进 `.env`，**不进请求体**；"请求给了用请求的、没给用配置的"这层裁决只住一个地方。`k=5`（1..50）是已交付的实际默认值，不动） | `{items:[{table_uid,title,vector_rank,keyword_rank,rrf_score,score_kw,matched_term_count,matched_column_count,hits:[…],cards:[…]}],took_ms,used_profile,aggregated_tables,hops_used}` **← 目标形态（P4 决策 ⑧ 订正：仍是表粒度，一行都不改成卡粒度）**。原这行的"目标形态"写的是卡粒度 `{card_id,…,score_vec,score_kw,fused}`，与 §5.2 (4)"聚合到表"和 009 已交付的实际响应互相矛盾，作废；表粒度上补的是**三列名次**（`vector_rank`/`keyword_rank`/`rrf_score`，来自 §5.2 (3) 的 RRF——它吃名次不吃分数，见 ADR-0014）而不是换粒度，顶层补 `used_profile`（哪套档案在服务）、`aggregated_tables`（009 已交付的聚合原料）、`hops_used`（014 已交付的图原料，本片只填不重做）。**as-built(0009)**：P2 这颗只实现关键词路，请求侧只认 `{query,datasource_ids[],k}`（`query` 1..200 字、`k` 1..50；`top_vector/ef_search/trgm_threshold/mode` 传了直接 **422**（`extra="forbid"`——P2 不认这些旋钮，静默忽略等于假装它能调，前端只会得到"我传了 vector 怎么结果没变"这种查不出来的错），`trgm_threshold` 一律取配置值）；响应 `items` 是**表粒度**不是卡粒度（§5.2 (4)），每项 = `{table_uid,title,score_kw,matched_term_count,matched_column_count,hits:[{column_name,field,term}],cards:[{card_id,kind,seq,score,text_preview}]}` + 顶层 `took_ms`。`score_vec/fused/used_profile` **P2 不给**——向量路没接，给了就是编的；P4 起 `used_profile` 与三列名次开始有值，`text_preview` 是卡片正文前 200 字（预览端点给人眼判断用，010 拼 prompt 用的是 `cards` 里带回的完整段）。边界口径：点名的源无 read 权 → **403**（不是静默少一张表，理由见 §5.2 (5) 那条注）；不点名 → 在该用户看得见的所有源里找；零命中 → `items:[]`；`query` 空或超长 → 422；带未知字段 → 422；未登录 → 401。**as-built(P4-031)**：本行那几个旋钮今天**真的生效了**——请求体收 `mode`/`top_vector`/`ef_search` 三个（`trgm_threshold` 与 `rrf_k` 仍不进请求体，传上来 422 而不是静默忽略），上面那段 as-built(0009) 说的"传了直接 422"从此只对那两个旋钮成立；`mode` 不给时的缺省是"配齐向量端点四格 → `hybrid`，没配 → `keyword`"（与 `/api/healthz` 的 `retrieval_mode` 同一判据）。**响应形状一个字没改**：`vector_rank`/`keyword_rank`/`rrf_score`/`used_profile` 这四格仍是 032 的契约面，今天融合次序确实算出来了，但它没地方放——给了就是编的。所以"我传了 `mode:'vector'` 怎么结果没变"这一类问句，031 之后的答案是"次序变了，只是响应里看不出来"（`_vector_table` 那条口径见 §5.2 的 as-built(P4-031)）。**as-built(P4-032)：那四格今天真有值了**——`items` 每项多那三格（两路名次 + 融合分：`vector_rank`/`keyword_rank` 从 1 起、**未命中那一路就是 null**，与"第 0 名"分得开；`rrf_score` 是 `Σ 1/(rrf_k+rank)` 的原值，不像 `score_kw` 那样 round——它是对账用的数，round 过一次就再手算不回来），顶层多三格（`used_profile` 是 active 档案那行的 `{id,name,dimensions}`，库里一行 active 都没有时是 `null` 而不是零值摘要——那一行不存在就不能在响应里给它编一个身份，与 029 的 202 同一条口径；`aggregated_tables` 与 `hops_used` 的落法见 §5.2 的 as-built(P4-032)，前者不含桥表、后者数的是桥表张数）。`mode='vector'` 端出来的表 `hits`/`cards` 为空、`score_kw=0.0`，031 那句"端点只回一串浮点数，没有命中理由可说"从此有地方说。**009 交付的 `KbSearchHitOut`/`KbSearchCardOut` 一个字段没删**（`git diff` 里那两段只有新增行）。 |
 
 | GET | `/kb/cards?table_uid=` | read 权 | `?table_uid` | **as-built(0008)**：一张表的全部卡片段（主卡 `seq=0` 在前，宽表再带 `table_columns` 切片），每项 = 卡片全文 + embedding 元信息（`index_profile:{id,name,model,dimensions,card_template_version}` 与 `embedded_at`，后者 NULL = 还没向量化）。本行原写的 `/kb/cards/{id}`（按单张卡 id 取）**未实现、也不打算实现**：一张表切几段只有服务端按 §6 的策略算得出，要前端先知道段数才能取全素材是倒置的依赖。边界口径：表存在而零张卡 → `[]`（"同步跑过、卡片还没建"是真实中间态，不是"表不存在"）；`table_uid` 找不到 → 404；无 read 权 → 403。 |
 | CRUD | `/kb/terms` | sync 权 | `{name,definition,table_uid?,column?}` | `kind='term'` 卡片 |
