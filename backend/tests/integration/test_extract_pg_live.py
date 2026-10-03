@@ -1,4 +1,4 @@
-"""真 PG 演示源跑通全程（工单 024 验收 1/3/4/5）：`ai_web_demo_pg` → 元数据库 → 卡片。
+"""真 PG 演示源跑通全程：`ai_web_demo_pg` → 元数据库 → 卡片。
 
 为什么必须 live：这几条钉的都是**真 catalog 查询经真驱动、真映射、真落库之后再读回来**的东西——
 "索引列序对不对""`format_type` 的人话名有没有被归一搬坏""新鲜度那一格有没有被搬成 aware
@@ -7,6 +7,8 @@
 这一份钉的是它跑在真 `pg_catalog` 上时结果仍然是那些形状。
 一句自我限定：**"两枚时间戳都在场时取较晚的那一枚"这一支 live 证不到**——源库实测 0 张表两枚
 同时非空（见下面验收 5 那条用例的 docstring），分辨力仍在那颗两枚都摆出来的桩上。
+本文件钉的验收：工单 024 的 1/3/4/5，以及工单 033 验收 2 的 PG 半边（`SAMPLE_DISTINCT=true`
+那一轮在真 `pg_catalog` + 真 psycopg 上落到哪两列、又绝不碰哪几列）。
 
 期望值出处（**独立真相源，不是从实现 dump**）：
 - `backend/scripts/init_demo_pg.sql` —— 建库脚本自己：10 个业务对象的名单与各表列数、
@@ -16,14 +18,17 @@
   七类类型各一条 `>0`/`=1`），给不了"哪一位排第几、注释原文是什么、FK 两端是谁"这类形状事实，
   所以形状那半的真相源换成逐条读 `CREATE TABLE`/`CREATE INDEX`/`COMMENT ON` 语句本身。
   这是记录在案的偏离，不是把验收改了。
+- `docs/kb-workflow.md` §8（三步采样的分工：类型清单决定谁能进门、窗口与阈值的两个 `LIMIT`
+  各管什么、超阈值那一支是"什么都不写"而不是"写个截断版"）。工单 033 那条用例的类型清单
+  与高基数名单同样是从建库脚本逐条数出来的，不是从 `sampling.py` 反推。
 - `docs/metadata-model.md` §8.2（五条 SQL 的分工、`modifiers` 的判定按 `typname`）、
   §2.4 注 ④（022 拍板的 PG 档：两列取较晚者、视图不给造新鲜度）、§9（归一值域）、
   §2.2 末注（PG 的 `catalog_name` 就是目标库，不是 MySQL 那个空串）。
 - `docs/verification.md` §1.5.5（登记参数逐字）与 §1.5（对象数口径）。
 
 一条用例一次真跑，所以每条的体量大得远超同类（`test_sync_live.py` 每条 ~67 行，这里最长的
-一条 ~180 行）：`_sync_pg_once` 每次都要登记一个新数据源 + 跑一整轮真同步（真连源库、真发
-§8.2 五条 SQL、真落 82 列 14 索引 10 卡）。拆成"一题一条用例"会把 4 轮真跑变成 12 轮以上，
+一条 ~185 行）：`_sync_pg_once` 每次都要登记一个新数据源 + 跑一整轮真同步（真连源库、真发
+§8.2 五条 SQL、真落 82 列 14 索引 10 卡）。拆成"一题一条用例"会把这 5 轮真跑变成 15 轮以上，
 而那些题本来就共享同一轮跑出来的那一套行——拆开只是让闸更慢，不会让判定更严。
 凭证只从 gitignored 的 `.setup/demo_pg_ro.env` 读（工单 015 外层脚本产出的那一份）：缺文件就
 skip，换台机器不该把整个闸口卡红。口令不参与 repr、不进任何断言文本。
@@ -43,9 +48,10 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.services.kb_service import ActiveProfile
+from app.settings import get_settings
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_events_pg import _events
-from tests.integration.test_sync_live import _counts, _one, _relation_edges, _rows
+from tests.integration.test_sync_live import _counts, _one, _relation_edges, _rows, _value_domain
 from tests.integration.test_sync_pg import _sync
 from tests.unit.test_type_domain import assert_in_value_domain
 
@@ -680,3 +686,134 @@ async def test_验收5_last_analyze_at_按两列取较晚者_视图与未分析�
     for table in ("category", "t_no_comment"):
         if all(value is None for value in stamps.get(table, (None, None))):
             assert landed[table] is None, (table, landed[table])
+
+
+# ---------------------------------------- 工单 033（kb-workflow §8）live 半边：期望值的原料清单
+#
+# 名单与"该有几个值"逐条读自 `backend/scripts/init_demo_pg.sql` 自己的表达式（行号注在名字上）。
+# 窗口组数是写用例前用只读探针在 `ai_web_demo_pg` 上数过的（`LIMIT 1000` 的那一段窗口，
+# 不是全表 distinct），因为"这一列在窗口里摊到几个值"由夹具的行数与取模决定，不由采样层决定。
+# 反过来，落库结果的**期望形状**全部来自 §8 那三步的字面：类型清单放行谁、阈值 30 挡掉谁。
+PG_EVENT_TYPES = ("view", "cart", "pay", "share")  # :377 `(ARRAY[...])[(n % 4) + 1]`，各 250
+# 本轮被采样写进值域的两列。判据两半：§8 第一步的类型清单（`varchar`/`char`/`boolean`/
+# `tinyint`/`bool`/`enum`/`set`）放行、第二步的阈值 30 放行。
+#   写：order_item.is_gift 2 组 / user_activity_log.event_type 4 组
+#   类型进门但被阈值挡掉（7 列）：category.name 40、customer.name 200、customer.phone 200、
+#       order_main.order_no 1000、payment_record.trade_no 1000、product.name 500、
+#       user_activity_log.session_id 900
+#   根本不在清单里（这一族才是 PG 侧最要紧的一格）：演示库把短枚举列一律建成 `text`
+#       （:109 gender、:110 level、:178 product.status、:226 order_main.status、:317 channel），
+#       §8 那行清单**没有 `text`**，所以它们两格皆空；数组列（:180 tags、:409 top_keywords）
+#       由 `_base_name` 的数组分支挡在门外。
+SAMPLED_COLUMNS = frozenset({"order_item.is_gift", "user_activity_log.event_type"})
+# 看着像枚举、NDV 也被 015 的自检数出来过（`:655-657` 那三行写着 4/3/4）却因为类型是 `text`
+# 而不许被采的列——名单逐条对着 `init_demo_pg.sql` 的 CREATE TABLE 数过。
+TEXT_LOOKALIKE = (
+    "customer.gender",
+    "customer.level",
+    "order_main.status",
+    "payment_record.channel",
+    "product.status",
+)
+
+
+async def test_工单033_开采样跑真PG演示源_两列拿到值域_text与数组列一律不采(
+    monkeypatch: pytest.MonkeyPatch,
+    client: AsyncClient,
+    login: Login,
+    pg_source: DbAccount,
+    session_factory: Factory,
+) -> None:
+    """工单 033 验收 2 的 PG 半边：`SAMPLE_DISTINCT=true` 的一次真同步，值域落在**两列**上。
+
+    必须 live 的理由，两条是 PG 这一侧独有的：
+    - `boolean` 列经真 psycopg 回来是 Python `bool`，`render_sample_value` 把它写成**小写**的
+      `false`/`true`。闸内的桩直接给字符串，证不到"驱动给的是什么类型"这一层；而卡片把那行
+      文本原样端给模型，字面大小写不是化妆问题。
+    - `text` 与数组列"不该被碰"这一半，只有真 `pg_catalog` 给的 `format_type` 原文落成真
+      `data_type` 之后才说得出（验收 4 那张成对表就是这一份原料）。清单外的一列被写了值域，
+      在桩上会绿、在真库上才会红。
+
+    期望值出处：上面那份原料注释块（`init_demo_pg.sql` 的表达式与行号）、
+    `docs/kb-workflow.md` §8 的类型清单与阈值语义、`docs/metadata-model.md` §9 的归一值域
+    （`character varying(32)→varchar(32)`、`boolean→bool`，两条都在本文件验收 4 里逐字钉过）。
+
+    两句自我限定，都不算这一条的分辨力：
+    - **`has_declared_enum` 那一支在 PG live 没有实物**——演示库一个真枚举类型都没有
+      （`typtype='e'` 实测 0 行，见验收 4 末注与 verification §1.5.4 末注），所以"定义已给值域
+      的列不采"在 PG 这一路只能靠 `tests/unit/test_extract_sample_distinct.py` 的桩。
+    - **关掉开关的第二轮把两格抹回 NULL** 那一半不在这里重复：它已经在真 MySQL 的兄弟用例
+      （`test_sync_live.py` 的工单 033 那一条）与闸内的双轮用例（`test_sync_sample_distinct_pg.py`）
+      各钉过一次，而这里的第二轮要多跑一整轮真同步、多烧 5 条真 SQL 与一次真卡片重建。
+    """
+    monkeypatch.setenv("AIWEB_EXTRACT__SAMPLE_DISTINCT", "true")
+    monkeypatch.setenv("AIWEB_EXTRACT__SAMPLE_DISTINCT_MAX_DISTINCT", "30")
+    monkeypatch.setenv("AIWEB_EXTRACT__SAMPLE_ROW_LIMIT", "1000")
+    get_settings.cache_clear()
+
+    ds_id, body = await _sync_pg_once(
+        client, login, pg_source, username="pg-sample-owner", ds_name="pg-sample"
+    )
+    assert body["errors"] == [], "采样那一步在真 PG 上失败了：见 §8 第二步的语句形状"
+    # 采样只动那两格，不动结构：82 列一行没少、一张表没多（工单 033 验收 6 的 live 那一半）
+    assert body["counters"]["columns"] == COLUMNS
+
+    domain = await _value_domain(session_factory, ds_id)
+    assert len(domain) == COLUMNS
+
+    # ---- 正量 ①：布尔列。窗口=前 1000 行里 `(n % 17 = 0)`（:293）摊到 58 行，
+    # 于是 false 942 / true 58，频次降序那一支把 false 排在前面。
+    is_gift = domain["order_item.is_gift"]
+    assert is_gift == ("bool", ["false", "true"], ["false", "true"]), is_gift
+
+    # ---- 正量 ②：varchar 枚举列。四个值在窗口里各 250 次，**全部同频**，
+    # 于是次序由"同频次按字面升序"那一条决定——这一格是那条 tie-break 在真数据上的样子，
+    # 没有它，四个值的先后就归 psycopg 的返回顺序决定，卡片文本会随机漂。
+    event_type = domain["user_activity_log.event_type"]
+    assert event_type == (
+        "varchar(32)",
+        ["cart", "pay", "share", "view"],
+        ["cart", "pay", "share", "view"],
+    ), event_type
+    assert set(event_type[1] or []) == set(PG_EVENT_TYPES)
+
+    # ---- 全列级：谁被写了、谁没被写，一列都不许多。
+    # `enum_values` 非空的集合**也**等于这两列——PG 侧定义那一整轮一个都没写（演示库 0 个真枚举），
+    # 所以这一条同时是验收 4 那句"抽取器不凭空造枚举值"在开了采样的那一轮的反面证据。
+    assert {key for key, (_n, _e, sv) in domain.items() if sv is not None} == SAMPLED_COLUMNS
+    assert {key for key, (_n, ev, _s) in domain.items() if ev is not None} == SAMPLED_COLUMNS
+    assert {n.partition("(")[0] for n, _e, sv in domain.values() if sv is not None} == {
+        "bool",
+        "varchar",
+    }
+
+    # ---- 反证 ①：`text` 那一族。低基数（015 的自检 :655-657 亲手数出 4/3/4）、非生成、
+    # 无定义值域，三条都够，唯独类型不在 §8 第一行那份清单里 → 两格皆空。
+    # 这一条不是在夸清单，是在**记账**：PG 演示库最像枚举的这几列进不了卡片，要它们就得改 §8
+    # 那行清单（那是改文档，不是这一片顺手能做的事），差异记在工单 033 的交付记录里。
+    for key in TEXT_LOOKALIKE:
+        norm, enum_values, sample_values = domain[key]
+        assert norm == "text", (key, norm)
+        assert (enum_values, sample_values) == (None, None), key
+
+    # ---- 反证 ②：数组列。`text[]`（:180）与 `varchar(64)[]`（:409）——后者元素类型确实在清单里，
+    # 但对数组发 `GROUP BY` 数的是"整个数组有几种"，阈值判定当场失真，所以 `_base_name` 认 `[`
+    # 就回 None。这一格在真库上的形状是"归一值带 `[]` 后缀"（验收 4 那张成对表的同一份原料）。
+    for key in ("product.tags", "product_stats_wide.top_keywords"):
+        assert domain[key][1:] == (None, None), key
+    assert domain["product_stats_wide.top_keywords"][0] == "varchar(64)[]"
+
+    # ---- 反证 ③：类型进门、被阈值挡掉的 7 列。`category.name` 是最要紧的那一列：表只有 40 行、
+    # 窗口 1000 行把它扫全了，外层 `LIMIT` 写的是阈值+余量（40）而不是阈值本身（30），
+    # 于是 40 组全数回来、40 > 30 → 放弃。写成 `LIMIT 30` 时这一列会只回 30 组，
+    # `adjudicate` 看不出"超了"，40 个取值的自由文本列就被当成枚举列写进卡片。
+    for key in (
+        "category.name",
+        "customer.name",
+        "customer.phone",
+        "order_main.order_no",
+        "payment_record.trade_no",
+        "product.name",
+        "user_activity_log.session_id",
+    ):
+        assert domain[key][1:] == (None, None), key

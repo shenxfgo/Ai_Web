@@ -24,6 +24,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 
 from app.extractor.base import (
+    ColumnSample,
     ConnectionSpec,
     ExtractWarning,
     RawCatalog,
@@ -33,6 +34,7 @@ from app.extractor.base import (
     RawIndexColumn,
     RawTable,
     Row,
+    SampleTarget,
     ScopeCounts,
     ServerInfo,
     SourceManifest,
@@ -40,9 +42,14 @@ from app.extractor.base import (
     ensure_within_max_tables,
 )
 from app.extractor.batching import in_list, in_params, slice_names
+from app.extractor.sampling import ndv_query_limit, quote_ident, rows_to_sample
 
 # 系统库永远不该进元数据：它们的信息是实例级的，且会把 60+ 张表灌进卡片库（§8.1 A）
 SYSTEM_SCHEMAS: Final = ("information_schema", "mysql", "performance_schema", "sys")
+
+# 工单 033：采样语句的标识符引号。一条语句里要给三处（库、表、列）包同一个字符，
+# 所以写一次存成常量；`quote_ident` 因此拿到的是"这个方言的引号是哪个"，而不是它自己猜。
+BACKTICK: Final = "`"
 
 SQL_CATALOGS: Final = f"""
 SELECT s.SCHEMA_NAME, s.DEFAULT_CHARACTER_SET_NAME, s.DEFAULT_COLLATION_NAME,
@@ -173,6 +180,38 @@ WHERE k.TABLE_SCHEMA = :schema AND k.REFERENCED_TABLE_NAME IS NOT NULL
   AND {in_list(tables, "k.TABLE_NAME")}
 """
     return sql, in_params(tables, schema)
+
+
+def build_sql_sample(
+    schema: str, table: str, column: str, *, max_distinct: int, row_limit: int
+) -> tuple[str, dict[str, object]]:
+    """`kb-workflow` §8 第二步（工单 033）：一列一条"先在扫描窗口里分组、再按阈值截断"的语句。
+
+    两个 `LIMIT` 各管一件事，别合：内层 `:row_limit` 是 `SAMPLE_ROW_LIMIT`（"单次采样扫描
+    上限"，也就是喂给 `GROUP BY` 的行数窗口），外层 `:ndv_limit` 是 `ndv_query_limit(阈值)`
+    （阈值 + 余量，用来让"这列其实有几百个值"在结果集里显形）。§8 原文只写了外层那一条；
+    内层这一层是 `SAMPLE_ROW_LIMIT` 唯一的落点，没有它第三键就还是"只有定义点"。
+
+    窗口**没有 `ORDER BY`**：§8 说的是"扫描上限"，不是"最新的那一批"，而加一个
+    `ORDER BY id` 等于让源库为了这个上限去做一次排序。代价如实记在这里：值域因此是
+    "窗口里出现过的值"而不是全表值域——这正是 §8 末那句"开采样会显著上升同步时长与
+    源库读压力"的另一面，窗口越小越省、也越可能漏掉少见的那个取值。
+
+    名字（库/表/列）只能进文本——源库不接受标识符位置的绑定参数——所以走 `quote_ident`；
+    两个数走具名绑定参数（与 §8.1 其余四条同一条纪律）。
+    """
+    scan = (
+        f"(SELECT {quote_ident(column, quote=BACKTICK)} AS v "
+        f"FROM {quote_ident(schema, quote=BACKTICK)}.{quote_ident(table, quote=BACKTICK)} "
+        f"LIMIT :row_limit) AS win"
+    )
+    sql = (
+        "SELECT win.v AS sample_value, COUNT(*) AS n\n"
+        f"FROM {scan}\n"
+        "GROUP BY win.v\n"
+        "LIMIT :ndv_limit"
+    )
+    return sql, {"row_limit": row_limit, "ndv_limit": ndv_query_limit(max_distinct)}
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +617,33 @@ class MySQLExtractor:
             warnings=warnings,
             batches=batches,
         )
+
+    # -------------------------------------------------- §8 可选加档（工单 033）
+
+    async def sample_distinct(
+        self, target: SampleTarget, *, max_distinct: int, row_limit: int
+    ) -> list[ColumnSample]:
+        """`kb-workflow` §8 第二步：**一列一条**"窗口内分组"的语句，组按列名交回。
+
+        发包数 = 候选列数，不是"每表一条"——这是 `collect()` 那套"查询条数与表数量无关"
+        口径的另一面，工单 033 的已定口径把它换成了逐表逐列，换来的是：单列失败只损失
+        那一列，单表失败只损失那一张表（`collect()` 的每库一事务表达不出这个粒度）。
+        视图也在射程内（§8 没排除它）：对视图发 `GROUP BY` 会执行视图定义的那段子查询，
+        窗口仍然是 `row_limit` 行，所以贵的不是聚合而是视图本身——真实大库默认关这个键
+        的一条理由就在这里。
+        """
+        samples: list[ColumnSample] = []
+        for column in target.columns:
+            sql, params = build_sql_sample(
+                target.schema_name,
+                target.table_name,
+                column,
+                max_distinct=max_distinct,
+                row_limit=row_limit,
+            )
+            rows = await self._fetch(sql, params)
+            samples.append(rows_to_sample(rows, column_name=column))
+        return samples
 
     async def close(self) -> None:
         def _close() -> None:

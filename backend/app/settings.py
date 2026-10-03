@@ -149,6 +149,10 @@ class ExtractGroup(BaseModel):
     stale_job_reclaim_s: int = 180
     sample_distinct: bool = False  # 默认关（P4 决策 ⑩）：开了等于每次同步真去源库跑 GROUP BY
     sample_distinct_max_distinct: int = 30
+    # §8 键表里"单次采样扫描上限"那一行。它进的是采样 SQL **内层**的那个 LIMIT
+    # （先按行截一段再数 distinct），所以它管的是"这一列最多看过多少行"，
+    # 与 `sample_distinct_max_distinct`（数出来之后放不放弃这一列）是两件事。
+    sample_row_limit: int = 1000
     min_mysql_version: str = "5.7"
     min_pg_version: str = "12"
     # kb-workflow §5：卡片模板本身改了要升它，它写进 kb_index_profile（§2.6 的 int 列），

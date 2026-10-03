@@ -146,3 +146,19 @@ def test_join_门槛可以被环境覆盖(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("AIWEB_RETRIEVAL__MAX_JOIN_DEGREE", "20")
     retrieval = Settings(_env_file=None).retrieval
     assert (retrieval.join_hops, retrieval.max_join_degree) == (3, 20)
+
+
+def test_采样三键的默认值逐字对得上_kb_workflow_8_那张表() -> None:
+    """工单 033 验收 1 的**配置那一半**：三个键的默认值出处是 §8 那张键表，不是代码。
+
+    三个数各管一件事，混了就没人说得清"这次同步到底扫了多少源库数据"：
+    - `sample_distinct=False`：开关。§8 那张表原来写 `true`（演示库口径），2026-10-02 拍板
+      改成默认关（决策 ⑩），真相源是 roadmap 分组 7 那句"扫源库数据，默认关"。
+    - `sample_distinct_max_distinct=30`：NDV 阈值，§8 第二步那句"超过即放弃"比的数。
+    - `sample_row_limit=1000`：**新增**的第三个键（§8 键表里的"单次采样扫描上限"）。
+      它此前只有定义点都没有——`Settings` 里没有这个字段，`.env.example` 里也没有那一行。
+    """
+    extract = Settings(_env_file=None).extract
+    assert extract.sample_distinct is False
+    assert extract.sample_distinct_max_distinct == 30
+    assert extract.sample_row_limit == 1000

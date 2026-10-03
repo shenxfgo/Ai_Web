@@ -56,6 +56,7 @@ from sqlalchemy.pool import NullPool
 
 from app.extractor import postgres_types
 from app.extractor.base import (
+    ColumnSample,
     ConnectionSpec,
     RawCatalog,
     RawColumn,
@@ -64,6 +65,7 @@ from app.extractor.base import (
     RawIndexColumn,
     RawTable,
     Row,
+    SampleTarget,
     ScopeCounts,
     ServerInfo,
     SourceManifest,
@@ -71,9 +73,14 @@ from app.extractor.base import (
     ensure_within_max_tables,
 )
 from app.extractor.batching import in_list, in_params, slice_names
+from app.extractor.sampling import ndv_query_limit, quote_ident, rows_to_sample
 
 # §8.2 A 的排除名单，原文逐字（三个名字 + 两个 `pg_temp*` / `pg_toast*` 模式）
 SYSTEM_SCHEMAS: Final = ("pg_catalog", "information_schema", "pg_toast")
+
+# 工单 033：采样语句的标识符引号。一条语句里三处（schema、表、列）都用它，
+# 而且 PG 这一家**不能**省——去掉引号就退化成大小写折叠的名字。
+DQUOTE: Final = '"'
 
 # `\_` 把下划线还原成字面量：不转义的 `pg_%` 里 `_` 是单字符通配符，会把 `pgXtemp` 这类
 # 正常表名一起排掉（本机 PG 18.6 实测：`'pgXtemp' LIKE 'pg\_%'` 为假、`LIKE 'pg_%'` 为真），
@@ -252,6 +259,30 @@ WHERE con.contype = 'f' AND sn.nspname = :schema AND {in_list(tables, "rc.relnam
 ORDER BY rc.relname, con.conname, x.ord
 """
     return sql, in_params(tables, schema)
+
+
+def build_sql_sample(
+    schema: str, table: str, column: str, *, max_distinct: int, row_limit: int
+) -> tuple[str, dict[str, object]]:
+    """`kb-workflow` §8 第二步（工单 033）：与 MySQL 那一版同形，只差标识符引号。
+
+    两个 `LIMIT` 各管什么、内层为什么不排序、为什么名字进文本而数字走绑定参数——
+    那份解释只写在 `mysql.build_sql_sample` 一处，这里不重述。PG 侧值得留字的是一条：
+    标识符**必须**带引号原样交回。023 之后归一过的只有类型名，表名/列名从来不曾归一，
+    而去掉引号会让建库时写成 `"MixedCase"` 的表在 PG 眼里变成 `mixedcase`——那张表不存在。
+    """
+    scan = (
+        f"(SELECT {quote_ident(column, quote=DQUOTE)} AS v "
+        f"FROM {quote_ident(schema, quote=DQUOTE)}.{quote_ident(table, quote=DQUOTE)} "
+        f"LIMIT :row_limit) AS win"
+    )
+    sql = (
+        "SELECT win.v AS sample_value, COUNT(*) AS n\n"
+        f"FROM {scan}\n"
+        "GROUP BY win.v\n"
+        "LIMIT :ndv_limit"
+    )
+    return sql, {"row_limit": row_limit, "ndv_limit": ndv_query_limit(max_distinct)}
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +645,30 @@ class PostgresExtractor:
             warnings=[],
             batches=batches,
         )
+
+    # -------------------------------------------------- §8 可选加档（工单 033）
+
+    async def sample_distinct(
+        self, target: SampleTarget, *, max_distinct: int, row_limit: int
+    ) -> list[ColumnSample]:
+        """`kb-workflow` §8 第二步：一列一条"窗口内分组"的语句（与 MySQL 同一形状）。
+
+        为什么两方言各写一份而不是共用一条 builder：这一路的 SQL 文本今天恰好同形，
+        但 §8 的下一步（`pg_stats.n_distinct` 免扫取基数，见 `docs/metadata-model.md`
+        §8.2 D 的偏离 4 末注）只有 PG 能用——共用一份就要在那时候拆。
+        """
+        samples: list[ColumnSample] = []
+        for column in target.columns:
+            sql, params = build_sql_sample(
+                target.schema_name,
+                target.table_name,
+                column,
+                max_distinct=max_distinct,
+                row_limit=row_limit,
+            )
+            rows = await self._fetch(sql, params)
+            samples.append(rows_to_sample(rows, column_name=column))
+        return samples
 
     async def close(self) -> None:
         def _close() -> None:

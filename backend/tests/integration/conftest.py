@@ -220,6 +220,27 @@ def embedding_endpoint_off(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def sampling_off_by_default(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """整条 integration 目录默认**不做** §8 的枚举采样，要采样的用例自己盖回 `true`。
+
+    工单 033 之后这一步是**真去源库跑 GROUP BY** 的：`run_sync` 会在 card_build 之前逐表
+    问一次方言的 `sample_distinct`。本机 `.env` 那行 P2 时代留下的
+    `AIWEB_EXTRACT__SAMPLE_DISTINCT=true` 会让几十条 pg 用例的桩抽取器被要求做它没实现的
+    事、让 live 用例在演示库上跑几百次扫描——`embedding_endpoint_off` 是同一条纪律的上一格。
+
+    代码默认值本来就是 `False`（033 的已定口径"默认关"），这一条只是不让开发机上的
+    一行配置替整条目录决定"要不要扫源库"。要真采的用例（`test_sync_sample_distinct_pg.py`）
+    在同名键上再 `setenv` 一次，autouse 排在同作用域其余夹具之前，后写的那一份赢。
+    """
+    monkeypatch.setenv("AIWEB_EXTRACT__SAMPLE_DISTINCT", "false")
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        get_settings.cache_clear()
+
+
 @pytest.fixture
 async def session_factory(
     pg_migrated: None, fernet_key: str

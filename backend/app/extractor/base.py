@@ -216,6 +216,34 @@ class ScopeCounts:
     view: int = 0
 
 
+@dataclass(slots=True, frozen=True)
+class SampleTarget:
+    """一次逐表采样的靶（工单 033；`kb-workflow` §8 的第二步是按**表**发、按**列**包的）。
+
+    只有三个字段是故意的：方言拿到"在哪个 schema 的哪张表上、对哪几列数一遍"就够了，
+    谁是候选列（§8 第一步的类型清单）、阈值怎么裁（§8 第二步）都不住在这里——
+    前者要读库里的 `meta_column`（采样住在落库之后），后者是 `Settings` 的口径。
+    `columns` 由调用方保证非空；空靶的发数由用例钉（一条都不发）。
+    """
+
+    schema_name: str
+    table_name: str
+    columns: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class ColumnSample:
+    """一列的分组结果：`((值, 次数), ...)`，顺序就是源库返回的顺序。
+
+    为什么交回的是**组**而不是 §7 那份接口草稿里的 `list[str]`：阈值判据（NDV）与
+    卡片里的次序（常见取值在前）都要用到次数，只交值就得在编排层再发一次 `COUNT(*)`。
+    值已经过 `render_sample_value` 文本化（`None` 表示 NULL 桶），裁决因此与方言无关。
+    """
+
+    column_name: str
+    groups: tuple[tuple[str | None, int], ...]
+
+
 def ensure_within_max_tables(table_count: int, max_tables: int | None) -> None:
     """范围上限只在**昂贵查询之前**判一次：两方言这条门槛是同一条，报错的字面也因此同字。
 
@@ -266,8 +294,13 @@ def apply_index_flags(columns: Sequence[RawColumn], indexes: Sequence[RawIndex])
 
 @runtime_checkable
 class Extractor(Protocol):
-    """P2 用到的方言子集 + 017 的范围计数。§7 的 `stream_manifest` / `sample_distinct`
-    属 P3，先不假装实现。
+    """P2 用到的方言子集 + 017 的范围计数。
+
+    §7 草稿里的三个方法到今天的账：`stream_manifest`（分批 yield + cancel 回调）与
+    `render_create_sql` 仍然**既无实现也无桩**（前者等 cancel 有写入点，后者等 P8 前端的
+    "查看建表语句"），这里不假装实现；`sample_distinct` 由工单 033 落地，因为它是**可选**
+    能力（§8 末那句"默认 disabled"），所以它不挂在 `Extractor` 上，单独成下面的
+    `SupportsSampleDistinct`——挂上来的话，第三种源库一登记就得先交一个空实现。
 
     `collect` 的抽取范围由调用方渲染成 SQL 片段传进来（006/007 共用
     `datasource_service.table_scope_filter`），方言层因此不认识 ORM 行也不认识正则口径；
@@ -307,3 +340,26 @@ class Extractor(Protocol):
     ) -> SourceManifest: ...
 
     async def close(self) -> None: ...
+
+
+@runtime_checkable
+class SupportsSampleDistinct(Protocol):
+    """`Extractor` 的可选加档：`kb-workflow` §8 的枚举 NDV 采样（工单 033）。
+
+    注意 § 号的两个来源：本文件头上的"§7"指 `docs/metadata-model.md` 的接口草稿，
+    而这里的"§8"指 `docs/kb-workflow.md` 的采样那一节——两份文档各自都有 §8。
+
+    分成第二个协议而不是往 `Extractor` 上加一个方法，是为了让"`sample_distinct` 是可选能力、
+    默认 disabled"（§8 末原文）在**类型上**看得见：加档缺失的方言到了编排层就是
+    "整步跳过、一条 SQL 都不发"，而不是"交一个空实现来假装支持"。编排层读的是
+    `_SourceDialect.can_sample_distinct` 那一个能力位，`isinstance` 只在用例里当它的对账
+    （`tests/unit/test_sync_dialect_dispatch.py`，同 024 的 `scope_column` 成对那条纪律）。
+
+    两个必填参数**不给默认值**（同 `collect` 的 `batch_size` 那条纪律）：30 与 1000 的口径
+    住在 `Settings.extract`，方言层再写一遍就出现第二个定义点。返回值是**组**而不是值域，
+    裁决归 `sampling.adjudicate`——这一层只负责"把这列数一遍"。
+    """
+
+    async def sample_distinct(
+        self, target: SampleTarget, *, max_distinct: int, row_limit: int
+    ) -> list[ColumnSample]: ...

@@ -14,6 +14,10 @@
 - `docs/metadata-model.md` §3/§4/§5：三段式写入语义、`extracted` vs `inferred`、软删除
 - 最后一张用例（工单 023 验收 5）：`docs/metadata-model.md` §9 的归一清单 +
   `backend/scripts/init_demo_mysql.sql` 里逐字写着的列类型
+- 最后一条（工单 033 验收 2）：`docs/kb-workflow.md` §8 的类型清单与阈值语义 +
+  `init_demo_mysql.sql` 里那几处 `ELT(1 + x % n, ...)` 的**字面清单**（品牌 12、标签 5×4、
+  退款原因 5×3、事件类型 6、城市 13 项里 `% 12` 够得着的 12）；窗口组数在写用例前用只读探针
+  在演示库上数过一遍，数的是"该有几个值"这件事，不是拿落库结果反推期望
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.extractor.mysql import MySQLExtractor
 from app.services.kb_service import ActiveProfile
+from app.settings import get_settings
 from tests.integration.conftest import Account, DbAccount
 from tests.integration.test_sync_pg import _sync
 from tests.unit.test_type_domain import assert_in_value_domain
@@ -145,6 +150,30 @@ async def _one(session_factory: async_sessionmaker[AsyncSession], sql: str, **pa
     rows = await _rows(session_factory, sql, **params)
     assert len(rows) == 1, rows
     return next(iter(rows[0].values()))
+
+
+async def _value_domain(
+    session_factory: async_sessionmaker[AsyncSession], ds_id: int
+) -> dict[str, tuple[str, list[str] | None, list[str] | None]]:
+    """`{表.列: (data_type, enum_values, sample_values)}`——§8 那两格在本轮落库后的样子。
+
+    键用 `表.列` 而不是 `库.表.列`：这一份要跨 MySQL/PG 两个 live 文件共用（PG 那一份从这里
+    import，与 `_counts` / `_relation_edges` 同一先例），而两边都只登记一个库一个 schema，
+    `datasource_id` 已经把范围钉住了。
+    带着 `data_type` 回来只有一个用途：那两条"凡是被采过的列，类型必须在 §8 清单里"的
+    全列级断言——只点名几列的话，采样把清单外的列也写了会看不见。
+    """
+    return {
+        f"{row['tbl']}.{row['col']}": (row["norm"], row["ev"], row["sv"])
+        for row in await _rows(
+            session_factory,
+            "select t.table_name as tbl, c.column_name as col, c.data_type as norm,"
+            "       c.enum_values as ev, c.sample_values as sv"
+            ' from "{s}".meta_column c join "{s}".meta_table t on t.id = c.table_id'
+            " where t.datasource_id = :ds",
+            ds=ds_id,
+        )
+    }
 
 
 async def _relation_edges(
@@ -545,3 +574,248 @@ async def test_工单023_data_type_落库后全是归一值_方言原文仍留�
         for name in expected
     }
     assert got == expected, json.dumps(got, ensure_ascii=False)
+
+
+# ---------------------------------------- 工单 033（kb-workflow §8）live 半边：期望值的原料清单
+#
+# 下面几份清单逐条读自 `backend/scripts/init_demo_mysql.sql` 的 `INSERT ... SELECT` 表达式本身
+# （行号注在每一个名字上），**不是**从 `meta_column` dump 回来的：这一条要断的是"值域该是那些值"，
+# 拿落库结果当期望就是同义反复。`brand`/`tags`/`reason` 三份都写成 `ELT(1 + x % n, ...)`，
+# 而 `n` 就是那份清单的长度——所以"组合数 = 各清单长度之积"这一条事实也住在脚本里。
+BRANDS = frozenset(
+    {
+        "云帆",
+        "木白",
+        "青麦",
+        "拾光",
+        "物研社",
+        "南屿",
+        "常喜",
+        "禾风",
+        "初语",
+        "山海",
+        "良物",
+        "潮汐",
+    }
+)  # :127-128，`ELT(1 + p.x2 % 12, ...)`
+TAG_HEADS = ("热销", "新品", "促销", "自营", "包邮")  # :131，`ELT(1 + p.x3 % 5, ...)`
+TAG_TAILS = ("正品保障", "七天无理由", "破损包退", "会员专享")  # :132，`ELT(1 + p.x4 % 4, ...)`
+REFUND_REASONS = ("拍错/多拍", "商品与描述不符", "质量问题", "物流太慢", "七天无理由")  # :330
+REFUND_STATES = ("已上传凭证", "客服已电话沟通", "等待买家退货")  # :331
+EVENT_TYPES = ("view", "search", "cart_add", "fav", "order_submit", "pay_success")  # :503
+# :167-168 那份城市清单写着 13 个名字，但取模是 `% 12` → `ELT` 最多走到第 12 项，
+# '重庆' 在这张表里一次都没出现过。全表 distinct 因此是 12，而**这一列的值域永远缺那一个名字**——
+# 它是 §8 那句"只取值不存行数据"之外另一条容易被读错的口径：脚本作者以为是 13。
+CITIES = frozenset(
+    {
+        "上海",
+        "北京",
+        "广州",
+        "深圳",
+        "杭州",
+        "成都",
+        "武汉",
+        "西安",
+        "南京",
+        "苏州",
+        "长沙",
+        "重庆",
+    }
+)
+
+# 本轮**被采样写进值域**的 7 列（键是 `表.列`）。逐列的来历：§8 第一步的类型清单放行、
+# 第二步的阈值 30 放行，两边都对着实跑前用只读探针在演示库上数过的那一份窗口组数：
+#   category.level 2 / customer.city 4 / order_item.is_gift 2 / product.brand 12 /
+#   product.tags 20 / refund_record.reason 15 / user_activity_log.event_type 6
+SAMPLED_COLUMNS = frozenset(
+    {
+        "category.level",
+        "customer.city",
+        "order_item.is_gift",
+        "product.brand",
+        "product.tags",
+        "refund_record.reason",
+        "user_activity_log.event_type",
+    }
+)
+# 本轮**有 `enum_values` 却没有 `sample_values`** 的 8 列：它们是 MySQL 真 ENUM，值域由
+# `information_schema` 的定义给（§8.2 那条老通路），而 §8 第一步的 `has_declared_enum` 那一格
+# 把它们挡在采样之外——定义比观测准（工单 033 的已定口径）。
+DECLARED_ENUM_COLUMNS = frozenset(
+    {
+        "customer.gender",
+        "customer.level",
+        "order_main.pay_type",
+        "order_main.status",
+        "payment_record.channel",
+        "payment_record.status",
+        "product.status",
+        "refund_record.status",
+    }
+)
+# §8 第一步放行去问的列数：演示库业务表里 `varchar`/`char`/`tinyint` 共 17 列，减去被
+# `exclude_tables: ["\\\\_%"]` 整表排除的 `_aiweb_demo_marker.version`；8 列真 ENUM 根本不进门。
+# 16 条问、7 列拿到值域——"发了多少条"与"写了多少列"分别是两道闸的实物，合成一条就说不清谁在筛。
+SENT_SAMPLE_QUERIES = 16
+
+
+async def test_工单033_开采样跑真MySQL_短文本列首次出现值域_关掉那一轮又抹回NULL(
+    client: AsyncClient,
+    login: Login,
+    monkeypatch: pytest.MonkeyPatch,
+    account: DbAccount,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """工单 033 验收 2 的 MySQL 半边：开关打开跑一次真同步，那两格在非真 ENUM 列上**第一次**有值。
+
+    必须 live 的理由有三条，闸内一条都给不出：
+    - 采样语句是 `build_sql_sample` 现拼的文本带两个绑定参数，它在真 MySQL 8 上跑不跑得起来
+      （派生表那一层 `LIMIT` 会不会被优化器合并掉、`GROUP BY` 认不认 derived 列）只有真库能答；
+      跑不起来的话终局是 `partial` + `sample_failed`，而这一条断的是 `success`。
+    - 值域的**内容**来自真数据的哈希分布（12 个品牌、5×4 个标签组合、15 条退款原因），
+      不是桩里摆好的那两组字符串。
+    - 关掉开关的第二轮把两格一起抹回 NULL：`sample_values` 是随本片才进 `_COLUMN_SYNC_COLS` 的，
+      "一批两格同生同灭"这件事只在真 upsert 上看得见（033 交付记录里那条口径的实物）。
+
+    期望值出处：上面那份原料注释块（全部来自 `init_demo_mysql.sql` 的表达式与行号）、
+    `docs/kb-workflow.md` §8 的类型清单与阈值语义、`docs/metadata-model.md` §9 的归一值域
+    （`tinyint(4)→tinyint`、`tinyint(1)→bool`，两条都注在 as-built(023) 那里，且本文件
+    工单 023 那一条已经逐字钉过一遍——这里复用同一对字面，不再另立一套）。
+
+    这一条**故意不要求** `active_profile`：033 把采样从 `if decision.profile_id is not None:`
+    里面提到了档案分支**之前**（"采样不属于档案"），所以"没有 active 档案、一张卡都没建的那一轮，
+    值域照样在场"正是那句注释的实物——`counters["cards"] == 0` 与 7 列值域同轮成立才算钉住。
+
+    一句自我限定：**`is_generated` 那一支在两处演示库里都没有实物**（MySQL 0 个生成列、PG 0 个），
+    所以这一条证不到"生成列不采"；那颗分辨力只住在 `tests/unit/test_extract_sample_distinct.py`。
+    """
+    # 三个键逐条钉死：期望的列名单与值集合是按"阈值 30 + 窗口 1000"数出来的，本机 `.env` 改了
+    # 那两个数时这一条要跟着重数，而不是悄悄换一份期望值。
+    monkeypatch.setenv("AIWEB_EXTRACT__SAMPLE_DISTINCT", "true")
+    monkeypatch.setenv("AIWEB_EXTRACT__SAMPLE_DISTINCT_MAX_DISTINCT", "30")
+    monkeypatch.setenv("AIWEB_EXTRACT__SAMPLE_ROW_LIMIT", "1000")
+    get_settings.cache_clear()
+
+    run = await _sync_once(client, login, monkeypatch, account)
+    body = run.body
+    assert body["status"] == "success", json.dumps(body, ensure_ascii=False)
+    assert body["errors"] == [], "采样那一步在真 MySQL 上失败了：见 §8 第二步的语句形状"
+
+    sample_sqls = [sql for sql in run.sent if "AS sample_value" in sql]
+    assert len(sample_sqls) == SENT_SAMPLE_QUERIES, len(sample_sqls)
+    assert all(sql.lstrip().upper().startswith("SELECT") for sql in sample_sqls), sample_sqls[:1]
+
+    domain = await _value_domain(session_factory, run.ds_id)
+
+    def values_of(key: str) -> tuple[str, list[str] | None, list[str] | None]:
+        assert key in domain, f"{key} 没落进本轮的 meta_column：{sorted(domain)[:5]}…"
+        return domain[key]
+
+    # ---- 正量 ①：中文短枚举列第一次有了值域（P2/P3 期间这两格在非真 ENUM 列上恒空）
+    norm, brands, brands_sample = values_of("product.brand")
+    assert norm == "varchar(64)"
+    assert brands is not None and set(brands) == BRANDS
+    assert len(brands) == len(BRANDS) == 12
+    assert brands == brands_sample, "§8 第三步：两格同批写入、同一份内容"
+
+    # ---- 正量 ②：组合值（`CONCAT_WS` 出来的 5×4）整串进值域，不拆开
+    _norm, tags, tags_sample = values_of("product.tags")
+    assert tags is not None and set(tags) == {
+        f"{head},{tail}" for head in TAG_HEADS for tail in TAG_TAILS
+    }
+    assert len(tags) == len(TAG_HEADS) * len(TAG_TAILS) == 20
+    assert tags == tags_sample
+
+    # ---- 正量 ③：自由文本形状的原因列（5×3 = 15 种组合，全角括号是脚本原文）
+    _norm, reasons, _sample = values_of("refund_record.reason")
+    assert reasons is not None and set(reasons) == {
+        f"{reason}（{state}）" for reason in REFUND_REASONS for state in REFUND_STATES
+    }
+    assert len(reasons) == len(REFUND_REASONS) * len(REFUND_STATES) == 15
+
+    # ---- 正量 ④：次序在真数据上的样子。六个值的次数互不相等（窗口=前 1000 行：pay_success 188、
+    # search 179、fav 165、cart_add 162、order_submit 157、view 149，探针在演示库上数过），
+    # 所以"频次降序"这一支被唯一决定；同频次按字面升序那一支要等次数相等才出场，住在纯函数层。
+    _norm, events, _sample = values_of("user_activity_log.event_type")
+    assert events == [
+        "pay_success",
+        "search",
+        "fav",
+        "cart_add",
+        "order_submit",
+        "view",
+    ], events
+    assert set(events or []) == set(EVENT_TYPES)
+
+    # ---- 正量 ⑤：窗口 ≠ 全表。`customer` 全表 distinct 城市是 12（那份 13 项清单里 '重庆' 被
+    # `% 12` 挡在门外），而这一列拿到的值域只有 4 个：`(SELECT city ... LIMIT 1000)` 走的是覆盖
+    # 索引 `idx_customer_city`（:157），前 1000 行按索引序回来只摊到 4 个城市。
+    # 这一格是 §8 那条"扫描上限"的**代价**的实物：省掉排序，换来"少见的取值可能没进窗口"。
+    # 真要变红的是执行计划换了，那时候重数的是这个 4 与下面这份名单，不是断言的写法。
+    _norm, cities, _sample = values_of("customer.city")
+    assert cities is not None and set(cities) <= CITIES
+    assert set(cities) == {"上海", "北京", "南京", "广州"}
+    assert len(cities) == 4 < 12
+
+    # ---- 正量 ⑥：窄整型与布尔写法。MySQL 的布尔是 `tinyint(1)`，驱动回来是 int，
+    # 所以值域字面是 "0"/"1"；PG 的 `boolean` 回来是 Python bool，同一归一值 `bool` 下字面是
+    # "false"/"true"（`test_extract_pg_live.py` 的对应那一条）。两方言在 `data_type` 上一致、
+    # 在值域字面上不一致——这一点只有各跑一次真库才看得见，而卡片把这两行都端给模型。
+    assert values_of("category.level")[1] == ["2", "1"]
+    assert values_of("order_item.is_gift")[:1] == ("bool",)
+    assert values_of("order_item.is_gift")[1] == ["0", "1"]
+
+    # ---- 反证 ①：真 ENUM 列一律不采，值域仍是**定义**那一份，且 `sample_values` 恒空。
+    # `sample_values is None` 才是这一支的判据：`on_sale/off_sale/draft` 三个值的观测顺序
+    # 与定义顺序恰好也排得一样（窗口里 on_sale 约占 2/3），所以次序分不出"定义"与"观测"，
+    # 而"定义那一路从来只写 `enum_values`"这条分得开。
+    assert values_of("product.status") == ("enum", ["on_sale", "off_sale", "draft"], None)
+
+    # ---- 全列级：谁被写了、谁没被写，一列都不许多（`_value_domain` 带 `data_type` 就是为这两条）
+    assert {key for key, (_n, _e, sv) in domain.items() if sv is not None} == SAMPLED_COLUMNS
+    assert {key for key, (_n, ev, _s) in domain.items() if ev is not None} == (
+        SAMPLED_COLUMNS | DECLARED_ENUM_COLUMNS
+    )
+    # 被采到的列的类型基名全落在 §8 第一行那份清单里；冒出别的基名就是候选筛子坏了。
+    assert {n.partition("(")[0] for n, _e, sv in domain.values() if sv is not None} == {
+        "varchar",
+        "tinyint",
+        "bool",
+    }
+
+    # ---- 反证 ②：高基数列什么都不写（§8 第二步"超过阈值即放弃"，放弃的形状是 NULL 不是空列表）
+    for key in ("customer.nickname", "product.sku", "user_activity_log.session_id"):
+        assert values_of(key)[1] is None and values_of(key)[2] is None, key
+    # `category.name` 是最要紧的那一列：表只有 40 行，窗口 1000 行把它扫全了，40 > 30 → 放弃。
+    # 外层 `LIMIT` 若写成阈值本身（`LIMIT 30`），这一列只会回 30 组，`adjudicate` 看不出"超了"，
+    # 于是 40 个取值的自由文本列会被当成枚举列写进卡片。
+    # `ndv_query_limit` 那 10 行余量买的就是这一格。
+    assert values_of("category.name")[1] is None
+
+    # ---- 采样不属于档案：这一轮没有 active 档案（用例没要那副夹具），卡片一张都没建
+    assert body["counters"]["cards"] == 0
+
+    # =============================== 第二轮：把开关关掉，看这两格的命运（同一个源、同一个账号）
+    monkeypatch.setenv("AIWEB_EXTRACT__SAMPLE_DISTINCT", "false")
+    get_settings.cache_clear()
+    second = await _trigger(client, run)
+    assert second["status"] == "success", json.dumps(second, ensure_ascii=False)
+    assert second["errors"] == []
+
+    after = await _value_domain(session_factory, run.ds_id)
+    assert [sql for sql in run.sent if "AS sample_value" in sql] == sample_sqls, (
+        "开关关掉之后源库又收到了采样语句：这一轮该一步都不发（工单 033 验收 1 的 live 那一半）"
+    )
+    # 两格一起回 NULL：`sample_values` 随本片进 `_COLUMN_SYNC_COLS`，与 `enum_values` 同一条命运。
+    # 少了这一格的话，一轮不采样的同步会把 `enum_values` 抹成 NULL 而让隔壁那格留着上一轮的值域——
+    # 卡片少一行「取值:」而界面下拉里还摆着那两个值，两处读同一列的说法当场分家。
+    assert {key for key, (_n, _e, sv) in after.items() if sv is not None} == set()
+    for key in SAMPLED_COLUMNS:
+        assert after[key][1] is None and after[key][2] is None, key
+    # 真 ENUM 那 8 列不受影响：值域每轮由抽取层从定义重写，`sample_values` 则始终是空的
+    # （定义那一路不写它，采样那一路不许碰它们）。逐个点名而不是比一个字典推导式：这一格
+    # 想说的话是"8 列全在、全带着定义"，写成推导式就把"少了一列"这种红洗成了"等于空"。
+    for key in sorted(DECLARED_ENUM_COLUMNS):
+        assert after[key][0] == "enum", key
+        assert after[key][1], f"{key} 的定义值域第二轮不见了"
+        assert after[key][2] is None, key

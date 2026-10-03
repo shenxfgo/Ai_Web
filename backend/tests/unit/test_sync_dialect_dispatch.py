@@ -18,7 +18,7 @@ import pytest
 from app.core.errors import NotImplementedSource
 from app.extractor import mysql as mysql_extractor
 from app.extractor import postgres as pg_extractor
-from app.extractor.base import ConnectionSpec
+from app.extractor.base import ConnectionSpec, SupportsSampleDistinct
 from app.extractor.postgres import PostgresExtractor
 from app.models.datasource import DataSource
 from app.services.datasource_service import table_scope_filter
@@ -116,3 +116,19 @@ def test_范围条件的列写法在这个方言的_b_查询里认得(kind: str)
     assert params == {"schema": "ai_web_demo", **scope_params}
     for name in ("order_main", "v_daily"):
         assert name not in built
+
+
+@pytest.mark.parametrize("kind", sorted(_DIALECTS))
+def test_采样能力位与工厂真产出的那个对象成对(kind: str) -> None:
+    """工单 033：`can_sample_distinct` 不许成为第二份真相（024 的 `scope_column` 同条纪律）。
+
+    编排层只读能力位、不 import 具体方言模块（024 刚把那条边拆掉），所以位与实物之间
+    没有类型系统兜着——它俩漂开的方式有两种，而且都是安静错：位说"有"而抽取器没有，
+    同步在源库上撞 `AttributeError`；位说"没有"而抽取器有，采样整步永远不跑，
+    而配置里 `SAMPLE_DISTINCT=true` 照旧读得到（"改了配置不生效"正是本片要闭的那类错）。
+    断言写成"两边相等"而不是"两边都为真"，是因为第三种源库将来登记时这一条要跟着变绿
+    而不是跟着红——它钉的是成对，不是这一家的实现进度。
+    """
+    dialect = _dialect_for(kind)
+    # 只构造不连接：`__init__` 惰性建引擎，所以这一条在两种源都没起的时候也跑得动
+    assert dialect.can_sample_distinct == isinstance(dialect.factory(SPEC), SupportsSampleDistinct)

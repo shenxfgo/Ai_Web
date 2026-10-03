@@ -39,10 +39,13 @@ from app.extractor.base import (
     RawForeignKey,
     RawIndex,
     RawTable,
+    SampleTarget,
     SourceManifest,
+    SupportsSampleDistinct,
 )
 from app.extractor.mysql import MySQLExtractor
 from app.extractor.postgres import PostgresExtractor
+from app.extractor.sampling import adjudicate, is_sample_candidate
 from app.models.datasource import DataSource
 from app.models.meta import (
     MetaColumn,
@@ -127,6 +130,12 @@ _COLUMN_SYNC_COLS = (
     "is_unique",
     "is_indexed",
     "enum_values",
+    # §8 的采样写的那两格是**一个批次**（`adjudicate` 一次返回、一条 UPDATE 一起写），
+    # 所以失效也必须是一个批次：`sample_values` 之前不在同步列里，一次失败的采样轮会把
+    # `enum_values` 抹成 NULL 而让隔壁那格留着上一轮的值域——卡片少一行「取值:」而界面
+    # 下拉里还摆着那两个值，两处读同一列的说法当场分家。进来之后每轮由采样重写，
+    # 与 `enum_values` 同一条命运（工单 033 交付记录）。
+    "sample_values",
     "char_length",
     "numeric_precision",
     "numeric_scale",
@@ -211,6 +220,63 @@ def meta_column_sweep() -> Any:
     return delete(_COLUMN).where(
         _COLUMN.c.table_id.in_(bindparam("table_ids", expanding=True)),
         _COLUMN.c.synced_at < bindparam("synced_before"),
+    )
+
+
+def meta_column_sample_candidates() -> Any:
+    """§8 第一步的读料：本轮落成的那些表里，每一列"值不值得去源库数一遍"所需的三格。
+
+    判据本身不住这里（`extractor/sampling.is_sample_candidate` 是共用纯函数，两方言同一条），
+    这里只负责把它的**入参**捞齐：`data_type`（库里那一格，归一后的）、`is_generated`、
+    `enum_values`（非空即"定义已经给了值域"）。多带一列就多一点"读回来再决定要不要"的余地，
+    而那点余地通常是错的开始，所以清单收在这七个。
+
+    排序是 `(表, 列的位置, 列名)`：表序决定失败清单的先后（`errors[]` 是给排障的人读的），
+    而后缀那一档纯粹是确定性的——`ordinal_position` 在桩源与真表上都能并列，
+    没有它，同一轮跑两遍问列的顺序可以不同。
+    """
+    return (
+        select(
+            _TABLE.c.id,
+            _TABLE.c.schema_name,
+            _TABLE.c.table_name,
+            _COLUMN.c.column_name,
+            _COLUMN.c.data_type,
+            _COLUMN.c.is_generated,
+            _COLUMN.c.enum_values,
+        )
+        .join(_COLUMN, _COLUMN.c.table_id == _TABLE.c.id)
+        .where(_TABLE.c.id.in_(bindparam("table_ids", expanding=True)))
+        .order_by(_TABLE.c.id, _COLUMN.c.ordinal_position, _COLUMN.c.column_name)
+    )
+
+
+def meta_column_sample_update() -> Any:
+    """§8 第三步那一格 UPDATE：只写 `enum_values` 与 `sample_values`，别的列一个字不碰。
+
+    自然键 `(table_id, column_name)` 就是 `uq_meta_column_key`，也正是候选清单回的那两格——
+    换成代理键 `id` 要先把 id 读回来，而这一句每轮要发几十次。
+
+    绑定参数全部带前缀（`sample_` / `new_`）而不是就叫列名：SQLAlchemy 把 UPDATE / INSERT
+    上与目标列同名的绑定参数保留给编译器自己用，撞名会在**执行时**抛 CompileError
+    而不是在这里。而这一句的失败被 `except Exception` 收成了
+    `sample_failed`，不点名的话读者只会看到"源库返回了无法识别的错误"——一个我们自己
+    造的、跟源库毫无关系的错误。
+
+    `synced_at` **不**跟着刷：那一格记的是"这一列的结构最后一次被源库确认"的时刻，
+    而采样没有确认任何结构——它只是替我们多看了几行数据。语义列写进行为列之后，
+    读侧再没有一条路能分出"结构刚同步过"与"只是有人扫过它的值"。
+    """
+    return (
+        update(_COLUMN)
+        .where(
+            _COLUMN.c.table_id == bindparam("sample_table_id"),
+            _COLUMN.c.column_name == bindparam("sample_column_name"),
+        )
+        .values(
+            enum_values=bindparam("new_enum_values"),
+            sample_values=bindparam("new_sample_values"),
+        )
     )
 
 
@@ -865,6 +931,93 @@ async def _run_embed_stage(
     return failures
 
 
+async def _run_sample_stage(
+    session: AsyncSession,
+    extractor: SupportsSampleDistinct,
+    *,
+    table_ids: Sequence[int],
+    max_distinct: int,
+    row_limit: int,
+) -> list[dict[str, Any]]:
+    """§8 的逐表枚举采样：一张表一次发数、一个事务，回失败清单（工单 033）。
+
+    粒度是**表**而不是整轮一发，与 `sync_cards`（019）、`_run_embed_stage`（029）是同一条理由：
+    "这一张表的采样失败了，其余表的值域照常在场"这句话只有逐表提交表达得出来。
+    挪进 `collect()` 也表达不出来——那是每库一事务，任一查询抛错整个 catalog 回滚，
+    所以采样不许住进抽取那一段（工单 033 已定口径）。
+
+    **不发进度帧**：`sync_jobs.phase` 的词表是九个值（`core/sync_vocabulary`），§8 这一步
+    没有对应的那一格，而"为了发帧多加一个 phase 值"会同时牵动迁移的 CHECK、粗档词表与
+    进度条的段数——那一账归前端的联调片，不归这片。
+
+    三键都由调用方读过 `Settings` 再传进来（020 给 `batch_size` 立过的同一纪律）：这一层再读
+    一次就出现第二个定义点，"改了配置不生效"正是本片要闭掉的那类错。`max_distinct` 同时管
+    两件事——方言侧外层 `LIMIT` 的表达式（`ndv_query_limit`）与这里的裁决阈值，两边必须
+    同一个数，否则"扫了 40 组却按 30 判"那种错只在真库里看得见。
+
+    `adjudicate` 回 `None` 时**什么都不写**：§8 第二步对超阈值那一列说的是"放弃"，
+    而 `meta_column` 没有"只记基数"的那一格（本片不动迁移）。那一列因此留在本轮 upsert
+    之后的 NULL 上——它本来就是 NULL，抽取层只给真 ENUM 列写值域。
+    """
+    if not table_ids:
+        return []
+    rows = (
+        await session.execute(meta_column_sample_candidates(), {"table_ids": sorted(table_ids)})
+    ).all()
+
+    # §8 的第一步在这里落地：读回来的是**列**级的行，发数却是按**表**发的，两者在这里对上。
+    plans: dict[int, tuple[str, str, list[str]]] = {}
+    for (
+        table_id,
+        schema_name,
+        table_name,
+        column_name,
+        data_type,
+        is_generated,
+        enum_values,
+    ) in rows:
+        if not is_sample_candidate(
+            data_type, is_generated=bool(is_generated), has_declared_enum=bool(enum_values)
+        ):
+            continue
+        bucket = plans.setdefault(int(table_id), (str(schema_name), str(table_name), []))
+        bucket[2].append(str(column_name))
+
+    failures: list[dict[str, Any]] = []
+    for table_id, (schema_name, table_name, columns) in plans.items():
+        try:
+            samples = await extractor.sample_distinct(
+                SampleTarget(
+                    schema_name=schema_name, table_name=table_name, columns=tuple(columns)
+                ),
+                max_distinct=max_distinct,
+                row_limit=row_limit,
+            )
+            for sample in samples:
+                values = adjudicate(sample.groups, max_distinct=max_distinct)
+                if values is None:
+                    continue
+                await session.execute(
+                    meta_column_sample_update(),
+                    {
+                        "sample_table_id": table_id,
+                        "sample_column_name": sample.column_name,
+                        "new_enum_values": list(values.enum_values),
+                        "new_sample_values": list(values.sample_values),
+                    },
+                )
+            # 什么都没写也要收口：不 commit 的话这张表的读还挂在事务里，下一张表失败时的
+            # rollback 会连带把它扫掉——"一张表一个事务"当场名存实亡。
+            await session.commit()
+        except Exception as exc:  # 宽是故意的，与 per-catalog / 逐表卡片 / 逐表向量同一条理由
+            await session.rollback()
+            entry = _error_entry(exc, fallback_code="sample_failed")
+            # 表名前缀：一轮里几十张表，只说"源库断了"分不出断了谁（019/029 同族的 detail）。
+            entry["detail"] = f"{schema_name}.{table_name}: {entry['detail']}"
+            failures.append(entry)
+    return failures
+
+
 def _why(exc: BaseException) -> str:
     """把异常收成一句能进 `sync_jobs.errors[]` 的话：不带驱动原文，不截出半截 SQL。"""
     if isinstance(exc, AppError):
@@ -898,22 +1051,27 @@ def _error_entry(exc: BaseException, *, fallback_code: str = "sync_failed") -> d
 
 @dataclass(frozen=True)
 class _SourceDialect:
-    """抽取器工厂 + 它那条 B 查询里"表名"列的写法。
+    """抽取器工厂 + 它那条 B 查询里"表名"列的写法 + 它有没有 `kb-workflow` §8 那档采样。
 
-    成对放而不是两个 dict：`scope_column` 必须是**这个**抽取器自己声明的别名（MySQL 的
+    成对放而不是三个 dict：`scope_column` 必须是**这个**抽取器自己声明的别名（MySQL 的
     `information_schema.tables t` 对 `t.table_name`，PG 的 `pg_catalog.pg_class c` 对
     `c.relname`）。分成两张表的话，加一种源只改一处的概率就上来了，而"006 探测报 9 表 1 视图、
     007 同步抽出 11 张"这类分叉正是从这种地方长出来的（verification §1.2 as-built 注）。
+
+    工单 033 加第三格时沿同一条理由：编排层不许 import 具体方言模块（024 拆掉的那条边，
+    不许装回去），所以"这一家能不能采样"必须是**数据**而不是 `isinstance` 判定；
+    它与工厂产物的成对由 `test_采样能力位与工厂真产出的那个对象成对` 钉住。
     """
 
     factory: Callable[[ConnectionSpec], Extractor]
     scope_column: str
+    can_sample_distinct: bool
 
 
 _DIALECTS: Final[dict[str, _SourceDialect]] = {
     # 键取自 §2.2 的 `kind` 列，与 `source_manager` 那套驱动映射同名。
-    "mysql": _SourceDialect(MySQLExtractor, "t.table_name"),
-    "postgres": _SourceDialect(PostgresExtractor, "c.relname"),
+    "mysql": _SourceDialect(MySQLExtractor, "t.table_name", True),
+    "postgres": _SourceDialect(PostgresExtractor, "c.relname", True),
 }
 
 
@@ -1255,6 +1413,44 @@ async def run_sync(
         # 空集合会让 expanding bindparam 渲染成 `IN ()`（语法错误），而"什么都没同步到"
         # 恰恰最不该被理解成"上次同步的东西全过期了"。
         if completed_database_ids:
+            # 本轮真的落成了的表：card_build 与 §8 的采样共用这一份名单。工单 033 把它从
+            # `if decision.profile_id is not None:` 里面提到分支**之前**，因为采样不属于档案——
+            # 无 active 档案、三元组漂移不写卡的那两轮，值域照样该采（卡片没有，元数据还在）。
+            synced = await session.execute(
+                select(_TABLE.c.id).where(
+                    _TABLE.c.database_id.in_(completed_database_ids),
+                    _TABLE.c.synced_at >= synced_before,
+                )
+            )
+            synced_table_ids = [int(i) for i in synced.scalars()]
+            # `ds` 这三格必须在采样**之前**读好：`_run_sample_stage` 会逐表 rollback，而
+            # rollback 把会话里的 ORM 实例全部过期（上面 `datasource_id` 那段注释说的正是
+            # 同一件事），此后 `ds.kind` 是一次同步上下文里的懒加载 IO——在 async 会话上抬
+            # MissingGreenlet，位置还恰好落在"卡片已经建好了"的那一步里。
+            ds_kind = ds.kind
+            ds_server_version = ds.server_version or ""
+
+            # 工单 033（kb-workflow §8）：枚举 NDV 采样，默认关。
+            # 两道闸各管一件事，缺一都不是"这一轮该不该扫源库"的完整答案：
+            # - `sample_distinct` 是**用户的决定**（决策 14：扫谁的数据、什么时候扫交回用户）；
+            # - `can_sample_distinct` 是**这一家方言有没有那档能力**（`_SourceDialect` 的位，
+            #   编排层不 import 具体方言模块，所以读的是数据）。位为假时整步跳过、不报错——
+            #   "这种源库不支持采样"不是这一轮的错误，工单 033 验收 7 末条点名的就是它。
+            extract_cfg = get_settings().extract
+            if extract_cfg.sample_distinct and _dialect_for(ds_kind).can_sample_distinct:
+                # cast 的底气是 `test_采样能力位与工厂真产出的那个对象成对`：那位说"这一家的
+                # 工厂产出的对象有 `sample_distinct`"，这里就照那位调用。类型上 `Extractor`
+                # 协议没有这一格（它是可选加档，见 `base.SupportsSampleDistinct`）。
+                for entry in await _run_sample_stage(
+                    session,
+                    cast("SupportsSampleDistinct", extractor),
+                    table_ids=synced_table_ids,
+                    max_distinct=extract_cfg.sample_distinct_max_distinct,
+                    row_limit=extract_cfg.sample_row_limit,
+                ):
+                    status = "partial"
+                    errors.append(entry)
+
             # 工单 008（kb-workflow §7）：card_build 是同步作业里第二个落库 phase。
             # 放在整段抽取之后而不是每个 catalog 内部，是因为它的输入是**本轮确认完整的库的集合**
             # （`completed_database_ids`），循环里任何一个都还没拿到这份名单。
@@ -1280,23 +1476,16 @@ async def run_sync(
                 event_payload=({"skipped": True, **decision.warning} if decision.warning else None),
             )
             if decision.profile_id is not None:
-                synced = await session.execute(
-                    select(_TABLE.c.id).where(
-                        _TABLE.c.database_id.in_(completed_database_ids),
-                        _TABLE.c.synced_at >= synced_before,
-                    )
-                )
-                synced_table_ids = [int(i) for i in synced.scalars()]
                 # 只给"本轮真的落成了"的表建卡：陈旧表源库已无实体，给它刷一张新卡等于
                 # 继续向 AI 保证一张不存在的表。
                 card_result = await sync_cards(
                     session,
                     index_profile_id=decision.profile_id,
-                    datasource_id=ds.id,
+                    datasource_id=datasource_id,
                     job_id=job_id,
                     table_ids=synced_table_ids,
-                    dialect_name=ds.kind,
-                    server_version=ds.server_version or "",
+                    dialect_name=ds_kind,
+                    server_version=ds_server_version,
                     card_build_hook=card_build_hook,
                 )
                 tally.cards = card_result.cards
