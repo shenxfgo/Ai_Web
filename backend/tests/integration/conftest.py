@@ -320,6 +320,7 @@ async def active_profile(
     )
     return ActiveProfile(
         index_profile_id=profile_id,
+        name=profile_name(model, dimension=dimension, card_template_version=tplv),
         model=model,
         dimensions=dimension,
         card_template_version=tplv,

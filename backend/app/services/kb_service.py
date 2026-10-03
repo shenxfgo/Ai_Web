@@ -368,20 +368,25 @@ def _card_new(stmt: Any, names: tuple[str, ...]) -> dict[str, Any]:
     return {name: getattr(stmt.excluded, name) for name in names}
 
 
-# 这个入口只读四列：id 用来挂卡片，其余三格就是 §2.6 的三元组。`name` 不读——它是给人看的
-# 拼写，而这里的消费者要比的是那三格的值；把 name 拿来比等于间接依赖它的拼法。
-_ACTIVE_PROFILE_FIELDS: Final = ("id", "model", "dimensions", "card_template_version")
+# 这个入口读的是 id + 三元组 + 名字：id 用来挂卡片，那三格用来比对（`triplet_drift`），
+# `name` 只用来**对外说清是哪一套**（032 的 `/kb/search` 顶层 `used_profile`）。
+# 比对仍然只看那三格的值，不看 name——拿 name 相比等于间接依赖它的拼法。
+_ACTIVE_PROFILE_FIELDS: Final = ("id", "name", "model", "dimensions", "card_template_version")
 
 
 @dataclass(frozen=True, slots=True)
 class ActiveProfile:
-    """库里"当前生效的那一套"档案：一行 `kb_index_profile` 的 id 加它的三元组。
+    """库里"当前生效的那一套"档案：一行 `kb_index_profile` 的 id、名字加它的三元组。
 
     三元组住在对象上而不是摊成三个参数：比对（`triplet_drift`）和使用（卡片挂 id）读的是
     同一份，拆开传就会有人只往下传 id，把"这套档案是哪三格"留在身后。
+
+    `name` 是那一行里存的字面，不是按 settings 现拼的：032 之后这一格会出现在对外响应里，
+    而"P4 起 `used_profile` 不再是编的"这句话要的是"库里那一行叫什么就叫什么"。
     """
 
     index_profile_id: int
+    name: str
     model: str
     dimensions: int
     card_template_version: int
@@ -418,6 +423,7 @@ async def read_active_profile(session: AsyncSession) -> ActiveProfile | None:
         return None
     return ActiveProfile(
         index_profile_id=int(row["id"]),
+        name=str(row["name"]),
         model=str(row["model"]),
         dimensions=int(row["dimensions"]),
         card_template_version=int(row["card_template_version"]),

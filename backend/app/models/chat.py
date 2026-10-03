@@ -76,7 +76,12 @@ class ChatMessage(Base):
     question_text: Mapped[str | None] = mapped_column(Text)
     question_resolved: Mapped[str | None] = mapped_column(Text)
     # ★可解释性的载体：[{card_id,table_uid,score_kw,score_vec,fused}]。
-    # P2 只有 score_kw 有值，向量与融合是 P4——留 null 而不是不留，为的是能区分"没命中"和"没算"。
+    # P4 起 `score_vec`/`fused` 写的是**名次**不是分数（ADR-0014），键名不改。没算的那条腿留 null
+    # 而不是不留，但要说清这一格换来什么：`score_vec` 非空 ⇒ 向量路跑过且这张表在它的次序里；
+    # 两格皆 null ⇒ 要么整条问句走的是 `mode='keyword'`，要么向量路跑过而这张表不在它的前列里。
+    # **这两种在行内分不开**——`chat_messages` 不存 `mode`（五键由 metadata-model §2.7 定死，
+    # 加键要连 P8 的前端契约一起改，归那一页）。所以这一格是"哪条腿贡献了这张表"的证据，
+    # 不是"这一发请求用了哪套 mode"的证据。
     retrieved: Mapped[list[Any] | None] = mapped_column(JSONB)
     prompt_tokens: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0"), default=0

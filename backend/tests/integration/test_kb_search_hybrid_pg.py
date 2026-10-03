@@ -44,6 +44,7 @@ from app.models.user import User
 from app.schemas.kb import SearchMode
 from app.services import kb_service
 from app.services.embedding_client import EmbeddingClient, EmbeddingNotConfigured
+from app.services.kb_service import ActiveProfile
 from app.services.nl2sql import retriever
 from app.services.nl2sql.retriever import (
     HybridRetriever,
@@ -268,6 +269,11 @@ async def test_hybrid_两路名次折完之后关键词头名被向量路翻掉(
         (),
         (),
     )
+    # 工单 032 验收 1 的 hybrid 那一半：三列名次跟着融合结果一起出来，数值就是上面那段手算。
+    # `customer` 的 `keyword_rank` 是 `None`——关键词路跑了而它不在里头，与"这一路没跑"
+    # （`test_mode_vector_…` 那一条）靠 `mode` 分辨，两种含义在这里都不许被写成 0。
+    assert [(item.keyword_rank, item.vector_rank) for item in found] == [(2, 1), (1, 3), (None, 2)]
+    assert [item.rrf_score for item in found] == [1 / 62 + 1 / 61, 1 / 61 + 1 / 63, 1 / 62]
 
 
 async def test_mode_keyword_与_LikeRetriever_逐字段相同且不包含只有向量的表(
@@ -289,6 +295,41 @@ async def test_mode_keyword_与_LikeRetriever_逐字段相同且不包含只有�
     assert _names(seed, like) == [_PAYMENT, _ORDER]
     # `==` 打在 frozen dataclass 上 = 逐字段比（含 score_kw 与整条 hits/cards）。
     assert hybrid == like
+
+
+async def test_两条腿各自出名次_单路模式下没跑的那一路留空而不是第0名(
+    session_factory: async_sessionmaker[AsyncSession], embedding: FakeEmbedding
+) -> None:
+    """工单 032 已定口径那半（"名次从 1 起，未命中该路的用 NULL"）在**单路** `mode` 下的形状。
+
+    两档各断一件事，期望值都来自本文件上面那两张已钉住的次序表，不是从实现反推：
+    - `mode='keyword'`：`payment_record` 关键词第 1、`order_main` 第 2（`test_mode_keyword_…` 那条
+      的同一份次序）。向量路整个没跑 → `vector_rank` 与 `rrf_score` 都是 NULL，**不是** 0 也**不是**
+      融合分——融合没发生，给个数就是在响应里写一件没发生的事（故事 27 那条理由）。
+    - `mode='vector'`：`_FIRST` 那三张的距离次序（第 1/2/3 由 `_place_by_order` 摆出来）。
+      关键词腿没跑 → `keyword_rank` NULL。
+    """
+    session, seed = await _seeded(session_factory, with_vectors=True)
+    async with session:
+        keyword = await HybridRetriever(tuning=_tuning("keyword"), rrf_k=_RRF_K).search(
+            session, actor=seed.actor, question=_QUESTION, k=5
+        )
+        vector = await HybridRetriever(tuning=_tuning("vector"), rrf_k=_RRF_K).search(
+            session, actor=seed.actor, question=_QUESTION, k=5
+        )
+
+    assert [(_names(seed, [item])[0], item.keyword_rank, item.vector_rank) for item in keyword] == [
+        (_PAYMENT, 1, None),
+        (_ORDER, 2, None),
+    ]
+    assert all(item.rrf_score is None for item in keyword), "keyword 这一路没做融合，分数格必须是空"
+
+    assert [(_names(seed, [item])[0], item.keyword_rank, item.vector_rank) for item in vector] == [
+        (_ORDER, None, 1),
+        (_CUSTOMER, None, 2),
+        (_PAYMENT, None, 3),
+    ]
+    assert all(item.rrf_score is None for item in vector)
 
 
 async def test_mode_vector_在端点没配时抬一档而不是安静回落到关键词路(
@@ -342,6 +383,33 @@ async def test_k_收口发生在融合之后而不是各自砍一刀(
     assert _names(seed, found) == [_ORDER]
 
 
+async def _invisible_source_with_head_card(session: AsyncSession, seed: Seed) -> MetaTable:
+    """别人那个源里摆一张**与问句同向**的卡（余弦距离 0 = 全场最相关），把表带回来。
+
+    距离摆 0 而不是"差不多近"：越权召回时它必须出头名，这样"结果里少一张别人的表"这种断言
+    不会被"它本来就排不上"洗成假绿——漏了 `datasource_id` 那一格，次序当场就变。
+    列注释用 `备注`（问句切不出这个词），所以它只会从向量路进来，不会顺带污染关键词路的名次。
+    """
+    other = User(username="Other", password_hash=hash_password("x"), role="member")
+    session.add(other)
+    await session.flush()
+    their_src = _data_source(other.id, "their-hybrid")
+    session.add(their_src)
+    await session.flush()
+    theirs = await _table(session, their_src, "secret_ledger")
+    seed.tables["secret_ledger"] = theirs  # 让 `_names` 认得它：越权召回时要印名字
+    session.add(_column(theirs, 1, "note", comment_zh="备注"))
+    await session.flush()
+    # `_cards` 回的是**全库**的卡（它按 table_id 排序、不按入参过滤），所以按 table_id 挑。
+    built = await _cards(session, their_src, [theirs.id])
+    [their_card] = [card for card in built if card.table_id == theirs.id]
+    await session.execute(
+        kb_service.card_vector_update("embedding"),
+        {"card_id": their_card.id, "vector": await _query_vector_at(_DIMENSION)},
+    )
+    return theirs
+
+
 async def test_向量路只召回当前生效档案且只召回看得见的源(
     session_factory: async_sessionmaker[AsyncSession], embedding: FakeEmbedding
 ) -> None:
@@ -356,24 +424,7 @@ async def test_向量路只召回当前生效档案且只召回看得见的源(
     """
     session, seed = await _seeded(session_factory, with_vectors=True)
     async with session:
-        other = User(username="Other", password_hash=hash_password("x"), role="member")
-        session.add(other)
-        await session.flush()
-        their_src = _data_source(other.id, "their-hybrid")
-        session.add(their_src)
-        await session.flush()
-        theirs = await _table(session, their_src, "secret_ledger")
-        seed.tables["secret_ledger"] = theirs  # 让 `_names` 认得它：越权召回时要印名字
-        session.add(_column(theirs, 1, "note", comment_zh="备注"))
-        await session.flush()
-        # `_cards` 回的是**全库**的卡（它按 table_id 排序、不按入参过滤），所以按 table_id 挑。
-        built = await _cards(session, their_src, [theirs.id])
-        [their_card] = [card for card in built if card.table_id == theirs.id]
-        # 与问句同向 = 余弦距离 0，即"全场最相关"，越权了必然排在最前。
-        await session.execute(
-            kb_service.card_vector_update("embedding"),
-            {"card_id": their_card.id, "vector": await _query_vector_at(_DIMENSION)},
-        )
+        await _invisible_source_with_head_card(session, seed)
 
         # 老档案那一半：retired 那行从 030 的切换链上取要多摆一次 active，这里手插一行——
         # 对读侧而言档案 id 只是卡上的一个 FK 值，它是不是"上一版"与这条断言无关。
@@ -435,6 +486,73 @@ async def test_向量路只召回当前生效档案且只召回看得见的源(
     assert _names(seed, found) == [_ORDER, _CUSTOMER, _PAYMENT]
     assert "secret_ledger" not in _names(seed, found)
     assert "legacy_ledger" not in _names(seed, found)
+
+
+async def test_摘掉应用层那道门之后无权源的卡仍不在向量结果里(
+    session_factory: async_sessionmaker[AsyncSession],
+    embedding: FakeEmbedding,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """工单 032 验收 2 的摘刀反证（假绿防线 ⑤）：这条**只有在向量 SQL 那个条件写对时**才绿。
+
+    三幕跑在同一份 fixture 上——"把应用层那刀摘掉，结果必须不变"是一句比较，比较对象只能是
+    同一次的基线：
+
+    1. 基线（什么都没替）：无权源那张卡摆成与问句同向（余弦距离 0），向量路端出的仍只有我自己
+       那三张。
+    2. 摘刀：把这条链路上唯一还在应用层判权限的那一处换成"**一被调用就抬错**"
+       （`get_authorized`：预览的点名 403 门与 010/012 在 prompt 侧的逐表复核共用它；
+       检索这一头没有末端筛），**再跑一遍并断言与第 1 幕逐字相同**。不点名任何源，所以那道门
+       本来就不该被碰；"跑了且一模一样"因此是它一次都没被碰的证据，第 1 幕那句"不在结果里"
+       也就不是它挡的，更不可能是末端偷偷筛掉的。
+    3. 反证之反证：把**喂给那句 SQL 的 id 清单**换成"库里全部源"（等价于 `datasource_id`
+       那一格整段没写），同一句问句当场把那张卡端进结果。第 1、2 幕那句断言到此才真的只由
+       向量 SQL 里那个条件撑着，而不是碰巧没人越权。
+
+    为什么不点名那个无权源来做第 2 幕：`_search_scope` 会把点名的 id 与可见源求交，
+    交集为空时**根本不发 SQL**（应用层就返 `None` 了），那一幕证的就成了"交运算在挡"，
+    与验收 2 要证的正好是两件事。
+    """
+    session, seed = await _seeded(session_factory, with_vectors=True)
+    async with session:
+        await _invisible_source_with_head_card(session, seed)
+        await session.commit()
+
+        untouched = await HybridRetriever(tuning=_tuning("vector"), rrf_k=_RRF_K).search(
+            session, actor=seed.actor, question=_QUESTION, k=5
+        )
+
+        async def _gate_must_not_be_called(*args: object, **kwargs: object) -> None:
+            raise AssertionError("应用层那道权限门被调用了：无权源的卡不是被 SQL 挡的就是被它挡的")
+
+        monkeypatch.setattr(
+            retriever.datasource_service, "get_authorized", _gate_must_not_be_called
+        )
+        gate_removed = await HybridRetriever(tuning=_tuning("vector"), rrf_k=_RRF_K).search(
+            session, actor=seed.actor, question=_QUESTION, k=5
+        )
+
+        async def _scope_all_sources(
+            session: AsyncSession, *, actor: User, datasource_ids: Sequence[int]
+        ) -> tuple[ActiveProfile, tuple[int, ...]]:
+            profile = await kb_service.read_active_profile(session)
+            assert profile is not None
+            every = (await session.execute(select(DataSource.id))).scalars().all()
+            return profile, tuple(sorted(int(ds_id) for ds_id in every))
+
+        monkeypatch.setattr(retriever, "_search_scope", _scope_all_sources)
+        widened = await HybridRetriever(tuning=_tuning("vector"), rrf_k=_RRF_K).search(
+            session, actor=seed.actor, question=_QUESTION, k=5
+        )
+
+    assert _names(seed, untouched) == [_ORDER, _CUSTOMER, _PAYMENT]
+    # 第 2 幕的比较：那道门一被调用就抬错，而这一趟照样跑完、逐字同上——它没被调用过。
+    assert _names(seed, gate_removed) == _names(seed, untouched)
+    assert _names(seed, gate_removed) == [_ORDER, _CUSTOMER, _PAYMENT]
+    assert "secret_ledger" in _names(seed, widened), (
+        "把参数放宽到全部源之后它仍不在结果里——那上面两句'不在结果里'就没证人，"
+        "抓不到'权限压根没进 SQL'这种错法"
+    )
 
 
 async def test_还没有向量的卡不进向量路(

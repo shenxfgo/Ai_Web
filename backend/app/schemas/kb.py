@@ -138,6 +138,12 @@ class KbSearchItemOut(BaseModel):
 
     不带 `datasource_id` / `table_id`：与 `KbCardOut` 同一条理由，`table_uid` 就是对外标识，
     内部自增 id 出现在响应里只会诱导前端拿它拼 URL。
+
+    三格里两格是**名次**（从 1 起，工单 032 / §5.2 (8)）、`rrf_score` 是融合出来的那个倒数和，
+    三者都不是相似度。
+    名次的 `null` 有两种含义（这一路整个没跑，还是跑了而这张表不在它那一路里），靠请求那一发的
+    `mode` 分辨——所以这三格必须能被序列化成 `null`，也就**不许**给默认值：给 0 等于在响应里写
+    "第 0 名"这件没发生过的事。
     """
 
     table_uid: str
@@ -147,8 +153,39 @@ class KbSearchItemOut(BaseModel):
     matched_column_count: int
     hits: list[KbSearchHitOut]
     cards: list[KbSearchCardOut]
+    keyword_rank: int | None
+    vector_rank: int | None
+    rrf_score: float | None
+
+
+class KbSearchProfileOut(BaseModel):
+    """/kb/search 顶层的 `used_profile`：这一句问句是**被哪套基准答的**（工单 032 / spec 故事 29）。
+
+    三格而不是复用 `KbCardProfileOut` 那五格：`model` 与 `card_template_version` 已经出现在
+    `name` 那个拼法里（§2.6：`model@dimensions@card_template_version`），再各自端一次等于给前端
+    两个真相源；`provider`/`created_at`/`built_at` 这一片没有读取点
+    （spec §6 明确不建档案列表端点）。`dimensions` 同样出现在那个拼法里，**仍然单独端一格**，
+    因为 spec 故事 29 的验收要的就是这一格的数值（换维度 = 换 `name` 里那段字面，而界面要报
+    "当前 1024 维"不该去切一个给人看的串）——`name` 给人读，`dimensions` 给机器读。
+    """
+
+    id: int
+    name: str
+    dimensions: int
 
 
 class KbSearchOut(BaseModel):
     items: list[KbSearchItemOut]
     took_ms: int
+    # 库里一行 active 档案都没有时是 `null` 而不是零值摘要（029 的 202 同一条口径：
+    # 那一行不存在，就不能在响应里给它编一个身份）。
+    used_profile: KbSearchProfileOut | None
+    # §5.2 (4) 那一步的产物清单：本次端出的那几张表的 uid，顺序与 `items` 一致。
+    # 它**不含桥表**：桥表是 (6) 图扩展带回来的，从没进过召回，混进来就把两步的产物并成了一个格子
+    # （所以这一格与 `hops_used` 是两件事，一个数聚合、一个数图）。它也**不是**"聚合出但被 `k`
+    # 砍掉"的那一档——`Retriever.search()` 返回的已经是收口后的清单，预 `k` 候选集这一格协议不
+    # 暴露，工单 032 的"只填不造"因此落在这条线上（要那一格得改返回值，牵动 009/031 已交付的
+    # 二十处调用面，归收口片或后续片）。
+    aggregated_tables: list[str]
+    # 图扩展这一步用掉的跳数，口径跟 014：**数桥表张数**不数边数。单表问句是 0。
+    hops_used: int

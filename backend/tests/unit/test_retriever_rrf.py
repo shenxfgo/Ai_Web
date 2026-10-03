@@ -216,6 +216,21 @@ def _vec_table(uid: str, table_id: int) -> RetrievedTable:
     )
 
 
+def _reason_shape(item: RetrievedTable) -> tuple[float, int, int, tuple, tuple]:
+    """ "这张表带着哪条腿的形状出门"的指纹：理由、卡片与那两个计数格（032 之前用的是 `is`）。
+
+    032 把名次挂到出门的对象上之后 `replace` 造的是新对象，身份断言不再可用；被钉的还是同一件事
+    ——两路都命中时不许把关键词路那份理由换成向量路那个空壳（`_vector_table` 的口径）。
+    """
+    return (
+        item.score_kw,
+        item.matched_term_count,
+        item.matched_column_count,
+        item.hits,
+        item.cards,
+    )
+
+
 def test_融合后两路都命中的表带的是关键词路那份形状() -> None:
     """`fuse_rankings` 的装配规则：名次来自融合、表对象来自各自的腿（`hits`/`cards` 不丢）。"""
     keyword = [_kw_table(_ORDER, 10), _kw_table(_PAYMENT, 20)]
@@ -227,16 +242,11 @@ def test_融合后两路都命中的表带的是关键词路那份形状() -> No
     # customer 只在向量第 1 → 1/61。payment 最高；剩下两张严格并列，按 uid 升序收口
     # （`customer` < `order_main`），这条同时也是 §5.1 那条稳定排序在装配层的落点。
     assert [item.table_uid for item in fused] == [_PAYMENT, _CUSTOMER, _ORDER]
-    # 两路都命中的那张出门的是**关键词路那个对象**（不是字段相等的新对象）：理由与卡片还在。
-    assert fused[0] is keyword[1]
+    # 两路都命中的那张带出来的是**关键词路那份形状**（理由与卡片还在，不是向量路的空壳）。
+    assert _reason_shape(fused[0]) == _reason_shape(keyword[1])
     # 只在向量路的那张：形状就是向量路给的那份，没有硬凑的理由。
-    assert fused[1] is vector[0]
-    assert (fused[1].score_kw, fused[1].matched_term_count, fused[1].hits, fused[1].cards) == (
-        0.0,
-        0,
-        (),
-        (),
-    )
+    assert _reason_shape(fused[1]) == _reason_shape(vector[0])
+    assert _reason_shape(fused[1]) == (0.0, 0, 0, (), ())
 
 
 def test_一条腿为空时融合次序就是另一条自己照抄() -> None:
@@ -244,9 +254,43 @@ def test_一条腿为空时融合次序就是另一条自己照抄() -> None:
     keyword = [_kw_table(_ORDER, 10), _kw_table(_PAYMENT, 20)]
     vector = [_vec_table(_ORDER, 10), _vec_table(_PAYMENT, 20)]
 
-    assert fuse_rankings(keyword, (), rrf_k=60) == keyword
-    assert fuse_rankings((), vector, rrf_k=60) == vector
+    only_kw = fuse_rankings(keyword, (), rrf_k=60)
+    only_vec = fuse_rankings((), vector, rrf_k=60)
+    assert [item.table_uid for item in only_kw] == [item.table_uid for item in keyword]
+    assert [item.table_uid for item in only_vec] == [item.table_uid for item in vector]
+    # 形状不许被"过一遍融合"改掉：单腿时出门的还是那一条腿给的理由。
+    assert [_reason_shape(item) for item in only_kw] == [_reason_shape(item) for item in keyword]
+    assert [_reason_shape(item) for item in only_vec] == [_reason_shape(item) for item in vector]
+    # 名次照抄该路自己的次序（手算：1..n），另一路是整个没跑过的那一格才留 NULL。
+    assert [(item.keyword_rank, item.vector_rank) for item in only_kw] == [(1, None), (2, None)]
+    assert [(item.keyword_rank, item.vector_rank) for item in only_vec] == [(None, 1), (None, 2)]
     assert fuse_rankings((), (), rrf_k=60) == []
+
+
+def test_融合之后的表对象自己带着两路名次与融合分() -> None:
+    """工单 032 验收 1 的纯函数半边：名次跟着**表对象**出门，不再只住在 `FusedTable` 里。
+    融合名次也在这一层盖（`fused_rank`），不由清单的消费者现数——`pipeline` 那一头的 `fused`
+    因此只是一个平铺映射，"名额只砍尾巴"这个调用方的性质不再被反推成一次排序。
+
+    期望值就是上面那条手算表的另一面（`order_main` 只在关键词第 1、`payment_record` 两路都第 2、
+    `customer` 只在向量第 1），不由实现回算。`None` 在这一格的意思是"**这一路跑过但没命中它**"
+    ——与"`None` = 这一路整个没跑"（`mode='keyword'` 的向量名次）那种情形分开，靠的是请求里那个
+    `mode`，见 `search_preview` 那三列的文档串。
+    """
+    keyword = [_kw_table(_ORDER, 10), _kw_table(_PAYMENT, 20)]
+    vector = [_vec_table(_CUSTOMER, 30), _vec_table(_PAYMENT, 20)]
+
+    fused = fuse_rankings(keyword, vector, rrf_k=60)
+
+    assert [(r.table_uid, r.keyword_rank, r.vector_rank, r.fused_rank) for r in fused] == [
+        (_PAYMENT, 2, 2, 1),
+        (_CUSTOMER, None, 1, 2),
+        (_ORDER, 1, None, 3),
+    ]
+    scores = {r.table_uid: r.rrf_score for r in fused}
+    assert scores[_PAYMENT] == 1 / 62 + 1 / 62
+    assert scores[_CUSTOMER] == 1 / 61
+    assert scores[_ORDER] == 1 / 61
 
 
 def test_裁决_请求给了用请求的_没给用配置() -> None:

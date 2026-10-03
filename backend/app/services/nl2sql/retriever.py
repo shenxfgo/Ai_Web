@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final, Protocol, cast
 
 from pgvector.sqlalchemy import Vector
@@ -49,12 +49,14 @@ from app.schemas.kb import (
     KbSearchHitOut,
     KbSearchItemOut,
     KbSearchOut,
+    KbSearchProfileOut,
     KbSearchRequest,
     SearchMode,
 )
 from app.services import datasource_service
 from app.services.embedding_client import EmbeddingClient
 from app.services.kb_service import ActiveProfile, read_active_profile, vector_target_for
+from app.services.nl2sql import join_graph
 from app.services.nl2sql.prompt_builder import SchemaTable
 from app.settings import RetrievalGroup, get_settings
 
@@ -139,6 +141,11 @@ class RetrievedTable:
     """候选表。
 
     010 拼 prompt 与 012 的 `retrieval` 帧（落 `chat_messages.retrieved`）读的都是这一份。
+
+    那三格（工单 032，§5.2 (8)：两路名次 + 融合分）住在这里而不是只住在 `FusedTable` 里，
+    是因为出门的只有这一份：
+    `/kb/search` 的响应与 `retrieved` 帧都从它读，名次若留在融合层，端点就得自己再数一遍次序——
+    而"第几名"是两路各自算出来的事实，不是末端能反推的东西。
     """
 
     table_uid: str
@@ -150,6 +157,16 @@ class RetrievedTable:
     matched_column_count: int
     hits: tuple[ColumnHit, ...]
     cards: tuple[CardMatch, ...]
+    # 两路各自的名次（1 起）与融合分。`None` 有两种含义，靠请求给的 `mode` 分辨：这一路整个没跑
+    # （`mode='keyword'` 时的 `vector_rank`），还是跑了而这张表不在它那一路里（hybrid 时只在一条腿
+    # 露面的那张）。012 那句"留 null 才能把'没命中'和'没算'分开"的口径继续成立。
+    keyword_rank: int | None = None
+    vector_rank: int | None = None
+    rrf_score: float | None = None
+    # 融合名次，由 `fuse_rankings` 亲自盖（不由末端消费者现数——本类上面那句"名次不是末端能
+    # 反推的东西"对第三格同样成立）。`None` 就是"RRF 这一路没跑"，`mode='keyword'` 与
+    # `mode='vector'` 两条单腿都拿 `None`，所以它同时是"融合发生过没有"的那把尺。
+    fused_rank: int | None = None
 
 
 # §5.2 (4)：同一张表的多张卡不各自占名额，改成给主卡加一点 boost。
@@ -244,7 +261,10 @@ def rank_candidates(
             )
         )
     candidates.sort(key=lambda r: (-r.matched_term_count, -r.matched_column_count, r.table_uid))
-    return candidates[:k]
+    # 名次由**这一路自己**报（工单 032）：`mode='keyword'` 那一路不走融合，`keyword_rank`
+    # 是响应里唯一非空的那列名次，它只能来自计数键排序后的位次。截断在调用方（`_final_limit`），
+    # 只会砍掉尾巴，所以这里给的位次在砍完之后仍然是 1..n 连续。
+    return [replace(item, keyword_rank=index + 1) for index, item in enumerate(candidates[:k])]
 
 
 # ============================================================ 融合与裁决（纯函数）
@@ -325,7 +345,23 @@ def fuse_rankings(
     # 关键词路排在后，覆盖同 uid 的向量路那份：同一张表有两种形状时，出门的是带命中理由的那一份。
     for item in (*vector, *keyword):
         by_uid[item.table_uid] = item
-    return [by_uid[item.table_uid] for item in fused]
+    # 名次挂在**出门的那一份**上。`replace` 造的是新对象，所以" fused[i] is 那条腿的那个对象"
+    # 这种身份断言从今天起不成立——031 的两条用例改成字段等值，被钉的还是同一件事
+    # （理由与卡片来自哪条腿），只是不能再靠对象地址说话。
+    # `fused_rank` 在这里数、不在消费者那里数：下面调用方那一句 `[: _final_limit(k)]` 只砍尾巴，
+    # 所以先数完再砍，砍完之后 1..n 仍然连续；反过来（消费者自己 `enumerate`）就等于把
+    # "名额只砍尾巴"这个调用方的性质当成免费事实钉在融合名次上，哪天加一档"按分数重排再截"
+    # 就悄悄错位了。
+    return [
+        replace(
+            by_uid[item.table_uid],
+            keyword_rank=item.keyword_rank,
+            vector_rank=item.vector_rank,
+            rrf_score=item.rrf_score,
+            fused_rank=index + 1,
+        )
+        for index, item in enumerate(fused)
+    ]
 
 
 @dataclass(frozen=True)
@@ -730,7 +766,12 @@ async def _vector_ranking(
     grouped: dict[int, list[RowMapping]] = {}
     for row in rows:
         grouped.setdefault(int(row["table_id"]), []).append(row)
-    return [_vector_table(items) for items in grouped.values()]
+    # 位次在这里就折成名次（工单 032）：`mode='vector'` 那一路同样不走融合，而 `dict` 的迭代序
+    # 就是插入序 = 距离升序下这张表第一次出现的行序，与 `rrf_fuse` 那边 `_rank_map` 数的是同一件事。
+    return [
+        replace(_vector_table(items), vector_rank=index + 1)
+        for index, items in enumerate(grouped.values())
+    ]
 
 
 # ============================================================ 接缝
@@ -902,6 +943,13 @@ def _item_out(r: RetrievedTable) -> KbSearchItemOut:
             )
             for c in r.cards
         ],
+        # 名次与融合分**不在这里 round**：上面那两处 `round(…, 4)` 管的是分数（展示用，量纲是
+        # 相似度），而这三格是次序（工单 032 已定口径"名次是名次不是相似度"）。RRF 的头两名常常
+        # 只差 1e-5 量级（`test_retriever_rrf.py` 里 t_a 与 t_b 就是），抹到四位小数并列，
+        # 界面拿到的次序就和融合层算出来的不是同一个。
+        keyword_rank=r.keyword_rank,
+        vector_rank=r.vector_rank,
+        rrf_score=r.rrf_score,
     )
 
 
@@ -913,6 +961,13 @@ async def search_preview(
     `datasource_ids` 里点名了一个看不见的源 → 403（`get_authorized` 那一把尺），不是安静少一张：
     预览端点的全部用途就是让人判断"为什么没命中"，把越权请求降级成空结果会把这个诊断废掉。
     真检索路径（012 的 `/chat/ask`）不走这里，那边按 §5.2 (5) 静默过滤。
+
+    `used_profile` 这一格是**端点侧的第二次读**（检索器在 `_search_scope` 里为同一句问句读过一次）。
+    它报的是"组装响应这一刻库里 active 那一行叫什么"，**不是**"答这一句用的是哪一行"——请求会话
+    没有设隔离级别，PG 默认 READ COMMITTED 下每条语句一个新快照，一次 `activate` 落在 `search()`
+    与这次读之间时两处就不是同一行（并发 activate 归 P6 的档案面）。要报后者得让 `RetrievedTable`
+    带上档案 id（协议签名不用动，它已经带名次了），那是 P8 的事，这一格先把"有没有生效档案"
+    端给界面。`pipeline` 不经过这里，`retrieved` 帧里也没有档案身份。
     """
     for ds_id in payload.datasource_ids:
         await datasource_service.get_authorized(session, actor, ds_id)
@@ -925,9 +980,33 @@ async def search_preview(
         datasource_ids=payload.datasource_ids,
         k=payload.k,
     )
+    profile = await read_active_profile(session)
+    # `hops_used` 与 `aggregated_tables` 两格**只填不造**（spec 故事 30）：原料分别是 014 的
+    # `expansion_for` 与 009 已经交付的"聚合到表"那一步，本片不重做图、不重做聚合。
+    # 尺与 pipeline 那一次调用是同一个：同一个函数、同一对配置键（`join_hops` /
+    # `max_join_degree`），数的是桥表张数而不是边数——两端各自实现一遍才有"预览说连得上、真跑说
+    # 连不上"。**候选集合那一头两处不同**，写清楚：pipeline 在喂图前把跨源候选收窄到第一名那个源
+    # （`pipeline.py` 的 `same_source`，因为一条连接串连不了两个库），预览没有这条规矩（它不拒答
+    # 跨源，那是 P8 的问句面），于是跨源候选时这里报的是各源内部桥表数之和，而真链路只报主源那份。
+    # 候选同源的问句下两者逐字相等——演示库与闸内用例都在这一档。读第二趟图不心疼：图按
+    # `(源, 库)` 分键缓存在模块级，而且预览与 `/chat/ask` 不在同一条链路上（那条走 pipeline）。
+    cfg = get_settings().retrieval
+    uids = [r.table_uid for r in found]
+    expansion = await join_graph.expansion_for(
+        session, table_uids=uids, hops=cfg.join_hops, max_degree=cfg.max_join_degree
+    )
     return KbSearchOut(
         items=[_item_out(r) for r in found],
         took_ms=round((time.perf_counter() - started) * 1000),
+        aggregated_tables=uids,
+        hops_used=len(expansion.bridge_uids),
+        used_profile=(
+            None
+            if profile is None
+            else KbSearchProfileOut(
+                id=profile.index_profile_id, name=profile.name, dimensions=profile.dimensions
+            )
+        ),
     )
 
 

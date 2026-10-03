@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import itertools
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -316,6 +317,140 @@ async def test_一次完整问数把九步串起来并留痕(
         assert stored.retrieved[0]["score_vec"] is None
         assert stored.result_stats is not None and stored.result_stats["row_count"] == 3
         assert stored.executed is True and stored.error_code is None
+
+
+# ---------------- `chat_messages.retrieved` 那两格从"恒 null"变成"写名次"（工单 032 验收 6）
+#
+# §2.7 的五键（`card_id`/`table_uid`/`score_kw`/`score_vec`/`fused`）**键名一个不改**：改名会同时
+# 牵动 metadata-model 的列定义和还没写的 P8 前端契约。三条用例各钉一条分支，桩的形状就是
+# 031 那两条腿真实出门的形状（名次从 1 起、`rrf_score` 由 `1/(60+rank)` 手算，不由实现回算）：
+# hybrid（两格都有值）、keyword（两格都 null）、vector（只有 `score_vec` 有值）。
+# 三条缺一条就放得过一个错法：少了 vector，`fused` 写成"跟着向量名次走"照样全绿。
+
+
+@respx.mock
+async def test_融合发生过时retrieved那两格写的是名次(
+    session_factory, spies: Spies, results_dir: Path
+) -> None:
+    """hybrid 那条腿出门的形状：`score_vec` 是**向量路**的名次，`fused` 是**融合后**的名次。
+
+    两格故意取自不同的数（第一名那张在向量路里是第 3 名）——这正是融合存在的意义：关键词路把它
+    排在前头，向量路说它靠后。如果 `score_vec` 被写成"清单位次"，两格会永远相等，这条用例当场红。
+
+    桩里那两个 `rrf_score` 是手算的：`rrf_k=60` 下第 1 名 + 第 3 名 = `1/61 + 1/63 ≈ 0.032266`，
+    第 4 名 + 第 1 名 = `1/64 + 1/61 ≈ 0.032018`，前者大，所以清单次序与融合名次对得上。
+    `fused_rank` 与那两格一样由 `fuse_rankings` 盖上（消费者不现数），所以桩要自己带它。
+    """
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        _draft_route(sql=DRAFT_SQL)
+        first = replace(
+            _found(ds.id, ds.id * 10 + 1),
+            keyword_rank=1,
+            vector_rank=3,
+            rrf_score=1 / 61 + 1 / 63,
+            fused_rank=1,
+        )
+        second = replace(
+            _found(ds.id, ds.id * 10 + 2, table_uid="o" * 32),
+            keyword_rank=4,
+            vector_rank=1,
+            rrf_score=1 / 64 + 1 / 61,
+            fused_rank=2,
+        )
+
+        outcome = await pipeline.ask(
+            session,
+            actor=user,
+            question="2024 年每个月的订单总金额是多少",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever([first, second]),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+        stored = await session.get(ChatMessage, outcome.message_id)
+        assert stored is not None
+        rows = stored.retrieved
+        assert rows is not None
+        # 键集合断得一个不多：多一个键就是多一个前端契约，而 §2.7 那一行没有它。
+        assert {key for row in rows for key in row} == {
+            "card_id",
+            "table_uid",
+            "score_kw",
+            "score_vec",
+            "fused",
+        }
+        assert [row["score_vec"] for row in rows] == [3, 1]
+        assert [row["fused"] for row in rows] == [1, 2]
+        # `score_kw` 还是那个展示值（工单口径：它只做展示，不参与排序，也不被名次顶掉）。
+        assert [row["score_kw"] for row in rows] == [3.5, 3.5]
+
+
+@respx.mock
+async def test_降级到关键词腿时那两格回到NULL(
+    session_factory, spies: Spies, results_dir: Path
+) -> None:
+    """012 那句"留 null 才能把'没命中'和'没算'分开"从 P4 起是**分岔依据**，不是留列的理由。
+
+    `mode='keyword'`（向量端点没配，或显式降级）走的是 `LikeRetriever` 那条腿，融合压根没发生过，
+    所以 `fused` 是 NULL 而不是"它在清单里的位次"——单路的清单次序是关键词次序，把它写进"融合名次"
+    这一格等于替 RRF 编一次它没参加的排序。桩的形状就是 `_keyword_ranking` 出门的形状：
+    只有 `keyword_rank` 非空，`vector_rank`/`rrf_score`/`fused_rank` 都是 None（融合层没跑过，
+    它就不会盖那一个名次）。
+    """
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        _draft_route(sql=DRAFT_SQL)
+        only_keyword = replace(_found(ds.id, ds.id * 10 + 1), keyword_rank=1)
+
+        outcome = await pipeline.ask(
+            session,
+            actor=user,
+            question="2024 年每个月的订单总金额是多少",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever([only_keyword]),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+        stored = await session.get(ChatMessage, outcome.message_id)
+        assert stored is not None
+        assert stored.retrieved[0]["score_vec"] is None
+        assert stored.retrieved[0]["fused"] is None
+        assert stored.retrieved[0]["score_kw"] == 3.5
+
+
+@respx.mock
+async def test_只走向量腿时向量有名次而融合那一格仍是NULL(
+    session_factory, spies: Spies, results_dir: Path
+) -> None:
+    """`mode='vector'` 的留痕形状：一条腿的结果不叫融合。
+
+    这一格是上面两条钉不住的那个错法——`fused` 若写成"`vector_rank` 非空就给位次"，hybrid 与
+    keyword 两路恰好都对（前者两格都有值、后者两格都空），只有这一路会红：向量路有名次、
+    没有融合。尺在 `fuse_rankings` 那一层：它跑过才盖名次，单腿那两条一路它根本没被调用。
+
+    向量路的卡没有命中理由（031 的口径：端点只回一串浮点数），所以 `cards` 是空的，
+    `card_id` 跟着是 NULL——不替端点编一张它没说过的卡。
+    """
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        _draft_route(sql=DRAFT_SQL)
+        only_vector = replace(_found(ds.id, ds.id * 10 + 1), vector_rank=1, score_kw=0.0, cards=())
+
+        outcome = await pipeline.ask(
+            session,
+            actor=user,
+            question="2024 年每个月的订单总金额是多少",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever([only_vector]),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+        stored = await session.get(ChatMessage, outcome.message_id)
+        assert stored is not None
+        assert stored.retrieved[0]["score_vec"] == 1
+        assert stored.retrieved[0]["fused"] is None
+        assert stored.retrieved[0]["card_id"] is None
 
 
 @respx.mock

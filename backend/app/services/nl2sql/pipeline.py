@@ -212,13 +212,17 @@ async def ask(
         watch.lap("retrieve")
         out.retrieved = [
             {
-                # §2.7 的五键：score_vec/fused 恒 null（向量与 RRF 是 P4），留 null 才能把
-                # "没命中"和"没算"分开。
+                # §2.7 的五键，键名一字不改（改名会牵动列定义与还没写的 P8 前端契约）。
                 "card_id": r.cards[0].card_id if r.cards else None,
                 "table_uid": r.table_uid,
                 "score_kw": round(r.score_kw, 4),
-                "score_vec": None,
-                "fused": None,
+                # P4 起这两格写的是**名次**不是分数（决策 ⑧ / ADR-0014：RRF 吃名次不吃分数，
+                # 两路量纲不一致，分数相加等于让量纲大的那一路说话）。两格都由算它们的那一层
+                # 亲自盖好（`_vector_ranking` 点名次、`fuse_rankings` 点融合名次），这里只搬运：
+                # `fused` 尤其不能在这里 `enumerate` 现数——单腿清单里那个位次是那条腿自己的次序，
+                # 把它写进"融合名次"等于替 RRF 编一次它没参加的排序，所以融合没跑过就是 `None`。
+                "score_vec": r.vector_rank,
+                "fused": r.fused_rank,
             }
             for r in found
         ]

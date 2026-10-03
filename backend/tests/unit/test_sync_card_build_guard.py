@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 
-from app.services.kb_service import ActiveProfile
+from app.services.kb_service import ActiveProfile, profile_name
 from app.services.sync_service import card_build_guard
 
 REINDEX = "POST /api/kb/reindex"
@@ -59,6 +59,9 @@ def _active(
 ) -> ActiveProfile:
     return ActiveProfile(
         index_profile_id=7,
+        # `name` 由 §2.6 的拼法现拌：这个函数不读它（守卫比的是那三格的值），但档案行本来就有
+        # 这一列，摆个 `"x"` 进去等于让夹具的形状与库里的形状不同形。
+        name=profile_name(model, dimension=dimensions, card_template_version=tplv),
         model=model,
         dimensions=dimensions,
         card_template_version=tplv,
