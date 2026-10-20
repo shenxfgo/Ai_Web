@@ -301,6 +301,8 @@ uvicorn 的 `--loop asyncio` 会自动设 `WindowsSelectorEventLoopPolicy`，但
 >   > **同时 `sample_distinct` 的默认值按本节分组 7 那句"扫源库数据，默认关"落回 `false`**
 >   > （`settings.py` 与 `.env.example` 两处今天一起改，见 §配置语义那行 —— 它一直是 `false`，
 >   > 是代码那侧错了，这次是代码向文档对齐）。认下的后果写在 metadata-model §6 那条改判里。
+>   > **闭账(P4-033 已交付，P4 收口 034 复核)**：这一条到此结清，三枚键的读取点、两格值域的写入点
+>   > 与各自的用例/手测实物，逐条写在上面 §P4 收口那节的"本片顺带闭掉的四条旧账"第 1、2 条。
 > - **测试地基**：P2 的三张 sync 用例（`test_sync_live.py` / `test_sync_pg.py` / `test_sync_cache_pg.py`）
 >   现在都在请求内等 `run_sync` 返回，必须改成"POST 拿 job_id → await worker 的循环体 → 照旧断言"；
 >   用例**不真起子进程**，SSE 与进程边界另有真进费用例钉。
@@ -400,6 +402,19 @@ as-built(P2-0014)：**这张图提前到 P2 由工单 014 交付了**（010 只�
 ① `networkx` **照本句原文引入**（`MultiDiGraph` 建图 + 跨请求缓存，BFS 仍自己实现以便单测），
 ② `hops` 数的是**桥表张数**而不是边数，跳数定上限、边权重只在上限内定胜负；
 图**存方向、按无向扩展**（真实 FK 恒为子→父，按有向可达则演示库除"子→父"一跳外一律不可达）。
+as-built(P4 交付，工单 030/032)：本节上面 `:392~393` 那两行方案概述与下面验收 5 那一行，共**三处**字面被实物改了，都写在**本节**而不是只留在 ADR：
+① 「active 切换用一条 `UPDATE ... WHERE id=:new` 的原子语句」**不成立**——那条单语句 `CASE` 在真库上
+会把两行同时判成 `active`（partial unique 当场拒），所以 030 发的是**同一事务里固定顺序的两条**
+（先把当前 active 降 `retired`，再把 draft 升 `active`），原子性由事务而不是由一条语句给。
+见 ADR-0013 的 as-built 与 metadata-model §2.6；
+② 「全局 top-80 → **权限过滤**」的箭头顺序**倒过来才是实物**——可见源集合是喂进那条向量 SQL 的参数本身
+（`datasource_id = ANY(:visible)`），不是取回 80 张之后再在应用层切一刀。这条与本节踩坑 ④ 原来自相矛盾，
+现在统一到 ④ 那侧；"应用层还有一道二次保险"这句话在链路上**没有对应实体**（唯一的门是 `get_authorized`，
+它长在预览端点的点名 403、`load_schema_tables` 的逐表检查与 pipeline 取源那三处，都不在召回路上）。
+见 architecture §5.2 的 as-built(P4-032) 与下面收口表**第 2 行**那条摘刀用例的三幕形状；
+③ 「`vector(1024)` 的**影子列/影子表**」这两个词并列，实物只有**影子列**——同一张 `kb_card` 的第二根
+向量列 `embedding_1024` 带自己的 HNSW（spec 决策 ③ 的口径，026 落迁移、029 落写入点），"维度→列名"
+那个映射全仓唯一住在 `app/core/vector_columns.py`，未预置的第三维**显式报错**、不猜也不静默回落。
 
 验收：
 1. `POST /api/kb/reindex` 建 draft → 进度 SSE → `activate` 后 `kb_index_profile` 只有一个 active；
@@ -418,6 +433,253 @@ as-built(P2-0014)：**这张图提前到 P2 由工单 014 交付了**（010 只�
 ③ trgm 对中文短串分数极低，阈值要降到 0.1 以下或改走 `ILIKE` 精确路——别指望 trgm 做中文语义；
 ④ 权限过滤放在向量 top-80 之后会出现"过滤后为空"：需要在向量 SQL 里就 `JOIN grant` 过滤，
 应用层过滤只作二次保险。
+
+#### P4 验收收口（as-built(P4 交付)，工单 034）
+
+上面六条逐条从"拍板过的话"变成"跑出来的证据"，写法照 P3 收口那一张（每条给**独立真相源**——
+一个数、一份逐行比对、一段实跑输出——"用例绿了"不算）。本轮整轮闸**两跑**：收口前那一次
+**1230 passed / 2 skipped**（基线 980/2 起，只加不减；两个 skip 没变多，逐字回显在 verification §1.10）；
+写这段时按工单口径又重跑了一次，回显是 **1 failed / 1229 passed / 2 skipped**——红的那一条是
+`tests/integration/test_extract_pg_live.py` 里那道"演示库还没 `ANALYZE` 就不许断言行数"的守卫，
+**环境漂移不是代码**（PG 于 2026-10-19 09:00 重启过、累计统计没恢复，九张表至今没有 `last_analyze_at`），
+出路是源库属主补一发 `ANALYZE;`，两轮回显与探针输出都在 §1.10，不在这里摘要；命令与两处实物订正已按
+runbook 逐字落在那一节（账 12）。**034 落提交前又单点重跑了那一条守卫，仍红、同文件其余照旧绿**，
+所以本片的两个提交是带着这一格已知红落的——它不是回归，理由就是上面那两句。
+运行形态：真 API + 真 worker 子进程 + 真元数据库 + 028 的闸内替身，密钥无一进对话。
+
+| 验收 | 结论 | 独立真相源（用例文件 + 真跑输出） |
+|---|---|---|
+| 1 reindex 建 draft → 进度 SSE → `activate` 后只有一个 active | 交付（029/030） | 键：`tests/integration/test_kb_reindex_pg.py`（9 条）的 `test_reindex_回_202_两个键齐_库里多出一行_draft_且_active_整行不动`、`tests/integration/test_kb_profile_status_pg.py::test_第二行_active_被库拒_一条也不许靠代码拦`（"至多一个 active"由库里那条 partial unique 答，不由代码分支答）、`test_kb_activate_pg.py`（16 条，逐条断的是**库里的 active 计数**）+ `test_kb_activate_endpoint_pg.py`（8 条，真 HTTP 真鉴权）。实录：verification §1.8.1 ①②③——job 26 那 14 帧逐字（`embed` 段 `embedded` 1→…→**12**、终局帧带 `payload.profile_id: 2`）、跑完那三行快照（新 draft `(2, 'text-embedding-3-small@1536@tplv1', …, 'draft', …)` 而 active 那行逐格与开工探针相同）、`active` 行数在**五个快照里都是** `(1,)` |
+| 2 `/kb/search` 的诊断结构五格 + "销售额"命中两表 | **结构那一半交付**（031/032）；**语义那一半只有用例、没有真跑**（正文留空，见下面映射表末注） | 键：`tests/integration/test_kb_search_api_pg.py`（18 条）的 `test_真链路单路模式下三列名次齐_没跑的那一路是null而不是0`、`test_契约把三列名次原样端出_rrf_score不许被四舍五入`、`test_used_profile随激活的档案变_激活1024报1024回滚之后报回1536`、`test_hops_used在需要桥表的问句上是1_单表问句上是0`、`test_aggregated_tables是聚合到表的那一步_桥表不在里面`；权限那一格的正身是 `test_kb_search_hybrid_pg.py::test_摘掉应用层那道门之后无权源的卡仍不在向量结果里`（**三幕**：基线 → 把链路上唯一那道应用层门换成"一被调用就抬错" → 把喂给 SQL 的源清单放宽到全部源，第三幕让越权卡当场出头名，前两幕的"结果不变"才不是"根本没人在筛"）。实录：§1.8 手测表第 7 行与 §1.8.1 ⑤——`订单` 在激活替身基准后 200、5 项、每项三列名次齐（头一名 `order_main`，`keyword_rank 1`/`vector_rank 4`/`rrf_score 0.032018442622950824`、`took_ms 346`，逐字在 `out_search_after_activate.txt:44~46,173`；下面 ④ 那两发 `ef_search` 64/400 的名次与分数与这一发**逐字相同**，只有 `took_ms` 分别是 `308`/`318`——三发是同一条问句的三次往返，别把某一发的耗时记到另一发头上）；`销售额` 三种 `mode` 各发一次 `items` **三次全空**，而**这不是验收 2 的反证**（替身回的是字 n-gram 哈希，"近邻=语义相近"对它不成立；关键词那一路是 `ILIKE`+trgm，`销售额` 三个字在演示库卡片文本里一个字都没有，空是**正确行为**）。语义那一格的地基是用户自配的 `AIWEB_EMBEDDING__*` 三键，到位之前不许写成"跑过" |
+| 3 `ef_search` 64 → 400 召回集合是超集 | 交付（031），但**"400 真的多召回"那一半在真语料规模上没跑** | 键：`tests/integration/test_kb_search_hybrid_pg.py::test_ef_search_从_64_调到_400_时召回的名次集合真的变大`——用例前提摆了两格，各对应真库上量出来的一种"参数下发了也没用"：`SET LOCAL enable_sort = off`（小表上优化器本会选"扫全表 + 精确算距离 + 排序"，那条路上 `ef` 根本不参与）与把 `iterative_scan` 临时换成 `off`（生产值 `relaxed_order` 的语义就是"第一批不够接着扫"，它**故意**让结果集对 `ef` 不敏感）。期望值来自构造的 200 卡弧表（距离 `0.004k` 严格递增），不从实现反推。另两根钉：`test_ef_search_下发到的就是请求给的那个值且只活到本事务结束`（四次 `SHOW` 夹一次 `search()`、全在同一条连接，钉住踩坑 ② 那条 `SET LOCAL` 惰性 BEGIN 空转）与 `test_top_vector_收到_1_时向量路只带一张表上来`。实录：§1.8 第 8 行——24 张卡的真库上两档**都回** `[1,2,3,4,5]`（相等即 ⊆ 成立，但给不了"真的多召回"，本机规模就是不到），换 `top_vector=3` 那一发回 `[1,2,3]` 证的是"召回宽度这个旋钮真下发" |
+| 4 无 DSN 时纯内存单测仍跑、有 DSN 时集成测试额外跑 | 交付（031 起，032/033 加的那些条同形） | **独立真相源是两份计数**：`env -u AIWEB_PG_TEST_DSN -u AIWEB_REQUIRE_PG_TESTS .venv/Scripts/python.exe -m pytest tests/unit -q` → **750 collected / 750 passed / 0 skipped**（`--junitxml` 计数，6.247s；逐行点阵里没有一个 `s` 字符，落盘 `out_unit_no_dsn.txt`）。有 DSN 那一支就是上面那整轮闸（1230/2，§1.10），其中 `-m "pg or live"` 那一路在本机全部真跑。**没有**为"没 DSN"加 skip 分支——`tests/unit` 在缺 DSN 时照跑，才是这条要的形状 |
+| 5 换 `bge-large-zh`(1024) 重建：新列影子、激活后旧向量仍在可回滚 | 交付（026/029/030），**与 roadmap 字面有一处偏离：影子**列**不是影子**表**（同表第二根列 + 各自的 HNSW，见上面要点段那条 as-built） | 键：`tests/unit/test_vector_columns.py`（9 条——"维度→列名"全仓唯一那个纯函数，未预置的第三维**显式报错**、不猜也不静默回落，且列名字面在源码里只出现在映射与列定义本身）+ `tests/integration/test_kb_reindex_live.py::test_reindex到另一维时新列真写旧列一字不动且检索结果相同`（比的是那一列的**文本形态逐行相等**，不是"行数没变"；同时比 `/kb/search` 的 `items` 前后全等）+ `test_kb_search_hybrid_pg.py::test_激活换到另一维之后向量路读的就是那一维的那一列`（两列的次序**反着摆**，读错列必红）。实录：§1.8.1 ④——档案 3 在场的那三格快照分别是 `out_state_1024_partial.txt:13` 的 `(3, 'bge-large-zh-v1.5@1024@tplv1', 1024, 'draft', 12, 0, 8, 8)`、`out_activate_p3.txt` 那句 `POST /kb/profiles/3/activate` 200（响应体同时报 `retired: {id: 2}`）、以及回滚之后的 `out_state_after_rollback.txt:13` 的 `(3, 'bge-large-zh-v1.5@1024@tplv1', 1024, 'retired', 24, 0, 24, 24)`——**"3 正处在 `active` 那一刻"没有落盘快照**（那一发之后紧跟着就是回滚，本轮没在中间再 dump 一次），所以这一格是**两头的快照 + 中间那发 200** 拼出来的，不是逐字实录；能钉住"1536 列全空、1024 列全非空"的是那两头的 `24, 0, 24, 24` 与三串逐行内容 md5（`be943793…` 全 NULL 那一族 / `b03bc7d5…` / `fbfa9546…`）跨"激活 3 → 检索 → 回滚 2"**一字不变**，唯一变的是 `status`；回滚 `retired`→`active` 那一发 200，零手工 SQL |
+| 6 `TOKEN_BUDGET=1000` 时进 prompt 的表显著变少且**不报错** | 复验通过（010 交付的裁切器，本片**一行未改**、不重造） | 键：`tests/unit/test_prompt_builder.py`（18 条）——`git log --name-only` 自 P4 首提交（`57a611f`）起从未列出这个文件，最近一次改动是 P2-014 的 `220439b`。实录：同一句问句（"各城市各品类的销售额与退款率是多少"）在 `demo_ask` 下两发，`out_budget_12000.log` 与 `out_budget_1000.log` 的 diff 里**只有 1000 那一发**多两行 `INFO app.services.nl2sql.prompt_builder`：`prompt 预算裁切：丢弃表 ai_web_demo.order_main、ai_web_demo.order_item、ai_web_demo.product` 与紧随的 `JOIN 行随表被裁（缺席的表 uid）：…`，被裁表名逐张点名（roadmap 这条要的"日志记录被裁掉的表名"）。**两发之间只有"有没有被裁"这一格可比**：12000 那一发自己撞在 `error_code=llm_bad_response`（模型没返回正文——正是 014 账 ① 那条既有无主项，不是裁切器的事），所以它的终局不能与 1000 那一发（合法反问、无 `error_code`）比好坏。"不报错"那一格由 1000 这一发背：全程无异常，且反问正文自己点名"`order_main` 不在候选表内"——裁掉的东西真不在这一次的 prompt 里。**别拿 CLI 那行 `[④ 进 prompt 的表] 6 张` 当"没裁"的证据**：两发都是 6 张，它是 `AskOutcome.tables`（召回＋JOIN 扩展的名单，`demo_ask.py:93`），不是裁完之后进 prompt 的名单 |
+
+六条之外，收口时必须一起写的账：
+
+1. **`activate` 的前置判的是卡片行数，不是向量在场率**：`partial` 的 reindex 照样给档案盖 `built_at`
+   （文档与用例都在——architecture §7 那行由 029 写明，`test_kb_reindex_live.py:405` 钉着，本轮真库 job 28
+   又走了一遍），而 030 那道前置（`kb_service.missing_card_sources`）只判"这个源的卡片行数齐不齐"。
+   于是"12 张卡 / 8 根向量"这样一套**有洞的档案照样能上线**，上线之后那 4 张卡只是不出现在向量那一路的
+   名次里，没有任何地方写着"这一套建完了但有洞"。**本轮没有演这一发**（档案 3 后来被 1024 那轮撞名复用
+   重灌成 24/24），所以这一句是从代码与用例读出来的，不是跑出来的；口径本身是 spec 故事 5 与决策 ⑨ 定的
+   （"只判少不判多"），要不要补一格向量在场率**归下一片，无主**。
+2. **读侧三元组漂移 → 502 且整请求失败，系统自己不降级**（§1.8.1 ⑦，闸内没有等价物）：`mode` 缺省是
+   `hybrid`，向量腿报 `embedding_dimension_mismatch` 就整发 502，不会自动退回关键词那一路。这与 spec
+   决策 ⑦ 那句"`mode='keyword'` 是降级路径"读起来是两件事——降级今天只有**调用方显式改 `mode`** 一个入口。
+   "向量腿失败 → 退 keyword + 一条告警"要不要做，**归下一片，无主**。
+3. **`activate` 的鉴权档位是本轮暂定裁定**：工单层按 admin-only 落（`test_kb_activate_endpoint_pg.py` 钉的
+   就是这一档），用户尚未认；且 `member` 身份发 `activate` 的 403 在真 HTTP 上**未跑**（本机只有一个 admin
+   常驻，§1.8 第 6 行前半），那一格今天只有用例背书。
+4. **202 响应体的两键只在终端**：落盘的实物是终局帧的 `payload.profile_id` 加 `sync_jobs.reindex_profile_id`
+   （§1.8 第 2 行）。"这颗作业建的是哪套档案"从此可回放，但它的出处**不是**响应体——故事 7 那句"id 来源不靠
+   新端点"要按这个读。
+5. **`aggregated_tables` 有两种读法**，本片按"聚合到表那一步的产出、桥表不在里面"收口（那条用例的
+   字面就是这样钉的）。若 spec 故事 30 指的是"最终进 prompt 的表集合"，那是**另一格**，要重开就回 032。
+6. **`backend/.env:64` 今天仍是 `AIWEB_EXTRACT__SAMPLE_DISTINCT=true`**（033 手测遗留，034 的 §1.9 两步
+   手测按表字面留着它）。**代码默认仍是 `false`**（`app/settings.py` 与 `.env.example` 两处都真读过）。
+   后果是这台机器每次同步都会真去源库跑 `GROUP BY`；要不要落回由用户定，收口没代它决定。
+7. **`cancelled` 仍然一个写入点都没有**（P3 收口起就挂着）：`cancel` / `retry` / `GET /sync/jobs` 不在本片，
+   `sync_jobs` 至今没有 `cancel_requested` 列，要做 `cancel` 得先加那一列。
+8. **033 留下的三条原样挂着**：① "高基数列只记基数"的前半做不到（`meta_column` 没有存 NDV 的列，
+   动它要迁移＋归一＋as-built 三处一起）；② §8 的类型清单在 PG 侧够不到 `text`（跨方言改清单口径，
+   不是加一条分支）；③ "按数据源在 UI 勾选采样"没有 `app_settings` 那层 L3 地基（P9 验收 3 同一条账），
+   今天唯一的开法是进程环境变量、全实例一个开关。
+9. **031 那条"0008 扩 + 0009 收"的复核**（工单 034 已定口径）：真库两条都跑过——`alembic current` =
+   **`0009`**（本轮探针第一行，逐字在 §1.8.1 运行形态），`0007→0008→head→downgrade 0008→head` 那一整条链
+   由 `tests/integration/test_kb_is_active_shrink_pg.py` 在自建临时 schema 里真跑（读的是 `information_schema`
+   的列名，不是 ORM 属性）。`is_active` 的"全仓零命中"要按**那一条列的引用**读，不是按字面读——字面在仓库里
+   活得很好，本轮 `grep` 的实物清单是：`app/` 里 9 处，其中 6 处是注释与 docstring 文本
+   （`models/kb.py:39,40,62`、`kb_service.py:453,727`、`retriever.py:569`），3 处是**另一张表**的
+   `users.is_active`（`models/user.py:38` 声明、`auth.py:55`、`deps.py:72` 两处读它），
+   `app/` 之外还有 `scripts/demo_ask.py:131` 那一处真读；
+   `backend/tests/` 里 **8 个文件 / 35 行**，逐类是"反钉这一列不再回来"的断言
+   （`test_kb_is_active_shrink_pg.py` 整文件、`test_kb_active_profile_pg.py:126` 那句 `hasattr` 反钉、
+   `test_kb_models_ddl.py:139`、`test_kb_migration_ddl.py:24,127,169,170` 钉 0008/0009 的 SQL 文本）、
+   叙述"这一列曾经在场"的注释（`test_kb_activate_pg.py:15,71`、`test_kb_profile_status_pg.py:10,11`、
+   `test_kb_search_pg.py:14`、`test_kb_models_ddl.py:130,204~205`），以及另一张表的
+   `test_login_pg.py:145,208`；`alembic/versions/` 里 0002/0005/0008/0009 四条迁移脚本自己。**结论不变但口径改窄**：
+   **库侧那一格是真的**——`kb_index_profile` 已没有这一列（`information_schema` 实测），且没有任何一处
+   生产代码读写**它**的 `is_active`；"零命中"从来只能是这一句，不是字面的零。
+10. **工单层补的两条口径仍在等用户认**（034 工单末尾那两条，本篇按"最小改法"落了，**不是我自作主张闭掉的**）：
+    ① `sync_jobs.reindex_profile_id` 那枚**载体列**——spec 只说"复用 `sync_jobs`/`JobQueue`"，没说"哪颗作业
+    在建卡时该用哪套档案"，而 ADR-0011（执行体在另一个进程读不到请求）让 reindex 在没有载体列时不成立，
+    所以 026 照 021 的 `force` 列同形补了一列（上面账 4 说的"出处不是响应体"就是这一列的直接后果）。
+    ② **draft 撞名复用 + 激活是整档案激活**——档案是全局的（`profile_name()` 里没有 datasource），
+    两个源同三元组必然共用一行 draft，于是 030 的前置校验扩到"覆盖当前 active 正在服务的所有源"，
+    spec 故事 5 那句"这个源的卡片行数"因此被读成集合判断（本轮 job 29/30 就是两个源各发一颗、
+    共用档案 3 那一发）。**若这两条被否**，026 那条工单自己写的改法是给档案加 `datasource_id`，
+    牵动 `doc_uid` 与 008 的 golden 快照，代价要在下一片重开前先算。
+11. **024 那条"直连库发只读 SELECT 的记法要用户拍板"的待追认，本轮不但没闭、还新增了一发**：
+    P3-024 收口时留的口径是"手测里绕过应用直连元数据库发只读 `SELECT` 这个记法要用户认"（原话在
+    `.scratch/p3-production-sync/` 那份交付记录里，文档侧只留了结论）。本轮 034 为了核 §1.10 那个
+    `last_analyze_at` 的空洞，**又直连了一次真源 PG**（`ai_web_demo_pg` 的 `pg_stat_user_tables`，
+    只读、凭证走 gitignored 的 `demo_pg_ro.env`），并且**没有落 evidence 文件**——探针脚本本身在
+    `.scratch/p4-hybrid-retrieval/evidence/probe034.py`（gitignored），输出只以文字形式进了 §1.10。
+    这一格因此是**两笔账**：记法待追认（原样挂着）+ 本轮这发的可复现性比其它实录低一档（别的都有落盘文件）。
+12. **`ANALYZE` 今天没有任何脚本入口，闸门对源库维护状态的依赖只能靠人**（工单 034 新增，用户拍板
+    "命令写进 runbook、择时由本人跑"）：§1.10 那条红的守卫（024 加的）根源是 `ai_web_demo_pg` 自
+    2026-10-19 09:00 postmaster 起来后**一次都没被分析过**，而 `ANALYZE` 要求表属主身份——本轮实测
+    `demo` schema 那 10 张表的 `tableowner` 全是 `postgres`，`demo_pg_ro` 只有 CONNECT + USAGE + SELECT
+    跑不动；本机 `backend/.setup` 此刻**没有** §1.5.3 建库那把 `pg_login.env`（只有 `aiweb_ro.cnf` /
+    `demo_pg_ro.env` / `local_admin.txt` / `my_login.cnf` 四份），所以这一发不在我能跑的范围内，也不该由我
+    为了拿凭据去试别的账号。那句"属主是 `postgres`"的实测是走 `demo_pg_ro` 的只读 `SELECT pg_tables`，
+    输出同样**没落 evidence 文件**——按上面账 11 那一笔记着，一起等用户认。命令与两处实物订正（**PG 18 装在
+    `D:\Program Files\` 而不是 `C:\`**；不带表名的
+    `ANALYZE;` 即覆盖当前库、不必逐张列）逐字写在 `docs/verification.md` §1.10 的 runbook 段。
+    **归属**：把它做成 `Makefile` 的 `demo-db-pg` 旁边一条或 `scripts/demo_pg.ps1` 的一步 = 新增脚本能力，
+    034 是零代码收口片、不塞；建议归 P5（工程化）或下一个碰闸门的片。
+
+##### 本片顺带闭掉的四条旧账（工单 034 涉及层·账，逐条给"原文在哪 / 谁闭的 / 现在的证据"）
+
+1. **三枚采样键的读取点**（原文在 roadmap §P3 那条"本片明确不做"，`:294~295`；改判段 `:296~303` 承诺由 033 接手）——
+   **已闭**。`sample_distinct`（`settings.py:150`，默认 `false`）、`sample_distinct_max_distinct`（`:151`）、
+   `sample_row_limit`（`:155`，P3 时"出生即无读取点"的那一枚）三枚现在各有真读取点，同一次判断在
+   `sync_service.py:1440`（开关 + 方言能力位），两枚下发在 `:1448`/`:1449`。证据：
+   `tests/unit/test_extract_sample_distinct.py`（28 个测试函数 / 55 条收集，§1.9 表按六档分类逐档点的条数
+   加起来正是这 28）+ `tests/integration/test_sync_sample_distinct_pg.py`（9 条），手测两步本轮真跑
+   （job 31 关 / job 32 开，实物在 §1.9 末三行）。
+2. **`meta_column.enum_values` / `sample_values` 的写入点**（同一处 P3 原文那半句"`sample_values` 继续无写入点"）——
+   **已闭**。两格由 `adjudicate` 一次返回、一起写（今天内容相同，那是一格事实不是两格巧合，
+   §1.9 表末那条留白写明）。证据：§1.9 表第 9~10 行那三条 pg 用例 + 本轮 job 32 那一发把 ds1 从
+   `(133, 8, 0)` 推到 `(133, 15, 7)`（`enum_values` 8→15、`sample_values` 0→7），卡片正文里「取值」行第一次在场。
+3. **`kb_index_profile` 三态与"至多一个 active"**（原文就在 ADR-0013 第 5~7 行的问题陈述里："没有任何唯一约束
+   保证只有一行 active"）——**已闭**：026 落 `status` + partial unique、030 让切换只有那一个写入点、
+   031 的 0009 把旧镜像列 `is_active` 从库里删掉（"两套真相"那个对象从此不存在）。证据：
+   `test_kb_profile_status_pg.py::test_第二行_active_被库拒_一条也不许靠代码拦`（错误文本里带索引名
+   `ux_kb_index_profile_active`）+ 上面账第 9 条那条链（真库 `alembic current` = `0009`）。
+4. **`/kb/rebuild` 旧名与"卡粒度目标形态"两处文档矛盾**（两处都在 spec §7 的第 ④ 条里——它一个字列了三格：
+   旧名、卡粒度、`top_vector`/`ef_search` 那两个默认值；由 026 一次性改完）——
+   **已闭且经得起 grep**（尺：本轮 `grep -rn rebuild --include=*.md --include=*.py` 从仓库根起、
+   排除 `.venv/`、`node_modules/`、`.scratch/`、`__pycache__/`，命中 **10 行 / 6 个文件**，
+   逐处都是"旧名废弃、不留别名"那句叙述本身或它的历史记录，**这里按文件记账不按行号**（行号会随本节自己的
+   增删漂）：实现侧 `endpoints/kb.py` **1 行**（那句"旧名已被决策 ⑥ 废弃"的注释，没有任何路由叫这个名字）、
+   术语表 `CONTEXT.md` 1 行（`_避免_` 行列出旧名）、文档订正叙述 `architecture.md` 与 `kb-workflow.md` 各 1 行、
+   spec 的历史记录 `specs/2026-10-02-p4-hybrid-retrieval.md` 3 行、本节 3 行（本条的两行 + 故事映射表末
+   那句"45（`/kb/rebuild` 旧名全回写）"））。也就是说**没有一处是"还在用旧名"的活口**；
+   `architecture.md` 那行 §7 端点表的"目标形态"现在明写
+   "**仍是表粒度，一行都不改成卡粒度**"，并把 `vector_rank/keyword_rank/rrf_score` 三列名次补在表粒度上，
+   与 §5.2 (4) 和 009 已交付的实际响应不再互相打脸。
+
+##### spec §7 那十条"需订正的旧文档字面"的收口复核（工单 034 涉及层·文档回写）
+
+026 写侧先行把十条一次改完，027/030/031/032/033 各自往同一段落上叠 as-built。收口这一遍的尺是
+**逐条回到现在那份文本上读一遍**（不是读工单交付记录），判据两格：① 原字面已经不再与实物矛盾；
+② 叠在上面的 as-built 说的还是今天的事实。**十条全过**，没有一条需要返工；逐条给"现在住在哪儿"：
+
+| 条 | 原字面 | 复核结论 | 现在的字面（文件 + 那一格的关键句） |
+|---|---|---|---|
+| ① | architecture §5.1 as-built(P2-0009) 注 1"P4 的 RRF 会把分数重新变成次序本身" | 已订正，且订正是对的 | `architecture.md:455` 那句"**订正(ADR-0014)：P4 的 RRF 不会把分数变回次序本身**"；`§5.2` 主流程 `:532` 现在指回这条注 |
+| ② | §5.2 主流程"先取全局 top-80 再按权限过滤" vs 踩坑 ④"过滤要在 SQL 里" | 已统一成后者 | `architecture.md:550` 的订正(决策 ⑨) + `:570` 那句"本条就是上面那条订正的证人" |
+| ③ | §5.2 (3) 的 RRF 那句缺"两路名次各自的来源" | 已补 | `architecture.md:587`/`:628`：`keyword_rank` 来自 `_keyword_ranking`、`vector_rank` 来自 `_vector_ranking`、`fused` 来自 `fuse_rankings` 新盖的 `RetrievedTable.fused_rank`，并明写"不在消费者那里重算" |
+| ④ | §7 端点表 `/kb/rebuild` + 卡粒度"目标形态" + `top_vector=80`/`ef_search=100` 两个默认值 | 三格全改 | `architecture.md:883`（旧名废弃、不留别名）与 `:885`（"仍是表粒度，一行都不改成卡粒度"＋"缺省即取配置"），逐条对账在上面"四条旧账"第 4 条 |
+| ⑤ | `architecture:106` "reembed.py 归 P4，尚未落地" | 已改口 | `architecture.md:107~109`：归 P4 的是 `fake_embedding_server.py`，`reembed.py` 改判归 P9、本片不建空壳。§6 表第 2 行那把 `ls` 尺核的就是这句（本轮 8 个条目里没有 `reembed.py`） |
+| ⑥ | `kb-workflow` 三处旧名 + `endpoints/kb.py:3` 注释 | 已改 | `kb-workflow.md:186/:234/:235` 现在写 `POST /api/kb/reindex`，旧名只剩那句订正叙述本身；`endpoints/kb.py:4` 同理 |
+| ⑦ | metadata-model §2.6 "dim 不硬编码在迁移里" | 已收窄成"只对第一列成立" | `metadata-model.md:344` 的订正(P4-026/ADR-0012)；ADR-0012 的"后果"段写的就是同一件事，两边口径一致 |
+| ⑧ | §2.6 as-built(0008) ①"P2 只落一条行、直接 `is_active=true`" | 已改指向三态与唯一出生入口 | `metadata-model.md:419~426` 的订正(P4-026/ADR-0013)——含 027 关后门那句 |
+| ⑨ | §2.7 `retrieved` 五键里 `score_vec`/`fused` 恒 `null` | 已改 | `metadata-model.md:630~639`：`score_vec` = 向量路名次、`fused` = 融合名次、`mode='keyword'` 时 `score_vec` 回 NULL，**并且单独补了 `mode='vector'` 那一支**（`score_vec` 有名次而 `fused` 仍 NULL）——这一支是 032 交付记录里补的，spec 那条只提了 keyword 侧 |
+| ⑩ | `.env.example` 的 `SAMPLE_DISTINCT=true` 与 `settings.py` 默认值一起翻 `false` | 已翻，且 roadmap 分组 7 那句注释保持不动 | `settings.py:150` `sample_distinct: bool = False` + `backend/.env.example:77` `=false` + roadmap 自己 §4.1 那份键表里那一行也是 `false`。**注意本机 `backend/.env:64` 仍是 `true`**（上面账 6，等用户定，与文档口径无关） |
+
+同一次复核还顺带核了 **ADR-0012~0015 与代码的口径**（工单涉及层那条；ADR 的结论一条没改，只按口径
+给 0013/0014 加了 as-built 指针）：0012 的"第三个维度 = 再一次 DDL"就是 `core/vector_columns.py`
+那个纯函数对未知维度**显式报错**的行为，0013 的"恒为一行由库背书"由 partial unique 背书、
+但"一条语句"那半句被真库证伪（已在该 ADR 顶部 as-built 记成同一事务两条，见上面映射表第 1 行）；
+0014 的"吃名次不吃分数"落在 `fuse_rankings`，`rrf_score` 不做四舍五入那格也写在 `:885`；
+0015 的"`provider` 恒写 `openai_compatible`"今天仍是**一处**（`embedding_client.py:28` 那枚
+`EMBEDDING_PROVIDER` 是全仓唯一字面量，`schemas/kb.py:20` 那句"不露"也照旧），
+它那条"语义边界不许越界声称"就是上面验收 2 那一格留空所依据的原话。
+
+**一条要认的记账方式**：本表"现在的字面"那一列给的是**被引文件的行号**（`architecture.md:455` 这类），
+不是 roadmap 自己的行号——前者从 P4 开工到现在一个字没动过，所以这些号是稳的；
+roadmap 自己在本片被反复增删，任何指向本节内部的行号都会漂，所以一律改成"按账的编号"（账 1~12）引用。
+顺带记一处已经漂了的：spec `:260` 那句里的 `roadmap.md:491` 指的是本片这些段落被加进来之前的位置，
+今天那一行落在账 9 中间——**spec 是带日期的历史记录，不去改它**，漂了这件事记在这里。
+
+##### §6 "明确不做"那十一条的边界证据（工单 034 验收 5：用 grep / git 而不是印象）
+
+逐条给"这一条今天长什么样 + 本轮真跑的那把尺"。**结论全是"没被顺手补"**，但第 3 条有一处字面没落干净，
+已按下面的四键账一并记账。
+
+| # | spec §6 那一格 | 证据（本轮真跑的命令与命中） |
+|---|---|---|
+| 1 | `/kb/status` 与档案列表端点 | `app/api/endpoints/kb.py` 全文只有四条路由，行号 32/48/62/105 = `GET /kb/cards`、`POST /kb/search`、`POST /kb/reindex`、`POST /kb/profiles/{profile_id}/activate`。没有 `GET /kb/profiles`，`/kb/status` 仍无主（那几格由 `/kb/search` 顶层 `used_profile` + 202 的两颗 id 给） |
+| 2 | `/kb/reembed` 与 `scripts/reembed.py` | `app/` 里 `reembed` 零命中；`ls -1 backend/scripts/` 本轮 **8 个条目 = 7 个脚本 + 1 个 `__pycache__`**（`check_env.py` `demo_ask.py` `fake_embedding_server.py` `init_demo_mysql.sql` `init_demo_pg.sql` `run_worker.py` `seed_admin.py`），**没有 reembed.py** |
+| 3 | LLM 改写 (0) 与 simple FTS (2c) | `enable_rewrite` 在 `app/` 只出现一次（`settings.py:170` 的字段定义）⇒ 键在、无人读。FTS 那一档要说得更准：GIN 表达式索引 `ix_kb_card_search_fts`（`models/kb.py:110~114` 的 `to_tsvector('simple', search_text)`）**早在 0005 就建了**、由 DDL 快照钉着，但 `app/services/` 里 `to_tsvector`/`tsquery`/`@@` 零命中（仅有的两处 `@@` 命中是 MySQL 的 `@@max_execution_time` 与守卫自己的正则字面）⇒ 这一条是"**索引在场而查询不接**"，不是"库里没有 FTS" |
+| 4 | `tiktoken` 与 `AIWEB_RETRIEVAL__TOKENIZER` | `backend/pyproject.toml` 里 `tiktoken` 零命中；`TOKENIZER` 在 `app/` 与 `.env.example` 都零命中（键根本没出生）；不引的理由仍写在 `services/token_estimate.py:3~4` |
+| 5 | `pypinyin` 拼音首字母 | `app/` 与 `pyproject.toml` 双零命中，原料与开关键都没建 |
+| 6 | `app_settings` 那层 L3 运行参数 | `app/` 零命中，`grep -rl "app_settings\|grants" backend/alembic/versions/` **零命中**（没有建表迁移）。`rrf_k`/`ef_search` 默认值因此照口径只住 `.env` |
+| 7 | `datasource_grants` 表与 `GET/PUT /datasources/{id}/grants` | `grep -rn grants app/api/` 零命中（端点不存在）；`app/` 里 `datasource_grants` 只剩两处注释在讲"'granted' 档暂时到不了"（`schemas/datasource.py:10`、`datasource_service.py:58`），归 P6 |
+| 8 | 任何前端（调参页 / 档案列表 UI） | `git log --name-only 57a611f..HEAD \| sort -u` = **77 个文件**，全部落在 `backend/` 与 `docs/` 之下；`grep -c "^frontend/"` = **0**（P4 九个工单从头到尾没碰过前端目录） |
+| 9 | `cancel` / `retry` / `GET /sync/jobs` 列表与详情 | `cancel_requested` 与 `retry_of` 在 `app/` 双零命中（两列都不存在）；`endpoints/sync.py` 只有 `:44 POST /sync/jobs` 与 `:115 GET /sync/jobs/{job_id}/events`——列表与详情两条都没有；`cancelled` 仍无写入点（上面账第 7 条） |
+| 10 | 版本闸门、`SCHEMA_PARTIALLY_VISIBLE`、`manifest_digest`、结果 csv 保留期 | 两枚版本键**都不是抽取侧的闸门**（`settings.py:156/157` 是定义处；`min_mysql_version` 全仓零读取点，`min_pg_version` 唯一的读取点是 `check_env.py:110` 的部署前自检——这一条口径 `metadata-model` `:1153~1156` 早就写好了，本行原来那句"各出现一次（无读取点）"是把它写宽了，as-built(P4-034) 已按实测改窄；继续归 P6/P10）；`grant_limited`（`extractor/base.py:73`）**全仓没有任何把它写成 `True` 的赋值**，所以 `sync_service.py:430` 那句 `is_visible: not catalog.grant_limited` 恒真、`known_complete` 今天只是 `meta_table_mark_stale()` docstring 里对调用方的约束（`:371`）；`manifest_digest` 只有 `models/meta.py:320` 那一格列定义、无写入点；csv 保留期口径不变——只删 `sync_job_event` 旧行、csv 逐字节不动（§P3 收口表第 15 行，且那一格仍只有用例背书） |
+| 11 | 第二个 provider / 向量数据库 / IVFFlat / 多 worker | `EMBEDDING_PROVIDER` 是 `embedding_client.py:28` 那枚 `Final` 常量、全仓唯一出处（provider 恒 `openai_compatible`）；依赖里没有 milvus/qdrant/weaviate/chroma（本轮 `grep pyproject` 零命中）；`IVFFlat` 只作为**被否掉的选项**出现在两处注释里（`settings.py:116` 讲 2000 维上限、`models/kb.py:80` 讲"空表建不了要先训练"）；`job_queue.py:70` 那句 `FOR UPDATE SKIP LOCKED` 是"两个 worker 同时扫队列也不重复领"的保险，**不等于开了多 worker**——`scripts/dev.ps1` 只有一条 `worker` 命令（`:56`），一次起一个进程 |
+
+一处**没落干净的 §6 字面**（as-built(P4-034)：记账、补完、且不扩范围）：spec §6 第 3 条要求 `ENABLE_REWRITE`
+"键保留但要在注释里**写清归属**"，而 034 开工时 `settings.py:170` 是一个光秃秃的 `enable_rewrite: bool = False`、
+`.env.example` 那一行只写了功能（"开一次额外模型往返做指代消解"）没写"无实现点、归 (0) 那一档"。
+这是 026~033 都没认领的一格，本轮补在注释里（`settings.py:168~169` 两行 + `.env.example:90~91` 两行）：
+**纯注释、零行为变化**，读取点仍然一个没有（补完再 grep，`app/` 里 `enable_rewrite` 的命中数还是 1）。
+因为它动的是 `backend/` 下的文件而不是文档，按"文档与代码分开提交"的口径另起一次施工提交，不混进本轮文档提交。
+
+##### 四键账与无主账（工单 034 验收 4/6）
+
+**本片那四枚键**（行号与读取点本轮逐处真读）：
+
+| 键 | 定义 | 读取点 | 结论 |
+|---|---|---|---|
+| `AIWEB_RETRIEVAL__RRF_K` | `settings.py:183`（`60`），`.env.example:97` | `retriever.py:922` `cfg.retrieval.rrf_k` → `HybridRetriever.__init__`（`:846`）→ `fuse_rankings(..., rrf_k=)`（`:894`） | 有读取点，且**只走 `.env`**（`resolve_tuning` 的 `:392` 明写"请求体收了就是范围蔓延"） |
+| `AIWEB_RETRIEVAL__HNSW_EF_SEARCH` | `settings.py:187`（`64`），`.env.example:98` | `retriever.py:397`（请求没给才回落这一格） | 有读取点；请求体那一格是另一条路（故事 27 的三旋钮各自独立判） |
+| `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` | `settings.py:155`（`1000`），`.env.example:79` | `sync_service.py:1449` | 有读取点（P3 判"不补"的那枚键，033 让它和读取点同片出生） |
+| `AIWEB_EXTRACT__SAMPLE_DISTINCT` | `settings.py:150`（**默认 `false`**），`.env.example:77` | `sync_service.py:1440`（与方言能力位 `can_sample_distinct` 一起判） | 有读取点且默认关；`sample_distinct_max_distinct`（`:151`→`:1448`）同 |
+
+仍在账上的键：`AIWEB_RETRIEVAL__ENABLE_REWRITE`（无实现点，见上面 §6 第 3 行那处补注释）、
+`AIWEB_EXTRACT__MIN_MYSQL_VERSION`（零读取点）/ `__MIN_PG_VERSION`（读取点只有 `check_env.py:110` 那枚部署前自检，
+抽取侧的 `UNSUPPORTED_VERSION` 闸门仍没接）——两枚继续归 P6/P10。
+
+**本片新增的无主项**（上面"六条之外"那**十二**条账里已经点名的，这里只补一句归口）：向量在场率那一格（账 1）、
+"向量腿失败 → 自动退 keyword + 告警"（账 2）、`activate` 鉴权档位的用户裁定（账 3）、
+`aggregated_tables` 的第二种读法（账 5）、本机 `.env` 的 `SAMPLE_DISTINCT=true`（账 6）、
+033 那三条（账 8）、**工单层那两条口径的用户认定**（账 10）、**024 那条"直连库发只读 SELECT 的记法"
+待追认 + 本轮新增的那一发没落盘的源库探针**（账 11）、**源库 `ANALYZE` 没有脚本入口**（账 12，命令已进
+`verification §1.10` 的 runbook，跑与不跑由用户择时）。**都不许因为"P4 收口了"就当成已闭。**
+
+**P3 那批原样挂着的账**，本轮复核过口径没变（复核的尺在上面 §6 表第 9、10 行）：
+`cancel`/`retry`、`GET /sync/jobs` 列表与详情、版本闸门、`SCHEMA_PARTIALLY_VISIBLE` 那套门控、
+`manifest_digest` 短路、结果 csv 保留期、PG 探测 501 那一档的措辞、MySQL 只读断言词表。
+另有一条本轮才看清的：**`alembic check` 至今没接线**——`scripts/dev.ps1` 的 `check` 那一步
+（`:62~66`）只有 `ruff check` + `npm run typecheck` + `pytest` 三件事，全仓 `alembic check` 的命中
+只有文档与用例注释（`test_kb_profile_status_pg.py:140`、`test_meta_schema_pg.py:8` 这类"漂移自己钉"的用例），
+所以 ORM ↔ 迁移漂移这一格今天仍靠人工比对与那两条用例，不在闸里。
+
+
+#### P4 用户故事映射对账（spec 故事 46 那张表，工单 034 验收 2）
+
+roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` §3 的 46 条故事**不是一一对应**，
+映射由故事 46 自己给出（1→1/3/4，2→22/29/43，3→27/28，4→39/41，5→17~19，6→44）。这张表逐条对，
+**对不上的如实写在对不上的那一格**，不改映射来凑绿。
+
+| roadmap 验收 | 认领的故事 | 对不上的那一格（照实写） |
+|---|---|---|
+| 1 | 1（三态入库）、3（reindex 202）、4（activate） | **故事 4 的字面不成立**："activate 是**一条语句**"被真库证伪——那条 `CASE` 会把两行同时判成 `active`，partial unique 当场拒。实物是同事务固定顺序**两条**（030），已回写 ADR-0013 as-built、metadata-model §2.6 与上面要点段。故事 2（现存那行的归置）落 026 + 上面账第 9 条那一条链 |
+| 2 | 22（向量路一条 SQL 取全局 top）、29（契约扩三列）、43（语义证据边界） | 故事 43 要的正是这一格怎么写：闸内替身跑通**形状**，真端点那一发**未跑**。所以这一行在上面的收口表里语义那半是**空正文 + 一句"只有用例、没有真跑"**，与 P3 收口那四格（故事 3/8/9/15）同形。故事 23（`SET LOCAL` 在事务里）、24（RRF 纯函数）、25（关键词名次沿用 009 的计数键）、26（`mode='keyword'` 与 `LikeRetriever` 逐字同构）、30（`hops_used`/`aggregated_tables` 的原料）、31（`retrieved` 写名次）、32~34（权限进 SQL、粒度到源、403 边界）也都属这一行的实物，roadmap 那一格够不到它们 |
+| 3 | 27（三个旋钮各自真生效）、28（64 的集合 ⊆ 400 的） | 故事 28 的判据（⊆）**成立但只到"相等"**：真库 24 张卡两档回同一串名次。"400 真的多召回"要真语料规模，本机没有；⊆ 那一句在闸内由 200 卡弧表那条真变大。故事 21（`HybridRetriever` 签名里不出现 ef/维度/列名）由 `tests/unit/test_retriever_seam.py`（3 条）钉，不在六条验收里 |
+| 4 | 39（纯函数单测不碰 HTTP、不连库）、41（真列/真索引形状挂 `pg`） | 没有对不上的。补一句边界：41 说的那一路在本机**全部真跑**（`-m "pg or live"`），换一台没配 DSN 的机器就是另一番计数——差额账见 roadmap §6 |
+| 5 | 17（第二列带自己的 HNSW）、18（映射全仓只有一个纯函数）、19（真流程走一遍：新列真写、旧列不动） | **roadmap 那一格写的是"影子列/影子表"两个词并列，实物只有影子列**（账外之账，已在第 5 行标注）。故事 20（`AIWEB_EMBEDDING__DIMENSION` 的角色从"决定列宽"降为"声明用哪一维"）是文档口径，026/031 都落了 as-built |
+| 6 | 44（`TOKEN_BUDGET=1000` 只做复验） | 判据换了格：故事 44 写的是"断送进 prompt 的表数显著变少"，而 CLI 打出来的那个数两发都是 6（它打的是召回名单，不是裁后名单，见第 6 行末注）。这一格按**日志里被点名的丢弃表**收口，比"表数变少"更接近实物，也与 010 那句"logger.info 记被裁表名"同源 |
+
+故事 46 那张映射表只覆盖六条 roadmap 验收。**先把数目这笔账算直**：46 条故事里，"认领"那一列点名了
+**14 条**（1/3/4/17/18/19/22/27/28/29/39/41/43/44），故事 46 本身是这张映射表，剩下的**未认领是 31 条**——
+其中 **12 条**在上面"对不上的那一格"里已经点过名（2/20/21/23~26/30~34），
+所以真正没在表里出现的是**下面这 19 条**：
+5/6/7（激活的三种前置——`built_at IS NULL` 不许激活、`retired` 可以再激活、id 来源不靠新端点）、
+8~16（写侧只认 active、三元组守卫、颗作业按数据源、`embed` 帧真计数、向量列由档案那一维决定、
+单表失败 `partial`、维度不符整颗 `failed`、三键为空 400 且不建空壳）、
+35~38（NDV 采样三键与两方言）、40/42（替身子进程与它自己那条确定性用例）、45（`/kb/rebuild` 旧名全回写）。
+它们不是漏了，而是各自的落点在 026~033 那张工单自己的验收标准里：8~10 归 027、11~16 归 029、
+5~7 归 030、35~38 归 033、40/42 归 028、45 归 026；逐片交付记录在
+`.scratch/p4-hybrid-retrieval/tickets/`（gitignored，不进提交）。
+本节只保证两件事没有被算成已闭：**语义那一格**（43）与**真语料规模那一格**（28 后半）。
 
 ### P5｜SQL 守卫加固 + 三层防御收口（3.5 人日）
 

@@ -11,6 +11,18 @@
 （CHECK 只能限字面，限不了唯一）；激活是**一条语句**：
 `UPDATE … SET status = CASE WHEN id=:new THEN 'active' WHEN status='active' THEN 'retired' ELSE status END`。
 
+> **as-built(P4-030)**：三态入库、partial unique、"同步只认 active"、profile 唯一出生入口是 reindex——
+> 这四条实物都成立，结论不变。**唯独"一条语句"那半句不成立，而且是当场不成立**。PG 的 partial unique
+> 索引项是**语句内逐行写入、逐行查重**的：那条 CASE 先扫到要升级的 draft 行时，旧 active 的索引项还在，
+> 新行进不去 → `UniqueViolationError: ux_kb_index_profile_active`。本轮在真库探过四种形状，生死只由
+> heap 扫描顺序决定（draft 的 tid 较小 → 单条 CASE 撞约束；旧 active 先被扫到 → 单条 CASE 侥幸通过）。
+> 实物因此是**同一事务内固定顺序的两条**（① `WHERE status='active' AND id<>:new` 降级 ② `WHERE id=:new`
+> 升级），原子性由事务给，不是由语句条数给——外部读者看见的仍是"切换前"或"切换后"两种状态，中间那一刻
+> 只存在于未提交的本事务里。ADR 想要的那件事（"恒为一行"由库背书）没有因为换成两条而丢：真正兜住它的
+> 一直是 partial unique 本身——工单 030 的口径原话是"partial unique 是它的兜底而不是它的实现"
+> （`kb_service.activate_stmts()` 的 docstring 抄的就是这一句），这里改的只是别把它当成要实现的东西。
+> 探测记录、四种形状的用例与 `kb_service.activate_stmts()` 的注释都在 `metadata-model §2.6`。
+
 **为什么同时否掉"只加唯一索引 + 时间戳列"**：那样库里同时存在 `is_active` 与时间戳两套真相，
 读侧还得自己拼三态判定——那正是 `stage_of` 那条纪律反对的"第二个翻译点"。
 

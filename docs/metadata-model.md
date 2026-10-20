@@ -1161,6 +1161,11 @@ DELETE FROM aiweb.meta_relation
 >    > 默认值已经跟着 033 之前的一次文档订正改成 `false`（`settings.py` 与 `.env.example` 两处一起，
 >    > 那条用例的期望值同步翻了），而**功能路径上的读取点要到 033 才出现**——在它出现之前，
 >    > 本节仍不许被读成"采样已经在跑"。`min_mysql_version` / `min_pg_version` 两条不动，仍写 P6/P10。
+>    > **行号订正(as-built(P4-034)，口径一字未改)**：033 往 `ExtractGroup` 里插了采样那几枚键，
+>    > 上面那句"键在 `settings.py:150-153`"和上一条那句"`card_template_version`（`:156`）"都跟着下移了——
+>    > 本轮 grep 实测：`sample_distinct` `:150`、`sample_distinct_max_distinct` `:151`、
+>    > `sample_row_limit` `:155`、`min_mysql_version` `:156`、`min_pg_version` `:157`、
+>    > `card_template_version` `:160`（`max_tables` `:145` 没动）。
 >    归属照旧：两个版本闸门写 **P6/P10**（roadmap §P6 的源库兼容矩阵、§P10 的部署闸门），
 >    两个采样键写 **P4**（NDV 采样整块）。
 > 3. **上面第 10 条那句"新增 `AIWEB_EXTRACT__SAMPLE_ROW_LIMIT` 键"从未落地**：`ExtractGroup`

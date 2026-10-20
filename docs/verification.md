@@ -668,7 +668,7 @@ Success: no issues found in 54 source files
 | 维度不符 → 整颗 `failed` 且不盖 `built_at` | 同文件 `test_端点回的宽度与档案不符时整颗作业failed且不盖built_at` | 替身按 model 名回 999 维，失败信息里两个数同时在场 |
 | 请求体问的是**档案那一行的 model**，不是配置当前那个 | 同文件 `test_请求体问的是档案那一行的模型名而不是配置当前那个` | 入队后把 `MODEL` 换成替身不认的名字、`DIMENSION` 留在同宽：宽度那一路分不出两侧，只有名字能。读 settings 的错法在替身侧是 400 → 终局 `partial`（本轮变异实测过：把客户端换回 `get_settings().embedding` 只有这一条红） |
 | 换基准的**三态流转**：切换、回滚、幂等、四种前置各回各的码 | `tests/integration/test_kb_activate_pg.py`（16 条）+ `test_kb_activate_endpoint_pg.py`（8 条） | 前者打 service 那条缝，逐条断的是**库里的 active 计数**而不是返回码；后者走真 HTTP 真鉴权，钉 admin-only 那一档与错误 envelope 里点名的源名。切换那条做过变异：让它在切换后把新档案的向量清空 → 只有"两根向量列内容未变"那一条红 |
-| **向量路与 RRF 的装配**：三条 `mode`、融合次序、`ef_search` 下发、未预置维度显式报错 | `tests/integration/test_kb_search_hybrid_pg.py`（12 条）+ `tests/unit/test_retriever_rrf.py` + `tests/unit/test_retriever_vector_sql.py` | 向量名次是**用例自己摆出来的**（`q / one-hot / -q`，余弦距离严格 `0<中<2`），融合次序是手算的 `1/62+1/61` 那一串，都不从实现反推；`set_config` 那条与召回同事务由"四次 `SHOW` 夹一次 `search()`、全在同一条连接"钉。**激活换到哪一维就读哪一列**（030 欠的真口径）在这里补回：两列的次序反着摆，读错列必红 |
+| **向量路与 RRF 的装配**：三条 `mode`、融合次序、`ef_search` 下发、未预置维度显式报错 | `tests/integration/test_kb_search_hybrid_pg.py`（14 条）+ `tests/unit/test_retriever_rrf.py`（12 条）+ `tests/unit/test_retriever_vector_sql.py`（7 个函数 / 8 条收集，其中一条是参数化） | 向量名次是**用例自己摆出来的**（`q / one-hot / -q`，余弦距离严格 `0<中<2`），融合次序是手算的 `1/62+1/61` 那一串，都不从实现反推；`set_config` 那条与召回同事务由"四次 `SHOW` 夹一次 `search()`、全在同一条连接"钉。**激活换到哪一维就读哪一列**（030 欠的真口径）在这里补回：两列的次序反着摆，读错列必红 |
 | 实现切换缝：`pipeline` 与端点都不认识实现的名字 | `tests/unit/test_retriever_seam.py` | 机械检查 `Hybrid`/`ef_search`/维度字面不出现在调用方，且测试里换一个实现后 pipeline 用例不改而仍绿（工单 031 验收 5） |
 | 收缩迁移 0009：`is_active` 从库里消失，且回滚能按 `status` 把内容恢复回来 | `tests/integration/test_kb_is_active_shrink_pg.py` | 在自建的临时 schema 里真跑 `alembic` 的 `0007→0008→head→downgrade 0008→head`，读的是 `information_schema` 的列名而不是 ORM 属性。**跑的是迁移本体**，不是把那句 SQL 重抄一遍 |
 | **对外那一面**（032）：`/kb/search` 的三格（两路名次 + 融合分）与顶层三格、权限那两格分开、留痕写名次 | `tests/integration/test_kb_search_api_pg.py`（18 条）+ `test_kb_search_hybrid_pg.py`（14 条）+ `test_pipeline_orchestration.py`（新增 3 条） | 摘刀那条（工单 032 验收 2）是**三幕**：基线 → 把链路上唯一那道应用层权限门换成"一被调用就抬错"→ 把喂给 SQL 的 id 清单放宽到全部源。第三幕让那张越权卡当场出头名，前两幕的"结果不变"才不是"根本没人在筛"；它**只有在向量 SQL 那一格写对时**才绿。名次由用例摆出来（越权卡距离摆 0 而不是"差不多近"），`rrf_score` 不 round 而 `score_kw` round（头两名常差 1e-5，抹平就与融合层的次序不是同一个）。`used_profile.dimensions` 与 030 那条回滚用例连着跑（激活 1024 → 报 1024，回滚 → 报 1536）。403 那条把 `mode:'vector'` 也点一次名，钉的是"门在取实现之前"——挪到后面就会先被 503 顶掉。`retrieved` 三种 `mode` 各一条：把 `fused` 改成直接跟着 `vector_rank` 走时 hybrid 与 vector 两支同红， 而"非空就给位次"那种写法只有 vector 红——后一族里前两条钉不住的那一档由 `mode='vector'` 那条守着 |
@@ -680,18 +680,228 @@ Success: no issues found in 54 source files
 - 真端点的**计费与限速形状**（真 429/5xx 之后退避多久、一轮全量灌完花多少）。闸内那条
   重试证据（§2.3 末）只证"5xx 会重试、用尽后按表落 `partial`"，不证真端点的额度。
 
-**手测怎么跑（034 收口时按这张表逐条填"本轮"列）**：
+**手测怎么跑（工单 034 已按这张表逐条填"本轮"列；"本轮"= 2026-10-03 那一段真跑，替身 = 028 的 `fake_embedding_server`，逐字输出在 §1.8.1）**：
 
 | # | 动作 | 期望证据 | 本轮 |
 |---|---|---|---|
-| 1 | 把 `backend/.env` 那四格指向**真端点**（键名同 §2.3 那块命令，值换成真的），跑 `scripts/check_env.py` | `embedding.dimension ok` 且维度=配置值；探针与客户端连的是同一个 `{base_url}/embeddings` | 未跑（等真端点） |
-| 2 | `POST /api/kb/reindex {datasource_id}` → 记下 `job_id`/`profile_id`，按 §1.7 那条命令起 worker | 202 两键齐；库里多一行 `status='draft'`、`built_at IS NULL`；active 那一行逐格不变 | 未跑（闸内已证同一形状，差真端点） |
-| 3 | SSE 追这颗作业：`GET /api/sync/jobs/{job_id}/events?cursor=0` | `embed` 段**一表一帧**，`payload` 是 `{table, embedded}` 且 `embedded` 逐表上涨、全程没有 `skipped` 键 | 未跑（同上） |
-| 4 | 跑完查库：`SELECT count(*) FILTER (WHERE embedding IS NOT NULL), count(*) FROM kb_card WHERE index_profile_id=:draft` | 非空数 = 该档案下的卡片数（真端点不丢发的话） | 未跑 |
-| 5 | `POST /api/kb/profiles/{id}/activate` → 再问一次 §3 那句问句 | 200 回 `{activated, retired}` 两格；库里 `count(*) WHERE status='active'` 恒为 1；旧向量列仍在（可回滚） | 未跑（030 已交付这条端点，闸内已证同一形状；`used_profile` 那一格要等 032 的响应契约） |
-| 6 | 换一个 `member` 身份再发同一条请求 → 然后把基准切**回**旧那套 | 前者 403 `forbidden` 且库里三态一个字没动；后者 200、`activated` 是旧那套、库里仍只有一个 active，且两根向量列的内容与切换前逐字节相同 | 未跑（同上，闸内 `test_kb_activate_endpoint_pg.py` + `test_上线与回滚都不改两根向量列里的内容` 各钉一半） |
-| 7 | `POST /api/kb/search {"query":"销售额","mode":"vector"}`（真端点在位） | 200 且 `items` 非空、次序是余弦距离的次序；`took_ms` 有量（一发 HTTP + 一条索引查询）。**这一格是 roadmap §P4 验收 2 的语义那一格**，替身证不了（下面"留白"第一条） | 未跑（等真端点；闸内 `mode='vector'` 的形状已由 `test_kb_search_hybrid_pg.py` 钉住） |
-| 8 | 同一句问句在**真语料**（几千张卡）上分别给 `ef_search=64` 与 `400`，比两次向量名次集合 | 64 的集合 ⊆ 400 的集合，且 400 那一发**真的多召回**几张 | 未跑。**为什么这条必须在真数据量上手工重做**：闸内 200 行 `kb_card` 上规划器选的是 scan + top-N 排序，`ef_search` 根本不参与，用例只能靠 `SET LOCAL enable_sort = off` 把计划钉到 HNSW 上（详见 architecture §5.2 as-built(P4-031) 实测第 2、3 条）——所以"名次集合真变大"这句验收今天**没有闸内等价物**，只有"下发值可查 + 集合包含关系" |
+| 1 | 把 `backend/.env` 那四格指向**真端点**（键名同 §2.3 那块命令，值换成真的），跑 `scripts/check_env.py` | `embedding.dimension ok` 且维度=配置值；探针与客户端连的是同一个 `{base_url}/embeddings` | **未跑**。本轮三键指向替身（`http://127.0.0.1:8123/v1`），两个模型名各跑一轮（`text-embedding-3-small`→1536、`bge-large-zh-v1.5`→1024）。真端点下"探针与客户端同源"这一格今天还没验过 |
+| 2 | `POST /api/kb/reindex {datasource_id}` → 记下 `job_id`/`profile_id`，按 §1.7 那条命令起 worker | 202 两键齐；库里多一行 `status='draft'`、`built_at IS NULL`；active 那一行逐格不变 | **替身下跑了**（§1.8.1 ①）：库里多出的那一行是 `(2, 'text-embedding-3-small@1536@tplv1', 'text-embedding-3-small', 1536, 1, 'draft', …)`，active 那行 `(1, 'no-embedding@1536@tplv1', '', 1536, 1, 'active', None, …)` 逐格与开工前探针（`out_probe.txt`）相同。**两处口径要分清**：`built_at IS NULL` 是**入队那一刻**的形状，跑完的 draft 就带 `built_at` 了——故事 6 那句"还没跑完不许激活"靠的正是这一格；202 那两键由 `test_kb_reindex_pg.py::test_reindex_回_202_两个键齐_库里多出一行_draft_且_active_整行不动` 钉，本轮那一发的响应体只在终端，落盘的实物是终局帧的 `payload.profile_id: 2` 加 `sync_jobs.reindex_profile_id=2` |
+| 3 | SSE 追这颗作业：`GET /api/sync/jobs/{job_id}/events?cursor=0` | `embed` 段**一表一帧**，`payload` 是 `{table, embedded}` 且 `embedded` 逐表上涨、全程没有 `skipped` 键 | **跑了**（§1.8.1 ①，job 26 那 14 帧逐字落盘）：`embedded` 1→2→3→4→5→6→**9**→10→11→12（`product_stats_wide` 一张表 3 张卡，所以那一跳跨三格），`skipped` 一个都没出现 |
+| 4 | 跑完查库：`SELECT count(*) FILTER (WHERE embedding IS NOT NULL), count(*) FROM kb_card WHERE index_profile_id=:draft` | 非空数 = 该档案下的卡片数（真端点不丢发的话） | **替身下相等**：`(24, 24, 0, 24)`（卡片数 / `embedding` 非空 / `embedding_1024` 非空 / `embedded_at` 非空，§1.8.1 ②）。两个"24"要交代来源：它是**两颗** reindex 各 12 张叠出来的（job 26 ds=1、job 27 ds=2 共用同一行 draft——这正是工单口径条 2 那句"撞名复用"的实物）。**它不背"真端点不丢发"**：丢发那一格由 §1.8.1 ⑥ 反向证（12 张里只有 8 张有向量，另外 4 张的表名在 `errors[]` 里逐张点名） |
+| 5 | `POST /api/kb/profiles/{id}/activate` → 再问一次 §3 那句问句 | 200 回 `{activated, retired}` 两格；库里 `count(*) WHERE status='active'` 恒为 1；旧向量列仍在（可回滚） | **跑了**（§1.8.1 ③）：档案 2 那一发 200、`{activated, retired}` 两格齐且各自带三元组；`active` 计数在五个快照里都是 `(1,)`。"旧向量仍在"不按"行数没变"比，按**逐行内容 md5** 比：三串（`be943793…` 全 NULL 那一族 / `b03bc7d5…` 档案 2 的 1536 列 / `fbfa9546…` 档案 3 的 1024 列）跨激活、跨切到 1024、跨回滚一字不变。问句那一格见第 7 行 |
+| 6 | 换一个 `member` 身份再发同一条请求 → 然后把基准切**回**旧那套 | 前者 403 `forbidden` 且库里三态一个字没动；后者 200、`activated` 是旧那套、库里仍只有一个 active，且两根向量列的内容与切换前逐字节相同 | 前半**未跑**：本轮只有 admin 一个身份（`login-probe` 那一发只验了未带 token → 401），403 那一档归 `test_kb_activate_endpoint_pg.py`（`global` 档那条）。后半**跑了**：`retired`→`active` 200（§1.8.1 ④），md5 两份快照逐字符相等。**顺带一条实测**：`built_at IS NULL` 那条前置只管 draft，`retired` 档案不论 `built_at` 都能再激活——所以本轮靠 API 就把基准恢复回开工那套（终局 1 active + 2 retired），零手工 SQL |
+| 7 | `POST /api/kb/search {"query":"销售额","mode":"vector"}`（真端点在位） | 200 且 `items` 非空、次序是余弦距离的次序；`took_ms` 有量（一发 HTTP + 一条索引查询）。**这一格是 roadmap §P4 验收 2 的语义那一格**，替身证不了（下面"留白"第一条） | **语义那一格留空**（写法照 §1.8.1 ⑤ 那句两句话）。真库 + 替身基准下"销售额"三种 `mode` 各发一次，`items` 三次**全空**；同一句换"订单"在激活替身基准后回 5 项、`vector_rank` 1..5 齐、`took_ms=308`。**形状跑通了，语义没跑通**，两件事不互替 |
+| 8 | 同一句问句在**真语料**（几千张卡）上分别给 `ef_search=64` 与 `400`，比两次向量名次集合 | 64 的集合 ⊆ 400 的集合，且 400 那一发**真的多召回**几张 | 前半**跑了，但只能给到"相等"**：24 张卡的真库上两档都回 `[1,2,3,4,5]`（相等即 ⊆ 成立）。后半**未跑**——真语料规模不到。**"参数没传下去"这一族失效换了一格排除**：同一句问句加 `top_vector=3`，向量名次集合变 `[1,2,3]`（召回宽度跟着请求体变）。`SET LOCAL hnsw.ef_search` 与召回同事务那一格仍只有闸内那条四次 `SHOW` 夹一次 `search()` 的用例背——原因还是原行末注那一条：小表上规划器选 scan + top-N，`ef_search` 根本不参与（architecture §5.2 as-built(P4-031) 实测第 2、3 条） |
+
+### 1.8.1 P4 真跑实录（工单 034 验收 1/3/5 的那一段真跑，语义那一格留空见 ⑤）
+
+**这一段证的是什么**：档案的**出生、切换、退场、回滚**四步在真进程、真元数据库、真 HTTP 上走通，
+以及 `embed` 那一档第一次不是 `skipped`。它**不证**中文语义命中——那是 ⑤ 那一格，也是本节唯一
+一处"只有用例、没有真跑"。
+
+**运行形态**（与前一份 P3 实录同一套，只多一个替身）：
+
+- 替身：`backend/scripts/fake_embedding_server.py --port 8123`，就绪行逐字为 `LISTENING 127.0.0.1 8123`；
+  两轮分别把 `AIWEB_EMBEDDING__MODEL` 设成 `text-embedding-3-small`（替身回 1536 维）与
+  `bge-large-zh-v1.5`（回 1024 维），`DIMENSION` 跟着改。密钥那一格填的是占位串 `in-gate-stand-in`，
+  不是任何真凭证。
+- API：`uvicorn app.main:app --host 127.0.0.1 --port 8124`（8000 被本机另一个项目占着，
+  所以取证脚本走 `AIWEB_EVIDENCE_API` 而不是写死基址）。
+- worker：`scripts/run_worker.py` 独立进程，与 §1.7 同一进入方式。
+- 登录只从 gitignored 的 `backend/.setup/local_admin.txt` 读，实录里每一行都只有
+  `[login] 200，access_token 长度 171`——token 本身不进文件。
+- **元数据库结构这一整段一个字没动**：`alembic current` = `0009`（探针第一行），全程只有 HTTP
+  与只读 `SELECT`。取证脚本 `evidence034.py` 里一条写语句都没有。
+
+#### ① 一次 reindex 的完整时间线（job 26，ds=1，替身 1536）
+
+`GET /api/sync/jobs/26/events?cursor=0` 的首帧、`embed` 段每一表和终局，逐字（全 14 帧在
+`out_reindex_ds1_timeline.txt`）：
+
+```
+[status] 200  content-type=text/event-stream; charset=utf-8
+id: 3
+event: progress
+data: {"stage": "card_build", "phase": "card_build", "done": 10, "view": 1, "cards": 0, "total": 10, "base_table": 9, "payload": {}}
+id: 4
+event: progress
+data: {"stage": "embed", "phase": "embed", "done": 10, "view": 1, "cards": 12, "total": 10, "base_table": 9, "payload": {"table": "ai_web_demo.category", "embedded": 1}}
+id: 10
+event: progress
+data: {"stage": "embed", "phase": "embed", "done": 10, "view": 1, "cards": 12, "total": 10, "base_table": 9, "payload": {"table": "ai_web_demo.product_stats_wide", "embedded": 9}}
+id: 13
+event: progress
+data: {"stage": "embed", "phase": "embed", "done": 10, "view": 1, "cards": 12, "total": 10, "base_table": 9, "payload": {"table": "ai_web_demo.v_daily_sales", "embedded": 12}}
+id: 14
+event: progress
+data: {"stage": "done", "phase": "done", "done": 10, "view": 1, "cards": 12, "total": 10, "base_table": 9, "payload": {"profile_id": 2}}
+event: done
+data: {"job_id": 26, "status": "success", "counters": {"cards": 12, …}, "warnings": [], "errors": [], "duration_ms": 4508}
+```
+
+三件事在这里看得见、在别处看不见：
+
+1. **`embed` 段一表一帧**，`payload.embedded` 是**累计卡数**不是表数（1→2→…→6→**9**→10→11→12，
+   `product_stats_wide` 那一跳跨 3 张卡）。这是 P3 那份 `{skipped: true, code: …}` 单帧的形状
+   第一次被真计数换掉（spec 故事 12）。
+2. **终局帧里带着 `profile_id`**（`payload.profile_id: 2`）——"这颗作业建的是哪套档案"是
+   可回放的事实，不用猜 202 的返回值（spec 故事 7）。
+3. `warnings: []` 且 `errors: []`：reindex 那一路上 027 那道 settings 守卫**不插手**（已定口径），
+   所以本轮把 `MODEL` 换成替身不认的名字时，作业照样 `success`——靶是档案那一行，不是配置。
+
+#### ② 跑完之后库里那三行（`out_state_after_reindex.txt`）
+
+```
+### kb_index_profile（三态 + 三元组 + built_at）
+  (1, 'no-embedding@1536@tplv1', '', 1536, 1, 'active', None, datetime.datetime(2026, 9, 29, 3, 34, 59, 277178, tzinfo=datetime.timezone.utc))
+  (2, 'text-embedding-3-small@1536@tplv1', 'text-embedding-3-small', 1536, 1, 'draft', datetime.datetime(2026, 10, 3, 5, 39, 14, 17270, tzinfo=…))
+
+### active 行数（ADR-0013 要求恰好 1）
+  (1,)
+
+### 每档案：卡片数与两根向量列非空数
+  (1, 'no-embedding@1536@tplv1', 1536, 'active', 24, 0, 0, 0)
+  (2, 'text-embedding-3-small@1536@tplv1', 1536, 'draft', 24, 24, 0, 24)
+```
+
+这一份快照里叠着三条事实：档案 2 **建完了但还没激活**（`draft` + `built_at` 已写）、
+`embedding` 那一列 24 张全非空而 `embedding_1024` 全空（**同一张表的第二根列没被顺手写**）、
+以及 active 那行的 `built_at` 仍是 `NULL`（线上那套从 P2 起就没有向量，本轮一个字没动）。
+
+**"两颗作业共用一行 draft"的实物**：job 26（ds=1）与 job 27（ds=2）在 `sync_jobs` 里
+`reindex_profile_id` **都是 2**，而档案表只有两行、卡片数是 `12 + 12 = 24`。这就是工单 034
+口径条 2 那句"档案是全局的，同三元组必共用一行 draft"的真跑版本——它同时解释了为什么
+`activate` 的前置校验必须按"覆盖当前 active 正在服务的**所有**源"来判。
+
+#### ③ 激活：200 的两格与 active 计数
+
+```
+### POST /kb/profiles/2/activate
+[status] 200
+[body]   {"activated": {"id": 2, "name": "text-embedding-3-small@1536@tplv1", "model": "text-embedding-3-small", "dimensions": 1536, "card_template_version": 1}, "retired": {"id": 1, "name": "no-embedding@1536@tplv1", "model": "", "dimensions": 1536, "card_template_version": 1}}
+```
+
+激活后再查：`(2, …, 'active', …)`、`(1, …, 'retired', None, …)`、active 行数 `(1,)`。
+**`retired` 不是删除**：档案 1 那 24 张卡一行没少（`out_state_after_activate.txt` 里
+`(1, …, 'retired', 24, 0, 0, 0)`），这是"可回滚"的前提而不是结果。
+
+#### ④ 换维度（1024）→ 读的是第二列 → 回滚，两根列的内容一字不变
+
+同一套流程在 1024 那侧走一遍（job 29/30 → 档案 3），关键几行（**逐字来自落盘的那几份**）：
+
+```
+### 每档案：卡片数与两根向量列非空数
+  (3, 'bge-large-zh-v1.5@1024@tplv1', 1024, 'draft',   12, 0, 8, 8)   ← out_state_1024_partial.txt:13
+  (3, 'bge-large-zh-v1.5@1024@tplv1', 1024, 'retired', 24, 0, 24, 24) ← out_state_after_rollback.txt:13
+                                                                        反向：1536 列全空
+
+### POST /kb/profiles/3/activate                                        ← out_activate_p3.txt:4~5
+[status] 200   [body] {"activated": {"id": 3, …, "dimensions": 1024}, "retired": {"id": 2, …}}
+
+### POST /kb/search {"query": "订单"}                                   ← out_search_on_1024.txt:180~193
+  "used_profile": {"id": 3, "name": "bge-large-zh-v1.5@1024@tplv1", "dimensions": 1024}
+  [向量名次集合] [1, 3, 4, 5, 6]      ← 与 1536 基准下的 [1, 2, 3, 4, 5] **不是同一串名次**
+```
+
+**这里要按实物认一格账**：档案 3 正处在 `active` 那一刻**没有落盘快照**——那一发 activate 之后
+紧跟着就是检索与回滚，本轮没在中间再 dump 一次 `每档案`。所以"3 曾成为基准"的证据是
+**两头那两行 + 中间那发 200 + 检索响应里 `"used_profile": {"id": 3}`** 四件拼出来的，
+不是某一份文件里的一行。（`24, 0, 24, 24` 那两个计数在 `active` 与 `retired` 两态下不会变，
+变的是 `status` 那一格——所以这一格缺的只是"当时那一瞥"，不缺结论。）
+
+"旧向量仍在（可回滚）"这一格**不按行数比，按逐行内容比**（`out_vecsum_*.txt`，
+把每张卡的向量列 `::text` 按 `id` 序拼起来取 md5；全 NULL 那一族也照样有一个指纹，
+所以"被写坏了"与"本来就是空"分得开）：
+
+```
+（激活档案 3 之前）            （回滚到档案 2 之后）
+  (1, 'retired', be943793…, be943793…, 24)     (1, 'retired', be943793…, be943793…, 24)
+  (2, 'active',  b03bc7d5…, be943793…, 24)     (2, 'active',  b03bc7d5…, be943793…, 24)
+  (3, 'draft',   be943793…, fbfa9546…, 24)     (3, 'retired', be943793…, fbfa9546…, 24)
+```
+
+三串指纹（`be943793` / `b03bc7d5` / `fbfa9546`）跨"激活 3 → 检索 → 回滚 2"全部不变，
+唯一变的是 `status` 那一格（上面那两行 `每档案` 里 1536 列那格都是 `0`、1024 列都是 `24`，
+就是这两串指纹计数出来的同一件事）。回滚那一发是 `POST /kb/profiles/2/activate` → 200，
+`retired` 的档案被重新激活——**spec 故事 6 后半句（"`retired` 可以再激活，这就是'可回滚'的落点"）
+在真 HTTP 上是这一发**。顺带一条实物与字面的差：那道前置校验只管 `built_at IS NULL` 的 **draft**，
+`retired` 不论建成没建成都能再激活，所以本轮靠 API 就把基准恢复回了开工那套（终局
+1 active + 2 retired），零手工 SQL。回滚后再发一次 `{"query":"订单"}`，
+`used_profile.dimensions` 回到 `1536`、名次集合回到 `[1,2,3,4,5]`。
+
+#### ⑤ 语义那一格：**只有用例，没有真跑**（roadmap 验收 2 的空正文）
+
+两句话，按已定口径分开写：
+
+- **闸内替身跑通了形状**：`订单` 在激活替身基准后 200、`items` 5 项、每项 `keyword_rank` /
+  `vector_rank` / `rrf_score` 三列齐（头一名 `ai_web_demo.order_main`，`keyword_rank 1` /
+  `vector_rank 4` / `rrf_score 0.032018442622950824`，`took_ms 346`）。
+- **真端点跑通了没有？未跑**。本轮真库里那句 `销售额` 在三种 `mode` 下各发一次，`items`
+  **三次全空**（`out_search_pre_{keyword,vector,hybrid}.txt`，`[向量名次集合] []`、无 `table_uid` 行）。
+
+全空这一格要说清它**不是**验收 2 的反证：替身回的是字 n-gram 哈希向量，"近邻=语义相近"对它
+不成立（§2.3 第一条），而关键词那一路是 `ILIKE` + trgm——`销售额` 三个字在演示库的卡片文本里
+**一个字都没有出现**（列名是 `amount` / `pay_amount`，注释是"支付金额"），所以关键词路空是
+**正确行为**。验收 2 那句"销售额命中 `payment_record` 与 `order_main`"要的是**语义**那一路，
+它的地基是用户自己配的 `AIWEB_EMBEDDING__*` 三键（密钥不进对话）。到位之前，这一格在
+roadmap 的收口表里是**空正文 + 一句"只有用例、没有真跑"**，与 P3 收口那四格（故事 3/8/9/15）同形。
+
+#### ⑥ 单表 embed 失败 → `partial`，其余表的向量在场（job 28，替身注入 `--fail-on order_main`）
+
+```
+### 每档案：卡片数与两根向量列非空数
+  (3, 'bge-large-zh-v1.5@1024@tplv1', 1024, 'draft', 12, 0, 8, 8)
+
+### 最近 5 颗作业
+  (28, 1, 'partial', 'done', False, 3, Decimal('100.00'), {…}, [],
+   [{'code': 'embedding_upstream_error', 'detail': 'ai_web_demo.order_item: embedding 端点不可用（HTTP 500），重试后仍没成功'},
+    {'code': 'embedding_upstream_error', 'detail': 'ai_web_demo.order_main: …'},
+    {'code': 'embedding_upstream_error', 'detail': 'ai_web_demo.payment_record: …'},
+    {'code': 'embedding_upstream_error', 'detail': 'ai_web_demo.refund_record: …'}])
+```
+
+12 张卡里 **8 张有向量**、4 张没有，失败的**表名**逐张点名（不是"4 张卡"）。为什么替身按
+`order_main` 这个串注入却炸了四张表：`--fail-on` 是对**请求文本**做子串匹配，而 `order_item` /
+`payment_record` / `refund_record` 的卡片正文里有 `order_main` 的 FK 说明行——这是替身的
+既定性状（§2.3），本轮正好拿它当"失败不止一张表"的自然样本。
+
+**顺带一条本轮才在真库上看见的**：这颗作业终局是 `partial`，而档案 3 那一行的 `built_at`
+**照样写了**（`2026-10-03 05:42:52`）。这一格**文档与用例都在**，不是本轮新发现的洞——
+architecture §7 那行由 029 写明"终局 `success`/`partial` 才给靶盖 `built_at`，`failed` 不盖"，
+用例 `tests/integration/test_kb_reindex_live.py:405` 那句"partial 也盖 `built_at`（已定口径）"钉着它；
+本轮真 HTTP 真库又走了一遍，两边一致。要说清的是它**连着另一格**：`activate` 的前置判的是**卡片行数**
+（`kb_service.missing_card_sources`），不是**向量在场率**，所以"12 张卡 / 8 根向量"这样一套有洞的档案
+照样能上线——本轮没有演这一发（档案 3 后来被 1024 那轮撞名复用重灌成 24/24，再没带着洞过前置），
+所以这一句是**从代码与用例读出来的**，不是跑出来的。口径本身是 spec 故事 5 与决策 ⑨ 定的，
+"要不要再补一格向量在场率"归下一片（见 roadmap §P4 收口"账"段第 1 条）。
+
+#### ⑦ 读路径的三元组漂移 → 502，而且**整请求失败**（本轮新看见的，闸内没有等价物）
+
+把基准回滚到档案 1（`model=''`、1536 维、**24 张卡全 NULL**）之后，进程里的 `MODEL` 还指着
+替身，于是配置的三元组与 active 档案不一致。写侧那条守卫本轮又跑到了（不写卡、告警、作业仍
+`success`，形状与 §1.7.1 的告警段同）；**读侧不一样**：
+
+```
+### POST /kb/search {"query": "订单"}
+[status] 502
+{"error": {"code": "embedding_dimension_mismatch", "message": "端点返回 1024 维，这套档案期望 1536 维", "detail": null}}
+```
+
+（这一发跑在"替身回 1024、active 档案期望 1536"那一步上，所以 message 里两个数是 1024/1536。）
+
+**要拍板的是形状而不是这个数**：`mode` 缺省是 `hybrid`，此时向量腿报错就**整请求 502**，
+不会自动降级成关键词那一路。这与 spec 决策 ⑦ 那句"`mode='keyword'` 是降级路径"读起来是两件事——
+降级路径今天只有**调用方显式改 `mode`** 这一条入口，系统自己不降。是不是要加"向量腿失败 →
+退 keyword + 一条告警"，**归下一片**（已记无主账），本片按实物写。
+
+#### 这一段真跑给不了的四件事（不许在收口表里被算成已闭）
+
+1. **中文语义命中**（验收 2 那一格）——等地基是真端点，见 ⑤。
+2. **`ef_search` 在真 HNSW 上把召回集合撑大**（验收 3 后半句）——24 张卡的规模下规划器不选
+   索引扫，见 §1.8 手测表第 8 行。
+3. **`member` 身份发 `activate` 的 403**——本机常驻只有一个 admin 账号，见 §1.8 第 6 行前半。
+4. **真端点的计费与限速形状**（§1.8"留白"第二条）——替身回 500 只证"5xx 会重试、用尽后按表
+   落 `partial`"（⑥ 那一发），不证额度、退避时长与全量耗时。
 
 ### 1.9 P4 枚举采样手测（工单 033 验收 4/5）
 
@@ -734,6 +944,118 @@ Success: no issues found in 54 source files
 把"采样不属于档案"钉成了同一轮里 `counters["cards"]==0` 与"7 列有值域"同时成立），而渲染那一跨
 在 `test_sync_sample_distinct_pg.py` 里已经按整行文本逐字钉过。
 
+**本轮（2026-10-03，工单 034 收口）按这两步各跑一次的实物**（运行形态同 §1.8.1 开头：真 API
+`127.0.0.1:8124` + 真 worker 子进程 + 真元数据库；只发 `ds=1` 那个 MySQL 演示源）：
+
+| 步 | 那一发 | 源库侧看到的 | 元数据库侧看到的 |
+|---|---|---|---|
+| 1（关） | job 31。入队那一发的响应体**只在终端**，落盘的实物是事件流（`out_final_sync_off.txt`，202 那两键由 `test_sync_enqueue_pg.py` 钉）与库里那一行 `started_at 07:16:30.687929Z` / `finished_at 07:16:31.562393Z` | 源库侧那把尺**换了表**：本机没开 `general_log`，用的是 `performance_schema.events_statements_summary_by_digest`（探针 `probe_digest.sql`，判据从"没有那条语句"变成"那条语句的 `count_star` 没涨"）。那 16 条含 `` AS `sample_value` `` 的摘要一条都没动：两份快照里都是 `count_star=17`、`last_seen` 停在 `13:36:22`，而 job 31 落在一小时之后的 `15:16:30–31`（本机）——**这一轮源库一条采样语句都没收到** | `select count(*) … where sample_values is not null` = **0**（ds1 `(133, 8, 0)`）；终局 `success`、`errors=[]`、`duration_ms=874` |
+| 2（开） | job 32：`202` + `{"job_id": 32}`（`out_final_sync_on.txt`，五帧逐字在场） | 同一份探针里那 16 条**各 +1**（17→18），`last_seen` 全部落进 `15:21:20`/`15:21:21`，正好在 job 32 的窗口（`15:21:19–20` 本机）里——**"开了才扫"这一格的方向反过来也钉住了**：发包数与那一轮一一对应 | ds1 `(133, 15, 7)`：`enum_values` 8→15、`sample_values` 0→7（与 §1.9 表末真 MySQL 那行的 live 期望值 7 个**同一个数**）；ds2 一字不动 `(133, 8, 0)`——本轮没发它，所以"两方言都实现"那一格仍只由 `test_extract_pg_live.py` 那条与闸内那族背；终局 `success`、`errors=[]`、`duration_ms=904` |
+
+三个数（`133` / `15` / `7`）是那一段探针的 `(datasource_id, 列数, enum_values 非空数, sample_values 非空数)`。
+本机 MySQL 的 `last_seen` 是 **UTC+8** 而 `sync_jobs.started_at` 是 **UTC**，比对必须 +8——上面写的
+两个本地时刻就是这么对上的，不是巧合。
+
+再加三条只有这一跑才看得见的：
+
+1. **第 1 步那一发没有东西可抹，所以它证的是"不发也不写"而不是"关掉会清空"**。开工探针
+   `out_state_final.txt`（14:19，job 31 之前 ds=1 最后一次同步之后）已经是 `(133, 8, 0)`，所以
+   `sample_values` 非空数在 job 31 前后都是 0。"把上一轮采到的值域抹回 NULL"这一格**本轮没被这两步
+   重演**，它的证据是 §1.9 表末那条真 MySQL 的 live 用例（`_COLUMN_SYNC_COLS` 整列覆盖那条口径的
+   后果），别把它算进本轮实录。运维口径照旧成立但出处要写对：**关开关等于清空，不是停止更新**。
+2. **卡片正文里那些「取值」行第一次在场**（`out_final_cardtext_on.txt`）：`product.brand` 那 12 个
+   中文品牌（常喜 / 木白 / 潮汐…）、`refund_record.reason` 那 15 条中文短语、`category.level` 的
+   `2 / 1`、`product.tags` 的 20 条逗号短语——落库的都是**值域**不是行数据（§8 第二步阈值 30 之内，
+   超的那几列今天什么都不写）。同一张卡里 `status enum` 那一行（`on_sale / off_sale / draft`）走的是
+   §8.1 C 的真 ENUM 老通路，两路原料不同但渲染成同一行格式，从卡片文本上分不出来——分得开的地方在
+   库里（`data_type='enum'` 的列 `sample_values` 恒 NULL，那条反证在 §1.9 表末第一行）。
+3. **本机 `backend/.env:64` 今天是 `AIWEB_EXTRACT__SAMPLE_DISTINCT=true`**（033 手测遗留，本轮第 2 步
+   就按这张表的字面要求留着它）。**代码默认仍是 `false`**（`app/settings.py` 与 `.env.example` 两处），
+   §1.9 表第一行那条默认值证据不受影响。后果是这台机器每次同步都会真去源库跑 `GROUP BY`——
+   要不要落回 `false` 由用户定，收口没代它决定。
+
+### 1.10 P4 收口的闸（工单 034 验收 8）
+
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 check` 整轮全绿（exit 0）。原始文件
+`.scratch/p4-hybrid-retrieval/evidence/gate034.txt`（gitignored，所以结论数字抄在这里而不是只给路径）。
+抄的是**每步的命令回显行 + 结论行**，中间省略的是 pytest 的进度点与 npm 的两行脚本回显：
+
+```
++ uv run ruff check app scripts tests alembic  (backend)
+All checks passed!
++ npm run typecheck  (frontend)
++ uv run python -m pytest  (backend)
+1230 passed, 2 skipped, 1 warning in 905.76s (0:15:05)
+```
+
+`dev.ps1 check` 仍然只有 `lint` + `typecheck` + `test` 三步（§1.7.2 末那段话在 P4 一个字没变：
+格式与类型**不在它里面**，`mypy` 今天仍没有闸目标背它，接进 `check` 归 P10 的 CI 那一片）。本轮手工补的
+两条，逐字（这两行现在也有一份落盘文件了：`evidence/out_tools034.txt`，as-built(P4-034) 补——原文只抄回显
+不给文件；本节另一处"只以文字进文档、没有落盘文件"的是 §1.10 末那条源库 `pg_stat` 探针，两处的账分开记）：
+
+```
++ .venv/Scripts/ruff.exe format --check app scripts tests alembic  [dev.ps1 无此目标，034 手工补]
+194 files already formatted
++ .venv/Scripts/python.exe -m mypy app  [dev.ps1 无此目标，034 手工补]
+Success: no issues found in 57 source files
+```
+
+对照基线：工单 025 收口时是 **980 passed / 2 skipped**，本轮 **1230 passed / 2 skipped**——高出的 250 条
+是 P4 那八片（026~033）加进来的，**只加不减**（034 本片零代码）。**两个 skip 没有变多、也没有换地方**：
+本轮单独跑 `tests/guard/test_corpus_mutation.py -rs` 复核，两条 SKIPPED 都仍指向同一行
+`tests\guard\test_corpus_mutation.py:61`，理由仍是"该用例没有 〈某个变异〉 的靶子"那一族，两支今天点名：
+`表名换成系统表` 与 `改成 INTO OUTFILE`（`-rs` 回显落 `evidence/out_skips034.txt`，as-built(P4-034) 补）。
+（守卫变异语料的
+两个空靶，来历见 nl2sql-safety §7 末注"闸从 629/3 变成 631/2"那一句，与 DB 介质无关）。
+
+**本轮整轮闸有两份留存物**（原文此前写"跑了两次，耗时分别是 549.17s 与 905.76s"——那个 549.17s 那一发**没有留下任何输出文件**，收口不许把一个查无实据的数留在文档里，故按现存的两份重写；订正 as-built(P4-034)）：
+① `gate034.txt`：`1230 passed, 2 skipped in 905.76s`（034 真跑实录那一段之后跑的，全绿）；
+② 收口重跑（034-E 之后）：`1 failed, 1229 passed, 2 skipped in 513.04s`，那**一条红不是代码回归**——
+`tests/integration/test_extract_pg_live.py::test_验收5_last_analyze_at_按两列取较晚者_视图与未分析过的表留空`
+末段那条"至少一张表被分析过"的守卫红了。本轮直连源库只读探针实录：`ai_web_demo_pg` 的
+`pg_stat_user_tables` 里九张业务表的 `last_analyze` / `last_autoanalyze` / `n_live_tup` **全是 NULL/0**、
+`pg_stat_database.stats_reset` 也是 NULL，而 `pg_postmaster_start_time()` = 2026-10-19 09:00——
+**postmaster 起来之后这个库没被分析过**（该守卫的用途正是"一个都没分析过时，这一格什么都没证到"，
+它红得其所）。同一条用例前面那几行断言（逐张等于源库两枚时间戳里较晚的一枚、视图留 NULL）**照旧绿**，
+也就是说"搬运没走样"这一半仍然成立，红的只是"这台机器现在没有新鲜度可搬"那一半。
+出路是**由源库属主跑一次 `ANALYZE;`**（`demo_pg_ro` 是只读账号，跑不动这条；口令照旧不进对话），
+跑完这条 live 用例即复绿。
+
+**这一发的 runbook**（as-built(P4-034)，用户拍板"命令写进文档、择时由本人跑"）：
+
+```powershell
+# 以 role `postgres` 的身份（= §1.5.3 建 `ai_web_demo_pg` 时那份 `pg_login.env` 里的 PGUSER；
+# 该文件此刻不在 backend/.setup 里，所以这一发只能由持有它口令的人亲手跑）。
+# ANALYZE 要求表属主身份：本轮实测 `information_schema`/`pg_tables` 里 schema `demo` 的
+# 10 张表 `tableowner` 全是 `postgres`，`demo_pg_ro` 只有 CONNECT + USAGE + SELECT，跑不动这条。
+& "D:\Program Files\PostgreSQL\18\bin\psql.exe" -h 127.0.0.1 -p 5432 -U postgres -d ai_web_demo_pg -c "ANALYZE;"
+```
+
+两个容易写错的实物：① **这台机器的 PG 18 装在 `D:\Program Files\` 而不是 `C:\Program Files\`**（服务
+`postgresql-x64-18` 的 PathName 实测指 `D:\Program Files\PostgreSQL\18\bin\pg_ctl.exe`，`C:\Program Files`
+下没有任何 PostgreSQL 目录，PATH 上也没有 `psql`）；② 不带表名的 `ANALYZE;` 分析**当前库**，正好覆盖
+`demo` 那十张，不必逐张列。
+
+跑完要重跑的三样（顺序即依赖序）：
+1. `cd backend && .venv/Scripts/pytest.exe tests/integration/test_extract_pg_live.py`——先单点确认那条守卫复绿；
+2. 整轮闸 `powershell -ExecutionPolicy Bypass -File scripts/dev.ps1 check`；
+3. 把第三份回显补进本节上面 ①② 两跑之后，以及 roadmap §P4 闸门段那句"两份留存物"里（那里今天写的是
+   `1230 passed` 与 `1 failed, 1229 passed`，收口不许让它停在已知会复绿的那一版上）。
+
+**为什么这不是"闸门坏了一半"**：`ANALYZE` 是源库的维护动作，本来就不在本仓库的构建链里；本仓库对它的
+依赖只有那一条守卫用例，而它拒绝在"这台机器一个表都没分析过"时假装证到了新鲜度——所以红是证据在说话，
+不是回归。把 `ANALYZE` 做成脚本入口（`Makefile` 的 `demo-db-pg` 旁边、或 `scripts/demo_pg.ps1` 加一步）
+**本片不做**：034 是零代码收口片，加脚本能力要另立工单，已按这条记进 roadmap §P4 的无主账（见那里
+新增的账 12）。
+
+这一路里有真 LLM 端点与真 embedding 替身的往返，时长本来就不可复现，**收口只按计数对账**。
+
+无 DSN 那一支（roadmap §P4 验收 4 的左半边）另跑一次，逐字在 `out_unit_no_dsn.txt`：
+命令 `env -u AIWEB_PG_TEST_DSN -u AIWEB_REQUIRE_PG_TESTS .venv/Scripts/python.exe -m pytest tests/unit -q`，
+结果 **750 collected / 750 passed / 0 skipped / 0 failures**（`--junitxml` 计数，6.247s；那份逐行点阵里
+没有任何 `s` 字符）。`tests/unit` 整目录在 DSN 缺失时**照跑、一条都不跳**，这才是那条验收要的形状——
+它证的不是"跳过得干净"，而是"根本没东西需要跳"。
+
 ---
 
 ## 2. 测试分层
@@ -743,31 +1065,22 @@ Success: no issues found in 54 source files
 | 目标 | 断言方式 | 关键用例 |
 |---|---|---|
 | `token_estimate` | 值域 + 单调性 + 分支（as-built(0008)：本行六条**不由 008 全认领**。008 交付的是 heuristic 纯函数，钉了 ③④ + 五条手算值域用例（`tests/unit/test_token_estimate.py`）。as-built(P2-0010)：①② **在 P2 不做**——用户拍板"prompt 预算沿用 008 的 heuristic 口径，不引 `tiktoken`"，`AIWEB_RETRIEVAL__TOKENIZER` 键与真分词器参照一起推给引入依赖的那一档（roadmap §P4）；⑤⑥ 走的是结果集与 `TOKEN_BUDGET` 裁切，属 011（010 只做卡片段的预算裁切，用的就是这个 heuristic 函数） | ① [P4] 与 `tiktoken.encode` 计数偏差 ≤8%（`cl100k_base` 可用时）；② [P4] 强制走 heuristic 分支时中文/英文/混合三段偏差 ≤25%（宁高估勿低估）；③ 单调：文本变长则估计不减；④ 空串=0；⑤ 超长 JSON 行结果集不炸（011）；⑥ "结果集只喂摘要"路径的预算 ≤`TOKEN_BUDGET`（**as-built(P2-012)：这条改归 012**——它是 ⑨ 结论那一步的输入预算，住在 `pipeline` 而不是 executor；011 交付的是 ⑤ 那一半。**落地形态是"超预算告警、不裁切"**：`result_brief(token_budget=)` 算一遍**选中那份素材**的体量，超了就 `logger.warning`，一个字不删。三条理由：摘要分支比整表**更长**（要开 stats 表加两张头尾表），"装不下就换摘要"会把超预算变成更超预算；摘要再裁就只剩"共 N 行"，那不如让模型看全；语义与 P4 验收 6"被裁的表要记日志、不报错但要可查"同一条。用例三条——典型 60 行摘要 ≤1500（预算不是摆设，1500 用字面量而不是 `Settings`，跟着配置断等于断"它不小于自己"）、超预算仍回整表（不改道）、几百个数值列的摘要超预算时报警且内容一字不缩） |
-| RRF 融合 | 手算黄金值 | ① 两路各 `[a,b,c]`/`[c,a,b]`、k=60 → 期望顺序与分数硬编码；② 只有一路有结果时仍参与；③ `keyword_weight=0` 退化为纯向量；④ 并列名次的稳定排序（同分按表名字典序，防抖动）；⑤ 空输入返回 `[]` 不抛。**as-built(P4-031)：本行由 031 认领**，五条落 `tests/unit/test_retriever_rrf.py`（11 条，全手算：期望分数写成 `1/61 + 1/64` 这种能对着 §5.2 (3) 核的字面而不是小数）。三处与字面不同：③ **没有 `keyword_weight` 这个旋钮**——工单 031/故事 27 的落法是三路开关，"纯向量"那一档就是 `mode='vector'`（用例在 `tests/integration/test_kb_search_hybrid_pg.py`，因为它要真发一次 HTTP），所以这一格从"权重为 0"改成"只有一条腿"；②的形态相应改成"一条腿为空时融合次序就是另一条自己照抄"；④ 的 tie-break 实物是 **`table_uid` 升序**而不是"表名字典序"（CONTEXT.md「表唯一键」：它是 md5 over `\x1f` 连接的三段，稳定但不可读——与 §5.1 那三个计数键的第三键同一个来源，两处不各写一份）。④ 之外还加了一条正向钉子（验收 2）：把 `score_kw` 跨表均匀放大/平移、或把宽表分数打到窄表的一千倍，**融合名次一字不动**——若有人按 `score_kw` 排名次，009 那次"68 列宽表打穿 `order_main`"的破验收会当场复现 |
+| RRF 融合 | 手算黄金值 | ① 两路各 `[a,b,c]`/`[c,a,b]`、k=60 → 期望顺序与分数硬编码；② 只有一路有结果时仍参与；③ `keyword_weight=0` 退化为纯向量；④ 并列名次的稳定排序（同分按表名字典序，防抖动）；⑤ 空输入返回 `[]` 不抛。**as-built(P4-031)：本行由 031 认领**，五条落 `tests/unit/test_retriever_rrf.py`（12 条，031 交 11 条、032 补一条 `test_融合之后的表对象自己带着两路名次与融合分`；全手算：期望分数写成 `1/61 + 1/64` 这种能对着 §5.2 (3) 核的字面而不是小数）。三处与字面不同：③ **没有 `keyword_weight` 这个旋钮**——工单 031/故事 27 的落法是三路开关，"纯向量"那一档就是 `mode='vector'`（用例在 `tests/integration/test_kb_search_hybrid_pg.py`，因为它要真发一次 HTTP），所以这一格从"权重为 0"改成"只有一条腿"；②的形态相应改成"一条腿为空时融合次序就是另一条自己照抄"；④ 的 tie-break 实物是 **`table_uid` 升序**而不是"表名字典序"（CONTEXT.md「表唯一键」：它是 md5 over `\x1f` 连接的三段，稳定但不可读——与 §5.1 那三个计数键的第三键同一个来源，两处不各写一份）。④ 之外还加了一条正向钉子（验收 2）：把 `score_kw` 跨表均匀放大/平移、或把宽表分数打到窄表的一千倍，**融合名次一字不动**——若有人按 `score_kw` 排名次，009 那次"68 列宽表打穿 `order_main`"的破验收会当场复现 |
 | `join_graph` BFS | 图与路径（as-built(P2-0010)：**整行不属于 010**。全仓没有 `join_graph` 实现，010 只渲染候选表之间的直连边；图算法与 architecture §5.3 的边权重/环/多路径歧义/降级四条一起归**工单 014 JOIN 图切片**） | ① 无 FK 但按命名约定推出边、`confidence` 按 §5.3 加权公式算（as-built(P2-0010)：两处口径都改了。常数"=0.7"与公式互斥，已由 010 闭环——0.7 现在是**公式地板**；原举例 `order_item.order_id → order_main.id` 在演示库**推不出来**：`order_id` 的名词是 `order`，库里没有 `order`/`orders` 表（真表叫 `order_main`），命名约定不认"前缀加后缀"的自由变体。库里真实存在的那条推断边是 `user_activity_log.product_id → product.id`（两侧同为 `INT`，实测算得 **1.00**），拿它当例）；② 自环 `parent_id` 不产生 1-hop 自引用；③ hops=2 时最长路径不超 2；④ 环（A→B→C→A）不死循环、路径去重；⑤ 桥表扩展：问 A、D 两表时能拉进 B/C，且 `path=[A,B,C,D]` 顺序可渲染进 prompt；⑥ 不可达时返回"需笛卡尔积"标记而不是硬连；⑦（010 转来的债）表度 > `MAX_JOIN_DEGREE` 的表**只禁当桥、不禁当端点**（它的直连边照旧进【可 JOIN】）——as-built(P2-0014)：本行**由 014 认领并加了第七行**；`hops` 数的是**桥表张数**（不是边数），跳数定上限、§5.3 的边权重只在上限内定胜负、权重再并列才算 `ambiguous`；图**存方向、按无向扩展**（真实 FK 恒为子→父，按有向可达则演示库除"子→父"一跳外一律不可达）；缓存键 `(datasource_id, database_id)`、同步终局后按库精确失效。**用例落点**：①~⑦ 全部在 `tests/unit/test_join_graph.py` 用手算图跑纯函数（本行口径"不依赖真库"），另加 `tests/integration/test_join_graph_rows.py` 钉唯一真 IO——读 `meta_relation` 的查询：演示库真边上 `payment_record↔product` 经 `order_main`+`order_item` 两张桥表可达、`category.parent_id` 自环不产生 1-hop 自引用、`user_activity_log→product` 带 1.00。写侧的字段度只做**告警**不丢边（丢弃分支在现行减法下不可达，理由见 architecture §5.3 的 as-built(P2-0014)），钉在 `tests/unit/test_sync_infer.py`（六条，`high_degree_fields` 的门槛是**严格大于**）+ `tests/integration/test_sync_pg.py`（断的是同步**响应**里的 `warnings`：`join_field_too_generic` 恰好一条、detail 带"出现在 10 张表"，而 `counters.relations_inferred == 9` 一条不少）。**as-built(P2-014)：本行已交付**——公共表面是 `join_graph.py` 的 `load_relations`/`graph_for`/`expansion_for`/`structure_hints`/`joinable_edges`/`invalidate` **六个**入口（纯函数 `build_graph`/`expand` 由单测直接钉）。①~⑦ 落 `tests/unit/test_join_graph.py`（**20 条**，全手算图）：验收 ①~⑦ 各一条，加的是门槛边界那一格（度 8 不抑制、度 9 抑制，且用例先断"度确实是 9"再断行为——门槛写成 `>=` 时不会假过）、自环那条钉的是 `number_of_edges() == 0`（"进图后被特殊对待"和"根本不进图"在路径断言上分不出来）、**同一对列上 `manual` 与 `extracted` 并存**时的覆盖顺序（真库的 `uq_meta_relation_key` 认这三档，不钉就是后加入的悄悄赢）、结构提示不受度门槛管、缓存三条（按库分键 / 失效只清那一个库 / 有条数上限）与"命中缓存不查库、但边变了只能靠失效"。真库那一半落 `tests/integration/test_join_graph_rows.py`（**8 条**，用例自己插行、不依赖演示库当前状态）：`payment_record↔product` 穿两张桥表、`hops=1` 时那一对就是连不上、`category` 自环照常参与跨表、0.700 那档被门槛筛掉、候选跨两个库时那一对按 `needs_cartesian` 报、新落库的边要等同步失效才进图。缓存失效落 `tests/integration/test_sync_cache_pg.py`（3 条：成功清、partial 只清提交过的库、一个都没写成则一个都不清），接线那一半落 `tests/integration/test_pipeline_orchestration.py`（**5 条**：桥表卡片被补查且进守卫白名单、**补不出卡片时整条路径撤下而不是留半条**、`hops`/`max_degree` 真从 `Settings` 传下去而 `structure_hints` 两个都不吃、单候选不降级、两候选零路径才降级）。真链路一条实录见 architecture §4.1 的 as-built(P2-014)。 |
 | `chart_advisor` | 规则决策表 | 时间+数值→line、类别(NDV≤12)+数值→bar、NDV>12+数值→bar(取 top10 + "其他")、双数值→scatter、单行单值→`kpi`、全 NULL 列→table only、行数 >200→不画图；`EChartsOption` 结构快照（键存在性，不比像素）。as-built(P2-012 开工前拍板)：本行**由 012 认领**（此前 architecture §2 的目录树里挂着 `chart_advisor.py` 却没有任何工单写它，roadmap P8 验收 5 是它的 UI 双证、不是它的出生地）。两处字面改了：① "单行单值→number" 与 architecture §4.2 的 `kpi` 是同一样东西的两个名字，**统一写 `kpi`**（`chart_spec.type` 是要进 golden 的字面，两个名字等于两条对不上的断言）；② 快照对象是**自有形状** `{type,x,series,title}`（metadata-model §2.7），不是 `EChartsOption`——翻译那一层归 P8，理由见 architecture §6.1 的 as-built |
 | PG/MySQL 类型归一 | 映射表（as-built(P3-023)：本行**由 023 交付**。用例三张——`tests/unit/test_pg_type_normalize.py`（PG 原料）、`tests/unit/test_mysql_type_normalize.py`（MySQL 原料 + `rows_to_columns()` 的接线）、`tests/unit/test_type_domain.py`（两方言共用的**那张断言表**，文件名以 `test_` 开头是为了让它真被收集执行）。规范字面全仓唯一住在 `app/extractor/type_normalize.py`（`VALUE_DOMAIN` + 两张 SYNONYMS + `compose`），`postgres_types.py`/`mysql_types.py` 只做方言原料的解析。归一落**抽取层（写侧）**：`data_type` 存归一值、`raw_data_type` 存 `COLUMN_TYPE` 原文）| PG `_text[]`/`numeric(10,2)`/`varchar(64)`/`timestamptz`/`jsonb`/`serial`/`generated always`；MySQL `decimal(10,0) unsigned zerofill`→**`numeric(10,0)`**、`enum('a','b')`→`enum`、`set`、`tinyint(1)`→**`bool`**（原行的"→bool 与否"问号已收，理由见 §9 as-built(P3-023)）、`datetime(3)`、生成列、`utf8mb4_0900_ai_ci`(8.0) 出现在 5.7 时的容错。跨方言塌成一个字面的两族：布尔（`boolean`/`tinyint(1)`→`bool`）与任意精度小数（`numeric`/`decimal`/`dec`/`fixed`→`numeric`，**值域里没有 `decimal`**，由 `test_decimal_不是归一值域的成员` 钉）。真跑那一半落 `tests/integration/test_sync_live.py` 的最后一张用例（工单 023 验收 5：演示库每一列的 `data_type` 过共享值域断言、不含空格即无修饰残留，再对八列点名比对 `(data_type, raw_data_type)` 成对）。**PG 侧的接线归 024**（PG 抽取器本体），本片只交付纯函数 + 用例 |
-| §8 三步采样的**三层**（as-built(P4-033)：纯半边 `app/extractor/sampling.py`、两方言的 `build_sql_sample`、编排 `sync_service._run_sample_stage`） | 三层分开钉，因为三处会各错各的：筛子错在"谁进了候选"，裁决错在"值域的顺序与要不要写"，编排错在"发了几条、失败时丢了谁"。SQL 形状仍钉在**假连接**上（`_rows` 是方言层唯一 I/O 出口，同上面 020/024 那两行的理由），值域**真落库**只能走 `pg`，而"真源库给的类型是什么"只有 `live` 答得出 | 纯函数 28 个用例函数（参数化展开为 **55** 条）在 `tests/unit/test_extract_sample_distinct.py`：候选筛子七条（六类都认 / `bool` 是 `boolean` 归一后的写法 / 清单外不认 / 带长度按基名判 / 数组后缀不认 / 生成列与"定义已给值域"两档不进）、裁决七条（频次降序 + 同频字面升序、恰好等于阈值仍写与超一个就不写**成对**、NULL 桶占分组但不进值域、全 NULL 不写空值域、去重后才算阈值、阈值非正数当场抛、**两格今天写同一份值域**）、`LIMIT` 表达式两条（默认阈值那条对 §8 字面 40，改阈值那条钉"它不是 40"——只写后者会两条一起漂）、SQL 形状五条 + 逐列发包与"无候选一条不发"两条 + 标识符转义三条 + 值文本化一条 + 行→组一条。编排九条在 `tests/integration/test_sync_sample_distinct_pg.py`（真元数据库 + extractor 桩）：开关那两向各一条（打开才第一次有写入点 / 默认配置下语句清单为空而作业仍 `success`）、两键真下发且改配置跟着变、超阈值那一列什么都不写且**阈值两侧各摆一列**、单表失败时其余表已写入的值域照常在场（`partial` + `errors[].detail` 的 `schema.table:` 前缀）、采样失败不碰元数据行数（注入前后同一份，钉的是"丢列不丢表"）、同一轮内新采的值域就出现在卡片「取值」段（回**整行文本**逐字对，012 那条老教训：「取值」与列名分开断会放过"取值行来自别的列"）、卡片那一步失败也带不走已提交的值域（逐表事务边界）、方言无这档能力时整步跳过不报错。**live 两条**（各跑一次真库，同 §1.9 表末两行）：真 MySQL 16 条采样 SQL / 7 列值域 / 关掉那一轮两格回 NULL，真 PG 只有 2 列拿到值域、`text` 与数组一律不碰。三条分辨力**都实跑过**（改一处、跑那一族、再改回来，结果记在这里而不是写在预期里）：
-① 把 `_COLUMN_SYNC_COLS` 里的 `sample_values` 摘掉 → **两条**红：真 MySQL 那条"关掉那一轮抹回 NULL"，
-外加 `test_单表采样失败_其余表已写入的值域照常在场`——后者红在"失败那张表的值域没被抹掉"，
-也就是分家的那个形状；
-② 把 `errors[].code` 从 `sample_failed` 改成复用 `embed_failed` → 只有那一条失败隔离红
-（`detail` 的 `schema.table:` 前缀照旧对得上，所以动的确实只有 code 那一格）；
-③ 把候选筛子的数组分支写松（`_base_name` 见 `[` 也切）→ 红的**只有**纯函数那一条
-`test_归一值里带数组后缀的不认`，**真 PG 那一发反而没红**：`product_stats_wide.top_keywords`
-那 40 行数组每行都不同，跨过阈值什么都不写，两格照样是 NULL。所以"数组不进候选"这一档的证据
-在闸内而不在 live——本片的 live 增量靠的是类型字面（`bool` 的小写、`text` 不进清单），不是这一格 |
+| §8 三步采样的**三层**（as-built(P4-033)：纯半边 `app/extractor/sampling.py`、两方言的 `build_sql_sample`、编排 `sync_service._run_sample_stage`） | 三层分开钉，因为三处会各错各的：筛子错在"谁进了候选"，裁决错在"值域的顺序与要不要写"，编排错在"发了几条、失败时丢了谁"。SQL 形状仍钉在**假连接**上（`_rows` 是方言层唯一 I/O 出口，同上面 020/024 那两行的理由），值域**真落库**只能走 `pg`，而"真源库给的类型是什么"只有 `live` 答得出 | 纯函数 28 个用例函数（参数化展开为 **55** 条）在 `tests/unit/test_extract_sample_distinct.py`：候选筛子七条（六类都认 / `bool` 是 `boolean` 归一后的写法 / 清单外不认 / 带长度按基名判 / 数组后缀不认 / 生成列与"定义已给值域"两档不进）、裁决七条（频次降序 + 同频字面升序、恰好等于阈值仍写与超一个就不写**成对**、NULL 桶占分组但不进值域、全 NULL 不写空值域、去重后才算阈值、阈值非正数当场抛、**两格今天写同一份值域**）、`LIMIT` 表达式两条（默认阈值那条对 §8 字面 40，改阈值那条钉"它不是 40"——只写后者会两条一起漂）、SQL 形状五条 + 逐列发包与"无候选一条不发"两条 + 标识符转义三条 + 值文本化一条 + 行→组一条。编排九条在 `tests/integration/test_sync_sample_distinct_pg.py`（真元数据库 + extractor 桩）：开关那两向各一条（打开才第一次有写入点 / 默认配置下语句清单为空而作业仍 `success`）、两键真下发且改配置跟着变、超阈值那一列什么都不写且**阈值两侧各摆一列**、单表失败时其余表已写入的值域照常在场（`partial` + `errors[].detail` 的 `schema.table:` 前缀）、采样失败不碰元数据行数（注入前后同一份，钉的是"丢列不丢表"）、同一轮内新采的值域就出现在卡片「取值」段（回**整行文本**逐字对，012 那条老教训：「取值」与列名分开断会放过"取值行来自别的列"）、卡片那一步失败也带不走已提交的值域（逐表事务边界）、方言无这档能力时整步跳过不报错。**live 两条**（各跑一次真库，同 §1.9 表末两行）：真 MySQL 16 条采样 SQL / 7 列值域 / 关掉那一轮两格回 NULL，真 PG 只有 2 列拿到值域、`text` 与数组一律不碰。三条分辨力**都实跑过**（改一处、跑那一族、再改回来，结果记在这里而不是写在预期里）：① 把 `_COLUMN_SYNC_COLS` 里的 `sample_values` 摘掉 → **两条**红：真 MySQL 那条"关掉那一轮抹回 NULL"，外加 `test_单表采样失败_其余表已写入的值域照常在场`——后者红在"失败那张表的值域没被抹掉"，也就是分家的那个形状；② 把 `errors[].code` 从 `sample_failed` 改成复用 `embed_failed` → 只有那一条失败隔离红（`detail` 的 `schema.table:` 前缀照旧对得上，所以动的确实只有 code 那一格）；③ 把候选筛子的数组分支写松（`_base_name` 见 `[` 也切）→ 红的**只有**纯函数那一条`test_归一值里带数组后缀的不认`，**真 PG 那一发反而没红**：`product_stats_wide.top_keywords`那 40 行数组每行都不同，跨过阈值什么都不写，两格照样是 NULL。所以"数组不进候选"这一档的证据在闸内而不在 live——本片的 live 增量靠的是类型字面（`bool` 的小写、`text` 不进清单），不是这一格 |
 | 卡片模板 golden | 快照 | `tests/fixtures/prompts/kb_card__{table}.expected.txt`，`{{ }}` 空白控制要断言（不然 diff 全是空白）；覆盖：无注释表、60 列宽表、纯视图、含 enum 列、无 PK 表、中文/反引号/`a b` 空格表名（转义必须可见）。as-built(0008)：宽表的第 2/3 段各多一份快照，命名 `kb_card__{table}__seq{n}.expected.txt`（原模式只有一个 `{table}` 槽位，而一张宽表要出 3 份文本）；快照是**按 §5 模板手写**的，不是从渲染器 dump 的——dump 只能证明"以后没变"，手写才证明"渲染出来的就是文档那一份"。六个场景落 `tests/unit/test_kb_card_golden.py`，空白控制是一条独立断言（首尾裸换行 / 空行 / 行尾空白 / 行首缩进四类各钉一次） |
 | `prompt_builder` | 结构断言 | 段落顺序（角色→硬约束→schema→JOIN→术语→示例→问题→输出格式）、"必须带 LIMIT"与"只能引用给定的表"两句恒定存在（as-built(P2-0010)：原写的是"禁止引用未给出表"，与 roadmap §P2 踩坑 ④ 的措辞不一致，而 golden 要锁字面，用户拍板统一成后者）、few-shot 段在预算不足时被**整段**丢弃。<br>as-built(P2-010 双轴审查后补三条)：① **golden 逐字节**锁整段 user 消息（`tests/fixtures/prompts/nl2sql__order_main.expected.txt`，手写不是 dump）；② 预算估算用的**行形状**与 j2 模板渲染出的行**同源**——`_term_line` / `_example_line` 各由一条"手写期望行 == 渲染在场 == 估算式产出"的三段断言钉住，改模板改不出漂移；③ ≥0.8 门槛的辖区**只是【可 JOIN】清单**，卡片【可关联】行里的同一条低置信边照旧在场（口径见 architecture §5.3）；边按**起点**筛不按终点筛，目标表被裁掉时标题那句"不要写进 SQL"就是唯一防线 |
 | `pipeline` 编排 | 接缝在 `pipeline.ask()`，LLM 走 respx、检索走 `Retriever` Protocol 的桩 | as-built(P2-012)：本行由 012 新增。① 顺序：检索 → 组装 → 生成 → 守卫 → 执行，**守卫在 executor 被调用之前**（spy 断言"守卫拒绝时 executor 一次都没进"，不是看日志）；② 早退三类各留一行 `chat_messages`：`NO_SCHEMA_FOUND` / 畸形返回 / `sql_guard_rejected`，且都不落 CSV；③ 素材齐料：`build_prompt` 收到的 `token_budget`/`few_shot_budget` 来自 `Settings`（010 的硬接线义务，漏传就是静默不裁切，用例直接断言装配点传给 `build_prompt` 的关键字参数值）；④ 畸形返回四档：围栏与前后附解释**能恢复**出同一条 SQL、截断**不恢复**且抬 `llm_bad_response`、`clarify` 非空不执行；⑤ 每步耗时在场（roadmap P2 踩坑 ② 那句"卡在哪一步"的可观测面）；⑥ **⑦ 的入参键集合被钉死**（多一个键就是调用方能传进来的一个入参，`row_limit`/`max_cell_chars`/`result_dir` 一旦被请求体摸到，L4/L3 口径与 ADR-0004 同时作废），`password` 断的是 `decrypt_secret` 那条线；⑦ **跨源只取相关度第一名的那个源**，断的是"补卡片的请求只带同源 uid"（断 prompt 里没它是桩造的假象——桩对任何 uid 都回同一张表）。<br>as-built(P2-012 施工后)：用例落点**不是工单原写的 `tests/unit/test_pipeline.py`**，而是 `tests/integration/test_pipeline_orchestration.py`（`pg` marker）——早退三类的验收本体是"留下一行 `chat_messages`"，不落库的断言只证明了返回值、没证明留痕。真跑一次 LLM 的那条是 `test_pipeline_live.py`（`live` marker）。**当时已知的洞**：模型按 ④ 模板写了 `LIMIT` 时守卫不补 `+1` 探针，`truncated` 恒假，本行 ⑤ 的耗时与 ② 的早退都真、只有这一格是死的——**2026-09-29 同日拍板闭环**，守卫改成"钳位 + 探针"（safety §1.2 ⑦ / §9.2 ⑧），撞上限那一支的 `truncated` 活了；模型自己写小于上限的 `LIMIT n` 那一支仍无探针、恒假，是有意的语义。<br>**as-built(P2-013)**：本行 ② 的三类早退补了两件东西。① **守卫拒绝那一支打了真 SQL**——用例 `test_模型硬产出_DROP_时守卫拦下且一次都不进执行器` 让路线回复直接产出 `DROP TABLE orders`，断 `executor` spy **零调用**、`sql_final is None`、违规 code `top_level_not_select`、落库行保留模型 `sql_raw` 原文、且结果目录**空**（没执行就不该有文件）。② **拒答文案有断言**——`no_schema_found` 那一行的 message 必须同时含"补录表注释 / 检查授权 / 同步"三个词（用例断的是这三个**词**，不是整句），CLI 侧另由 `test_demo_ask_print.py` 三条用例钉"每一种拒答都跟一行下一步动作"、"守卫拒绝那步说清了没执行也没落文件"、"无匹配表那步给的是今天真能走的三条动作"（`POST /api/sync/jobs` 而不是界面按钮）；分层本身还有一条反断言——服务端 message 里**不许出现"点此"**（界面话属于 P8 那一层，见 architecture §4.1 的 as-built(P2-013)） |
 | L1 检索三件纯函数（as-built(0009)：`query_terms` / `column_hits` / `rank_candidates`，`app/services/nl2sql/retriever.py`） | 手算黄金值，不碰 DB | ① 切词：`订单金额是多少` 只发二字滑窗（7 字 > 整段阈值 4）、`订单金额` 整段+滑窗都发、`pay_amount` 出整段与两个子词、单字段被丢；② 命中：同一列被两个词命中算两行理由但只算**一列**，比对字段按 `column_name → comment_raw → comment_zh` 顺序各查一次，判定用"子串 + casefold"以与 SQL 侧的 `ILIKE '%term%'` 严格同构；③ 排序：主键**命中的不同词数**、次键命中列数、`table_uid` 收尾（architecture §5.1 那条 as-built 注），同表多卡 `boost=0.05×(n-1)` 只进 `score_kw` 不进排序键；④ `k` 是名额上限；⑤ 零命中返回 `[]` 而不是猜一张表（阶梯 L4 的判据，013 要用） |
-| 向量路的 SQL 形状与实现切换缝（as-built(P4-031)：`hnsw_tuning_statement` / `vector_recall_statement` / `_retriever_for`，仍在 `app/services/nl2sql/retriever.py`） | 不连库钉**形状**、`pg` 那一路钉**行为**、外加一条缝的机械检查——三份各有理由 | **为什么形状要单独钉**（与 029 的 `test_sync_embed_sql.py` 同一条理由）：`pg` 那一路看得见"召回对不对"，看不见"顺手漏了一格谓词"，而向量路漏掉 `index_profile_id` 照样返回结果，只是新旧两套档案的向量混进同一个 `ORDER BY`（ADR-0012 立论要防的正是它）——形状错了但结果看着正常，正是这一族 bug 唯一能不靠读代码抓住的时刻。形状落 `tests/unit/test_retriever_vector_sql.py`（7 条）：① 距离算子排在**档案那一维的那一列**上、另一根列在 SQL 里一字不现（1536/1024 两档参数化）；② `ORDER BY` 是距离升序且选回的原料够 `_vector_table` 折成表；③ `index_profile_id = :p` 与 `datasource_id IN (可见源)` 两格谓词都在 WHERE（决策 ⑨/ADR-0008 的落点）；④ `<列> IS NOT NULL`（ADR-0003「卡片先于向量」的读侧一半——PG 把 NULL 排在升序**末尾**，少了这一格"还没灌向量"就伪装成"最不相关"）；⑤ `LIMIT` 的值就是请求给的 `top_vector`；⑥ `ef_search` 以 `set_config(…, true)` 下发且是**绑定值而不是拼接**（它的源头是请求体，拼串等于在一条每次检索都发的语句上开注入面）；⑦ `iterative_scan` 与 ef 在**同一条**语句里（分开发就是"设了 ef 没设扫描模式"那种半生效，而 SQL 文本上看不出区别）。行为落 `tests/integration/test_kb_search_hybrid_pg.py`（12 条，靶是 028 的闸内替身：真进程真 socket），向量名次由用例**摆出来**（`q / one-hot / -q` → 余弦距离严格 `0<中<2`）、融合次序手算、`SET LOCAL` 与召回同事务由"四次 `SHOW` 夹一次 `search()` 且全在同一条连接"钉。缝落 `tests/unit/test_retriever_seam.py`（3 条，验收 5）：两条实现的签名与协议逐字相同、`Hybrid`/`ef_search`/维度字面不出现在调用方（`pipeline.py` 与 `search_preview()`）、全仓构造向量化实现的语句只有一处。 |
+| 向量路的 SQL 形状与实现切换缝（as-built(P4-031)：`hnsw_tuning_statement` / `vector_recall_statement` / `_retriever_for`，仍在 `app/services/nl2sql/retriever.py`） | 不连库钉**形状**、`pg` 那一路钉**行为**、外加一条缝的机械检查——三份各有理由 | **为什么形状要单独钉**（与 029 的 `test_sync_embed_sql.py` 同一条理由）：`pg` 那一路看得见"召回对不对"，看不见"顺手漏了一格谓词"，而向量路漏掉 `index_profile_id` 照样返回结果，只是新旧两套档案的向量混进同一个 `ORDER BY`（ADR-0012 立论要防的正是它）——形状错了但结果看着正常，正是这一族 bug 唯一能不靠读代码抓住的时刻。形状落 `tests/unit/test_retriever_vector_sql.py`（7 个函数 / 8 条收集，其中一条是参数化）：① 距离算子排在**档案那一维的那一列**上、另一根列在 SQL 里一字不现（1536/1024 两档参数化）；② `ORDER BY` 是距离升序且选回的原料够 `_vector_table` 折成表；③ `index_profile_id = :p` 与 `datasource_id IN (可见源)` 两格谓词都在 WHERE（决策 ⑨/ADR-0008 的落点）；④ `<列> IS NOT NULL`（ADR-0003「卡片先于向量」的读侧一半——PG 把 NULL 排在升序**末尾**，少了这一格"还没灌向量"就伪装成"最不相关"）；⑤ `LIMIT` 的值就是请求给的 `top_vector`；⑥ `ef_search` 以 `set_config(…, true)` 下发且是**绑定值而不是拼接**（它的源头是请求体，拼串等于在一条每次检索都发的语句上开注入面）；⑦ `iterative_scan` 与 ef 在**同一条**语句里（分开发就是"设了 ef 没设扫描模式"那种半生效，而 SQL 文本上看不出区别）。行为落 `tests/integration/test_kb_search_hybrid_pg.py`（14 条——031 交 12 条、032 在同一个文件里补两条，本轮 `--collect-only` 实数；靶是 028 的闸内替身：真进程真 socket），向量名次由用例**摆出来**（`q / one-hot / -q` → 余弦距离严格 `0<中<2`）、融合次序手算、`SET LOCAL` 与召回同事务由"四次 `SHOW` 夹一次 `search()` 且全在同一条连接"钉。缝落 `tests/unit/test_retriever_seam.py`（3 条，验收 5）：两条实现的签名与协议逐字相同、`Hybrid`/`ef_search`/维度字面不出现在调用方（`pipeline.py` 与 `search_preview()`）、全仓构造向量化实现的语句只有一处。 |
 | `executor`（as-built(P2-011)：`app/services/nl2sql/executor.py`，会话级只读 + 超时 + 截断 + csv 落盘） | 离线纯函数手算 + live 真连演示库 | 离线八件（`tests/unit/test_executor_*.py`，共 31 用例）：① `serialize_cell` — Decimal 按 `str` 原样回（`"0.30"` 不变 `"0.3"`）、naive/aware `datetime` 走 `isoformat()`（前者无偏移后缀、后者保留 `+08:00`）、`date` 走 `YYYY-MM-DD`、`time` 走 `isoformat()`（TIME 列 → `"14:30:00"`）、`timedelta` 按 **MySQL TIME 字面量** `[-]H:MM:SS` 手工拆（`1:00:00`/`-1:00:00`/`30:00:00`/`0:00:45`——**不是** `str(timedelta)` 的 Python 规范形 `"-1 day, 23:00:00"`，否则 §3 第 10 步的逐位对数对不上）、`bytes` 分 `<binary 3B>` 与 `<binary 1.2KB>` 两档、超 `max_cell_chars` 的 str 截断、int/float/bool/None 原样透传；② `split_truncated` — 1001 行 & `row_limit=1000` → `truncated=True` 且末行为探针被丢、500/1000/`[]` 三种边界都不截断；③ `new_run_id` + `result_csv_path` — 形状 `[A-Za-z0-9]+`（生成器与校验器**共用一份正则**，防止"生成的名字过不了自己的门"），越界 run_id（`../etc/passwd`、`/abs/x`、`a\x00b`、`a/b`、`..`、`""`）一律 `ValueError`；④ `write_result_csv` — `utf-8-sig` BOM 头幂等回读、自动建父目录、逗号+引号 roundtrip；⑤ `enforce_readonly_grants` — SELECT-only 通过、`INSERT/UPDATE/DELETE ON ai_web_demo.*` 或 `ALL PRIVILEGES ON *.*` 抛 `ReadonlyCapabilityMissing`；⑥ `classify_source_error` — errno 3024/`"57014"` 翻成 `QueryTimeout`（detail 必须同时含 `timeout_ms` 数值与来源键名），非超时的 1146 原样 re-raise；⑦ `session_statements` — MySQL 顺序 `READ ONLY` 必须**第一位**、`wait_timeout` 用 `timeout_ms//1000+10`（15000→25），PG 走 `SET statement_timeout = '<n>ms'`；⑧ `resolve_timeout`（双轴审查收口新增）— 列上有值走 `data_sources.timeout_ms`、列上缺值落 `AIWEB_QUERY__TIMEOUT_MS` 且值必须 >0；**来源判定不在调用方**（`execute_readonly` 不收这两个入参）；⑨ **`resolve_result_file`**（as-built(P2-013)，下载侧那半边，`tests/unit/test_executor_path.py`）——三道门（名字不合法 / realpath 逃出目录 / 不是文件）塌成**同一档** `ResultFileUnavailable`，用例直接断 `{(code, message, status_code)}` **集合只有一个元素**且 `detail is None`（三种失败对外逐字相同，任何差别都是"run_id 是否存在"的 oracle），四个入参**逐字对上三道门**。形状门**复用写入侧的 `result_csv_path`** 而不是另写一份正则，它的 `ValueError` 在这里被翻掉——不翻就是客户端输入打出 500。门②（realpath 逃逸）**在本机真跑**：`os.symlink` 要特权（winerror 1314）但 **junction 不要**，而守卫判的是 `resolve()` 后的落点、与链接类型无关——`test_目录里的链接指向外面时拒绝` 用 junction 造逃逸，并断服务端日志出现 `reason=realpath 逃出目录`（异常种类分不出门②与门③，判定顺序被换掉时用例照样绿，所以要钉日志）；`test_结果目录自己是指向别处的链接时照常放行` 钉反面（目录级链接不算逃逸，运维挪结果盘的正当做法）。用例先试 `os.symlink` 再退 junction，两者都建不出来才 skip——skip 只可能意味着这台机器造不出该文件系统对象。**仍未证明的只剩一格**：指向**文件**的符号链接这一具体形态本机复现不出来（缺的是构造手段，不是代码分支），见 safety §7 的 as-built。<br>live 四条（`tests/integration/test_execute_live.py`，全 `pytest.mark.live`）：① 只读查询跑通 + Decimal/DATETIME 序列化 + csv 落在服务端拼的 `tmp_path` 内（不在 `data/results/`）；② `row_limit=5` 时 `truncated=True`、csv 恰好 6 行（1 表头 + 5 数据）；③ **引擎级写拒绝 ≠ 应用级写拒绝分开断言**（验收 ①）——应用侧 `check("update ...")` 抛 `SqlGuardError`，绕过守卫直喂 `execute_readonly` 时源库自己拒：`DBAPIError.orig.args[0] in (1792, 1142)`，**刻意不收 1046**（那说明是连接没选库的配置错、不是"写被拦"，混进来这条就假过）；④ **超时真中断**（验收 ②）——`select sleep(1) from order_item limit 5` 每行都睡 1 秒踩行边界（`select sleep(2)` 单行不响应，`count(*)` 也只吐一行；这是 MySQL `MAX_EXECUTION_TIME` 的坑，测试 docstring 已钉），命中 3024 → `QueryTimeout` 且 detail 含 `data_sources.timeout_ms` + `300`（键名由执行器从行上自己判出，不是用例传的） |
 | `sync_job_event` → SSE 那一条链（as-built(P3-017)：`app/core/sse.py` 的 `sse_format` / `progress_frame` / `stream_job_events` + `job_queue.subscribe`） | 读侧**只碰元数据库**，不碰源库；写侧与读侧分两处钉，因为它们的失败模式完全不同（写侧错在"帧与库不符"，读侧错在"攒到底才吐"） | ① **帧形状**：带游标的帧是 `id: <seq>\nevent: progress\ndata: {…}\n\n`，`id` 在**第一行**（`Last-Event-ID` 靠它，顺序写反了浏览器存不到游标）；流的第一个块是 `retry: 3000`，收尾是 `event: done` 且**没有 `id`**。负载在 `progress_frame` 里**摊平一次**（`{stage, phase, done, total, base_table, view, cards, payload}`），端点里再展一遍就会出现"库里改了帧没改"的分叉。② **游标补读**：`read_events` 只有 `WHERE job_id=:j AND seq>:c ORDER BY seq` 一个形状；用例先读到 seq=2、断开、带 `?cursor=2` 与 `Last-Event-ID: 2` 各重连一次，两边都从 seq=3 起（一条不丢也不重），参数与头冲突时**查询参数赢**，两个都给不成数字时**回全量**而不是 400。这一条是"选事件表而不是纯推 NOTIFY"的全部理由。③ **心跳**：常量 `PING_INTERVAL_S == 15.0` 单独钉一次（它是文档承诺的数字，跟着它断等待时长等于断"它不小于自己"），行为侧把生成器的 `ping_after_s` 设成 0.02 逼出三帧 `: ping\n\n`，不真等 15s。④ **叫醒**：`subscribe` 用的是 `asyncio.Event`（去重语义免费：一个作业被叫醒十次和一次要做的事完全相同），且必须挂在**一条专用连接**上——会话自己那条连接会被读循环每轮的 `rollback()` 归还，池化下交给下一个借用者、NullPool 下直接关掉，两种结局都是"进度永远不动"且一条都不报错。引擎从 `session.bind` 取而不是 `get_bind()`（后者给的是同步 `Engine`，对它的 `.connect()` 抛 `MissingGreenlet`）。⑤ **终局判据是 `sync_jobs.finished_at` 那一格有没有被点上**，不是 `status`：终局三个值在 `schemas/sync.py` 已有一份，读侧再抄一份就是"两处规则各自漂移"的老路（010 那族教训）。⑥ **会话在流里开、在流里关**（`get_stream_sessionmaker` 给的是**工厂**不是会话：FastAPI 会在 `StreamingResponse` 开始迭代之前就关掉 yield 型依赖，端点里再 `async with` 一次是唯一活法，测试也必须覆盖这个依赖）。⑦ **真进费用例**（`test_sync_events_live.py`，`live`）：三个真进程（API + worker + pytest 这个"盯进度条的人"），顺序是**先入队 → 再开流 → 最后才放 worker 出门**，拿到首帧那一刻**当场**回库读 `finished_at` 断它还是 NULL——"首帧在作业结束之前到达"这句话在 `httpx.ASGITransport` 上没有对应的事实（那个传输把 body 片段攒进 list 才返回，`resp.is_closed` 恒真），所以这一条必须走真 HTTP。用例落点：`tests/unit/test_sync_stage_vocabulary.py`（4 条，映射 9 值逐条写死）+ `tests/unit/test_sync_event_ddl.py`（6 条）+ `tests/integration/test_sync_events_pg.py`（5 条，写侧）+ `tests/integration/test_sync_events_sse_pg.py`（6 条，读侧）+ 真进程那 1 条。演示库上的分母实录 `total=10`（9 表 + 1 视图，不是 `SHOW FULL TABLES` 的 11） |
 | `job_queue` 两条语句的**形状**（as-built(P3-016)：`app/services/job_queue.py` 的 `enqueue_stmt` / `claim_stmt`） | 编译成 PG 方言文本比对，**不执行**（与 `test_sync_upsert_sql.py` 同一条理由：进程分离的三条口径——互斥靠 `ux_sync_running`、claim 靠**条件更新行数**、排队中的 pending 也算未结束——全是"语句长什么样"的事，写错一个谓词在真库上照样可能绿。`claim` 少外层那个 `status='pending'` 就是两个 worker 同时抽同一个源，而这一格要到 019 的僵尸回收真跑起来才看得见） | ① 入队只写 `pending`：`INSERT` 里不许出现 `running`，也不许顺手把 `started_at` / `heartbeat_at` 点上（那两列是 claim 的钟，也是"响应返回时这一轮还没开始跑"的可断言证据）；② claim 两处条件缺一不可：`FOR UPDATE SKIP LOCKED`（多 worker 各拿一个、谁都不等谁）+ 外层 `AND status='pending' RETURNING`（行数才是"我抢到了"的判据），且终局那几列（`finished_at`/`counters`）不许出现在这里。行为侧的七条在 `tests/integration/test_sync_enqueue_pg.py`（202/409/第二 worker 空手/源删后级联带走 job 行/终局三样/入队顺序） |
 | `run_worker` 一轮心跳的三条语句（as-built(P3-018)：`scripts/run_worker.py` 的 `heartbeat_update_stmt` / `reclaim_update_stmt` / `retention_delete_stmt`） | 同一套手法：编译成 PG 方言文本比对，**不执行**。三条口径全是"语句长什么样"的事——心跳只动 `heartbeat_at` 那一格、回收往 `errors`（`jsonb`，**没有 `error` 这一列**）里**追加**、保留期只删 `sync_job_event`——写错一个谓词或把追加写成覆盖，在真库上照样可能绿（`tests/unit/test_worker_reclaim.py`，7 条） | ① 刷钟那条里 `finished_at`/`errors`/`failed` 一个字都不许出现（它是"我还活着"的声明不是终局），且带 `status IN ('pending','running')` 守卫：收尾先落定时这一句必须打不中；② 回收那条逐字对上 §6 表格原句——`errors = (errors || CAST('[{"code":"reclaimed","detail":"heartbeat 超时"}]' AS JSONB))`、`heartbeat_at < now() - make_interval(secs => N)`、`RETURNING id` 三者缺一不可，条目常量 `RECLAIM_ENTRY_JSON` 直接抄文档字面量（`json.loads` 比回去只能证明序列化没变形，证明不了那两个词没被改写）；③ **阈值是入参不是字面量**：换 42 重编译，文本里必须出现 42 且不出现 180；④ 保留期那条编译文本里只许出现 `sync_job_event`，出现 `sync_jobs` 就是灭迹。⑤ **三个键各喂给哪个参数**：`cadence(settings)` 是那条映射的唯一住处（`loop()` 里不出现第二个 `settings.extract.*`），用例拿三个互不相同的数（11/181/31）断它——这条是补上来的：把 `interval_s` 与 `stale_seconds` 互换后跑完整轮，**只有这一条红**（真效果是刷钟 181s、回收阈值 11s，正在跑的作业被自己的 worker 判成僵尸）。⑥ **阈值不是整数就当场抛**：`180.7` / `True` / `"7; DROP TABLE x"` / `None` 四种都从**公共** builder 驱动，期望 `(TypeError, ValueError)`；同一用例再断 `180` 正常编译，否则"全拒"和"没生效"分不开。理由是实测：`int()` 式闸门会把 180.7 悄悄截成 180，而 `make_interval` 那条语句的全部语义就是"差多少秒算僵尸"。行为侧五条在 `tests/integration/test_worker_heartbeat_pg.py`：主事务未提交时换连接已可见、一轮循环改判 + 补终局事件、NOTIFY 丢失时最迟一个心跳周期仍读到、179s 不动 / 181s 判失败 / `pending@NULL` 不杀、保留期删 31 天那行且 `data/results/` 清单快照逐字节相同 |
 | MySQL 读侧的**发送切片**（as-built(P3-020)：`app/extractor/mysql.py` 的 `slice_names` + `collect()` 的批循环 + `SourceManifest.batches`） | 切片是纯函数、批是编排，两层分开钉：`collect` 的批语义钉在**假连接**上（`_rows` 是方言层唯一的 I/O 出口，同 §2.1 `test_extract_mysql_client` 那条理由），真库那一份钉在拦下来的语句清单上。为什么必须两层：假件看得见"第 k 条昂贵查询收到哪几个表名"，真库只看得见条数与顺序，而这两件都不是"总共发了几条" | 单测 11 条在 `tests/unit/test_extract_mysql_batching.py`：① 验收 2 那三个边界各一条（整除无空末批 / 末批只剩 1 张 / `batch>N` 退化成一批，外加空名单回 `[]` 而不是 `[[]]`——`collect` 靠"没有表就不发 C/D/E"躲开 `IN ()` 这个语法错误）；② `batch_size` 非正整数当场抛（`0` 会让切片要么死循环要么空清单）；③ 三条昂贵查询各 4 发、**每发各自的名单**——那四刀是手写的字面量，不写 `slice_names(VISIBLE, 3)`：用被测的那把刀去算刀口，红了也只是"刀和期望一起改错"；④ 反注入两条一起断（占位符 `:tbl_0..n` 与这一批的表名**逐一对应**，且语句文本里一个真表名都不出现——只断前者的话"`IN (:` + 拼接"那种形状照样过）；⑤ 退化路径与分批前同形（默认 200 在 10 个对象上必须退回"一 schema 四条"，防"分批把自己变成永远多发"）；⑥ 分批不改归并结果（批大小 3 与 200 抽出的列/索引逐个相同）；⑦ `MAX_TABLES` 仍在昂贵查询**之前**判（断的是 IS 语句**条数**==1，不是错误码——把门槛挪到 C/D/E 之后也照样抛同一个错）；⑧ 批间隔用耗时下限钉（120ms×3 个间隔 → `>=0.36`，并留 `<0.6` 的上限排除"每批之前都睡"）。live 两条在 `tests/integration/test_extract_mysql_live_batches.py`（验收 1/3/4/5/7）：批名单同时出现在事件负载与那三条昂贵查询的 `IN` 清单里，两边逐批相等；间隔 250ms 时 4 批之间三个间隙各 `>=0.25s`（实测同一份源：间隔 0 那一轮 `duration=1125ms`、间隔 250 那一轮 `1985ms`，差出来的就是那三次让气）。名单**不硬写"第一批是哪三张"**——§8.1 B 没有 `ORDER BY`，交付顺序不是源库的承诺；断的是每批的成员（批大小逐个钉 3/3/3/1、批间不重叠、并起来正好是 §1 那份 10 个对象的名单）。**验收 5 比的是另一次真跑而不是 008 的 golden**——那七份快照喂的是手工摆出来的 `meta_*` 输入（见上面卡片 golden 行），拿它对演示库等于比两件本来不该相等的事；做法是先按 200 跑一轮、再按 3 跑一轮，比五张 `meta_*` 行数与全部卡片 `text_md` 逐字符，只放行 `counters.batches` 那一格变化。**同一轮还比索引那条链的形状**（验收 7"P3 只补'分批后每批都还读到'那一格"）：两侧各取一份按 `(表名, 索引名, SEQ_IN_INDEX)` 排序的 `(列名, SUB_PART, cardinality 是否非空)` 清单逐位相等，再对分批那一次断每一行 `cardinality` 都非空、且全库唯一那处前缀索引 `product.name(32)` 仍在场。比"非空"而不比**数值**：`CARDINALITY` 是 InnoDB 的采样估算，两次真跑之间它可以合法地变，把"分批没改变结果"钉在它上面就变成看运气发红。这跟 007 那条 `test_sync_live.py::test_验收2_cardinality_与_sub_part_真的有非空值` 不互替——那一条走的是默认批大小（10 个对象一批装完），证的是链通着；"切成四批后每批还读得到"只有走分批那条路才答得出。实测变异：D 条投影换成 `NULL AS CARDINALITY, NULL AS SUB_PART` 后这条 live 用例红在 `has_cardinality` 那一行（007 那条同步变红，两个靶心各自独立）。**两个键都走真配置通道**（`monkeypatch.setenv` + `get_settings.cache_clear()`，同 021 的 `max_tables_one`）：桩掉 `get_settings` 的话"`run_sync` 有没有把配置传给方言"就永远验不到。实测过——把 `sync_service.py:1106` 那行换成硬编码 `200`：`test_sync_events_pg.py` 只红 `test_分批的两个配置键真有读取点_每批的表名随_tables_帧交回` 那一条，live 两条**一起红**（`counters.batches` 变成 1），而方言层那 11 条单测全绿——它们自己传 `batch_size`，本来就不该替编排层背书 |
-| PG 抽取器的**两半**（as-built(P3-024)：不连库那半是 `app/extractor/postgres.py` 的五条 §8.2 SQL 与行→`Raw*` 映射，加上 `sync_service` 的方言驱动表 `_DIALECTS`；live 那半是 §1.6 那份对账清单） | SQL 文本与映射钉在**假连接**上（`_rows` 仍是方言层唯一的 I/O 出口，同上面 020 那行的理由），501 分发与"列写法跟着 kind"钉在纯函数 + 真 `run_sync` 上 | **30 条不连库单测分两张**：`tests/unit/test_extract_pg_map.py` 14 条吃 §8.2 那条查询**自己的别名**当行键（假件与真 SQL 同形才有意义），钉的是 serial 与 identity 分得开（`default_value` 是 `nextval(...)` 那一串）、`_text[]`/`numeric(10,2)[]` 走 023 的归一而 `raw_data_type` 留原文、`modifiers` 白名单只认 `varchar`/`bpchar`/`numeric` 且数组一律 `NULL`、表达式索引那一位的 `column_name` 是 `NULL`（§8.2 D 的分支）、视图 `last_analyze_at` 恒 `NULL` 而表取 `last_analyze`/`last_autoanalyze` **较晚者**（§2.4 注④ 的 PG 半边）、`idx_scan` 只进 `cardinality_hint` 不进 `cardinality`（单位不同）。`tests/unit/test_extract_pg_client.py` 16 条把编排钉在同一颗桩上：`probe` 的三值 + **只有 42704 才降级**（`OperationalError` 且 `sqlstate is None` 不许被吞——那是连不上，不是版本不支持）、`discover` 排除三个系统 schema 与 `pg\_temp%`/`pg\_toast%`、四条查询的发出顺序 `pg_class → pg_index → pg_attribute → pg_constraint`、空范围**不发 `IN ()`**、`MAX_TABLES` 仍在昂贵查询之前判且三条出路原文到达、PG 侧永不产出 `CHARSET_SUSPECT`（那一格的原料是 MySQL 的会话变量）、020 的批形状在 PG 上同形（10 对象/批 3 → 4 批、昂贵查询 12 发、`:tbl_N` 与名单逐一对应、表名不拼进文本）、以及"方言层不许发写语句"——那条用**词边界正则**而不是子串禁（`AS ON_UPDATE` 里的 `ON ` 会被子串 ban 误杀，误杀一次就没人再敢加别名）。**驱动表 10 条**在 `tests/unit/test_sync_dialect_dispatch.py`，钉工单 024 验收 2 的两面：`kind='postgres'` 不再命中 `NotImplementedSource`（只构造不连接，所以演示源没建时这条不会 skip——skip 掉的正好是要钉的那一句），而 `oracle`/`mssql`/`MySQL`/`""` 仍抛且 `code=='not_implemented'`（不许顺手放宽）；另有一条配对断言，把 `table_scope_filter(ds, column=该格的 scope_column)` 渲染出的片段拿去断它**逐字出现在该方言的 B 查询里**（构造器由测试自己按 kind 查表，不从 `_DIALECTS` 拿——从被测那张表读出的构造器去验同一张表，红了只是两格一起改错）。**接线那一条是集成用例**：`test_sync_pg.py::test_postgres_源的范围条件按_pg_的列写法下发`——`kind='postgres'` 的源跑真 `run_sync`，形状桩件把收到的 `table_sql` 原样记下（桩件自己不渲染口径）。实测变异：把编排里那一行换回硬编码 `t.table_name` 之后**只有这一条红**，上面 40 条全绿（它们都不经过 `run_sync`），红了的内容是"PG 源带着 MySQL 的别名出发了"，而那一句本来要等源库报 42703/1054 才看得见。**as-built(P3-024 live 半边)：那条 SQL 已经在真 `ai_web_demo_pg` 上跑过**——`tests/integration/test_extract_pg_live.py` 四条（验收 1/3/4/5），走真 `POST /api/datasources` → `POST /api/sync/jobs`（202）→ worker 循环体 → 回读元数据库，源库与账号都是真的，逐字对账清单与"证到哪一格"写在 §1.6/§1.6.1；仍没证到的那一组（枚举数组形状、`relkind` 的 `'p'/'m'/'f'`、④ 的"两枚时间戳同时在场时取较晚那枚"、③ 的"每批重取 FK 会不会落两次"）**逐条只列在 metadata-model §8.2 末注"证到哪一步"那一份里**，本行不复述清单以免两处各漂一次。live 另钉到一个**缺口**而不是未证项：表达式索引的文本有列可存（§2.4 `meta_index.funcdef`），但 `RawIndexColumn` 不搬它，所以当前恒空。live 抓出两个**不在 PG 抽取器里**的缺陷并已修：① `inferred_rows` 把表 id 的查找键写死成 `_key("", …)`（MySQL 的 catalog 恒空串惯例），PG 侧每条推断边都查不到而**静默丢弃**（`relations_inferred` 报 0），修法是让 `InferredRelation` 带上它本来就该带的 `catalog_name`，`tests/unit/test_sync_rows.py` 补一条纯函数用例钉住（变异验过：换回 `""` 只有这条红）；② `meta_column.enum_values` 落的不是 SQL NULL 而是 JSON `null`（SQLAlchemy 的 JSON 类型默认 `none_as_null=False`，把 Python `None` 序列成 `'null'::jsonb`，于是 `IS NOT NULL` 成立、82 列全都"有枚举值域"），修法是 `enum_values`/`sample_values` 两格显式 `JSONB(none_as_null=True)`——只改绑定值不动 DDL，而 `_COLUMN_SYNC_COLS` 是整列覆盖，重跑一次同步就自清。**验收 6（MySQL 侧回归不变）在两个修复之后随整轮闸重跑**：被搬动的 `slice_names`/`in_list`/`apply_index_flags` 那三样正对着 MySQL 链，细节记在 roadmap §P3 验收 6 的 as-built |
+| PG 抽取器的**两半**（as-built(P3-024)：不连库那半是 `app/extractor/postgres.py` 的五条 §8.2 SQL 与行→`Raw*` 映射，加上 `sync_service` 的方言驱动表 `_DIALECTS`；live 那半是 §1.6 那份对账清单） | SQL 文本与映射钉在**假连接**上（`_rows` 仍是方言层唯一的 I/O 出口，同上面 020 那行的理由），501 分发与"列写法跟着 kind"钉在纯函数 + 真 `run_sync` 上 | **30 条不连库单测分两张**：`tests/unit/test_extract_pg_map.py` 14 条吃 §8.2 那条查询**自己的别名**当行键（假件与真 SQL 同形才有意义），钉的是 serial 与 identity 分得开（`default_value` 是 `nextval(...)` 那一串）、`_text[]`/`numeric(10,2)[]` 走 023 的归一而 `raw_data_type` 留原文、`modifiers` 白名单只认 `varchar`/`bpchar`/`numeric` 且数组一律 `NULL`、表达式索引那一位的 `column_name` 是 `NULL`（§8.2 D 的分支）、视图 `last_analyze_at` 恒 `NULL` 而表取 `last_analyze`/`last_autoanalyze` **较晚者**（§2.4 注④ 的 PG 半边）、`idx_scan` 只进 `cardinality_hint` 不进 `cardinality`（单位不同）。`tests/unit/test_extract_pg_client.py` 16 条把编排钉在同一颗桩上：`probe` 的三值 + **只有 42704 才降级**（`OperationalError` 且 `sqlstate is None` 不许被吞——那是连不上，不是版本不支持）、`discover` 排除三个系统 schema 与 `pg\_temp%`/`pg\_toast%`、四条查询的发出顺序 `pg_class → pg_index → pg_attribute → pg_constraint`、空范围**不发 `IN ()`**、`MAX_TABLES` 仍在昂贵查询之前判且三条出路原文到达、PG 侧永不产出 `CHARSET_SUSPECT`（那一格的原料是 MySQL 的会话变量）、020 的批形状在 PG 上同形（10 对象/批 3 → 4 批、昂贵查询 12 发、`:tbl_N` 与名单逐一对应、表名不拼进文本）、以及"方言层不许发写语句"——那条用**词边界正则**而不是子串禁（`AS ON_UPDATE` 里的 `ON ` 会被子串 ban 误杀，误杀一次就没人再敢加别名）。**驱动表 10 条**在 `tests/unit/test_sync_dialect_dispatch.py`（**数目订正 as-built(P4-034)**：这张文件今天是 **7 个函数 / 12 条收集**——033 在里面加了 `test_采样能力位与工厂真产出的那个对象成对` 那条参数化用例，本行原文的"10 条"写的是 024 那一刻的数，一字未改地留着只为了让它别变成第二个"文档说的数没人核过"的对象），钉工单 024 验收 2 的两面：`kind='postgres'` 不再命中 `NotImplementedSource`（只构造不连接，所以演示源没建时这条不会 skip——skip 掉的正好是要钉的那一句），而 `oracle`/`mssql`/`MySQL`/`""` 仍抛且 `code=='not_implemented'`（不许顺手放宽）；另有一条配对断言，把 `table_scope_filter(ds, column=该格的 scope_column)` 渲染出的片段拿去断它**逐字出现在该方言的 B 查询里**（构造器由测试自己按 kind 查表，不从 `_DIALECTS` 拿——从被测那张表读出的构造器去验同一张表，红了只是两格一起改错）。**接线那一条是集成用例**：`test_sync_pg.py::test_postgres_源的范围条件按_pg_的列写法下发`——`kind='postgres'` 的源跑真 `run_sync`，形状桩件把收到的 `table_sql` 原样记下（桩件自己不渲染口径）。实测变异：把编排里那一行换回硬编码 `t.table_name` 之后**只有这一条红**，上面那三张全绿（14 + 16 + 驱动表那张，本轮收集数 42 条；原文写"40 条"是 024 那一刻的三张之和——它们都不经过 `run_sync`），红了的内容是"PG 源带着 MySQL 的别名出发了"，而那一句本来要等源库报 42703/1054 才看得见。**as-built(P3-024 live 半边)：那条 SQL 已经在真 `ai_web_demo_pg` 上跑过**——`tests/integration/test_extract_pg_live.py` 四条（验收 1/3/4/5），走真 `POST /api/datasources` → `POST /api/sync/jobs`（202）→ worker 循环体 → 回读元数据库，源库与账号都是真的，逐字对账清单与"证到哪一格"写在 §1.6/§1.6.1；仍没证到的那一组（枚举数组形状、`relkind` 的 `'p'/'m'/'f'`、④ 的"两枚时间戳同时在场时取较晚那枚"、③ 的"每批重取 FK 会不会落两次"）**逐条只列在 metadata-model §8.2 末注"证到哪一步"那一份里**，本行不复述清单以免两处各漂一次。live 另钉到一个**缺口**而不是未证项：表达式索引的文本有列可存（§2.4 `meta_index.funcdef`），但 `RawIndexColumn` 不搬它，所以当前恒空。live 抓出两个**不在 PG 抽取器里**的缺陷并已修：① `inferred_rows` 把表 id 的查找键写死成 `_key("", …)`（MySQL 的 catalog 恒空串惯例），PG 侧每条推断边都查不到而**静默丢弃**（`relations_inferred` 报 0），修法是让 `InferredRelation` 带上它本来就该带的 `catalog_name`，`tests/unit/test_sync_rows.py` 补一条纯函数用例钉住（变异验过：换回 `""` 只有这条红）；② `meta_column.enum_values` 落的不是 SQL NULL 而是 JSON `null`（SQLAlchemy 的 JSON 类型默认 `none_as_null=False`，把 Python `None` 序列成 `'null'::jsonb`，于是 `IS NOT NULL` 成立、82 列全都"有枚举值域"），修法是 `enum_values`/`sample_values` 两格显式 `JSONB(none_as_null=True)`——只改绑定值不动 DDL，而 `_COLUMN_SYNC_COLS` 是整列覆盖，重跑一次同步就自清。**验收 6（MySQL 侧回归不变）在两个修复之后随整轮闸重跑**：被搬动的 `slice_names`/`in_list`/`apply_index_flags` 那三样正对着 MySQL 链，细节记在 roadmap §P3 验收 6 的 as-built |
 | `sync_jobs.progress` 那一格（as-built(P3-025)：`app/services/sync_service.py` 的 `progress_of()`，唯一调用点在 `_set_phase` 写事件帧的同一条 `UPDATE`） | 纯函数手算 + 一条真链路 | 这是 §2.5 那列 `numeric(5,2)` 自 0004 建表（`alembic/versions/0004_meta.py:65`）以来**第一次**有写入点。三条口径各钉一次：① 只有 `{done,total}` 参与折算，`base_table`/`view`/`cards` 是三本不同的账，把它们算进百分比会得到一个"看着像进度"的数；② `total<=0` **回 None**，调用方据此**不写那一格**——discover 之前分母还没定出来，写 `0.0` 等于替 `DEFAULT 0` 宣布"我确定现在是 0%"，而真话是"还不知道"（这一支最容易写错成"回 0.0"，因为两种写法在终局那一帧上都显示 100）；③ 值的来源是**事件帧里那一份** counters，不是另算一次——同一个数有两条产生路径就是 §2.8 决策 3（序列真相在 `sync_job_event`）要堵的东西。用例 `tests/unit/test_sync_progress.py`；真效果在 §1.7.1 的两处实录里：`timeline` 段末行 `progress=100.00` 与 `killbatch` 段打断那一行的 `progress=0.00`（那一轮 `heartbeat_at` 有了、`started_at` 有了，而 discover 还没交回分母，正是 ② 那一支的真实现场） |
 | `card_build` 的**档案守卫**（as-built(P4-027)：`app/services/sync_service.py` 的 `card_build_guard()`，唯一调用点在 `run_sync` 的 card_build 段；读侧唯一入口 `kb_service.read_active_profile()`） | 判决本身是纯函数（吃 `ActiveProfile \| None`，回 `{code, detail}` 或一份档案），所以两处守卫各钉一次单测；**"这一轮到底有没有卡"的真效果只能走整条链**（真入队 + 真 worker + 换连接回库），因为要断的是库里的行数而不是返回值 | 三条各钉一件事：① **没有 active 档案时同步 `success` 且零卡片**（`test_没有_active_档案时同步成功且零卡片_档案表一行都没多`）——一次断三件：`status=='success'`、`counters.cards==0`、`SELECT count(*) FROM kb_index_profile` 前后相同。第三件才是本条存在的理由：前两件在旧形状（"读不到就按 settings 建一套"）里照样绿，而"不许留那条兜底"正是本片要关的后门；② 差哪一格就不写卡，**两个方向各一条**（`@pytest.mark.parametrize` 的 改维度 / 改模型），且**被改的那一格在配置这一侧**（`monkeypatch.setenv` + `get_settings.cache_clear()`，档案行仍是夹具钉住的那一套）——这是验收 2 的字面动作"改 `AIWEB_EMBEDDING__DIMENSION` 再跑一次同步"；漂移造在档案行上虽然走同一个比对函数，却钉不到"这台机器改了 `.env` 之后同步看不看它"，而那正是后门原来藏身的地方（worker 在本进程里跑所以 env 改动对它可见，换成真子进程这条就不成立）。detail 必须**两个值都在场**（配置的与档案的）并点出下一步 `POST /api/kb/reindex`——只说"不一致"等于让运维再跑一次 SQL 去查是哪个键歪了；③ 守卫**只长在 card_build 那一步**：`counters.tables`/`columns` 照常有值、`phase` 序列里 `card_build`/`embed`/`done` 三帧都在场，把守卫挪到整段收尾之前（或干脆判成 `failed`）都在这里红。读侧那半边同一片改：`retriever._active_profile_id` 改成从 `read_active_profile` 投影，夹具 `active_profile` 与守卫用例共用**同一个** `conftest.insert_active_profile()`（`provider` 字面与 `name` 三段拼法只住那一处，029/031 改档案行形状时是一处不是一族），且它**只写 `status`、故意不写 `is_active`**，于是"读侧还在按那把镜像列筛"表现成"召回全空"而不是一个数字差——这一条红过才改。用例落点：`tests/unit/test_kb_active_profile.py`（`triplet_drift` 五档：三格全一致 / 各差一格 / 三格全差且顺序固定）+ `tests/unit/test_sync_card_build_guard.py`（判决四档：一致 / 无 active / 差维度 / 差模型，再加"不缓存结论"那条）+ `tests/integration/test_kb_active_profile_pg.py`（读入口五条，含"只有 draft/retired 时回 None"与"读的尺子是 `status` 不是那把镜像列"）+ `test_sync_card_profile_guard_pg.py`（上面三件事，其中②的两个方向各一条 → 共 5 条用例）+ `test_kb_cards_profile_source_pg.py`（卡片挂在传入的档案上、构建不再落档案行）+ `test_kb_cards_live.py` 验收 4（一整轮真同步跑完，`status='active'` 仍只有夹具那一行）。验收 4 那半句"文本与 008 golden 逐字符相同"的靶**不在本片新文件里**，而是 019 那条既有用例 `tests/integration/test_sync_card_isolation_pg.py::test_未注入时写进库的卡片文本与008golden快照逐字符相同`——它挂上 `active_profile` 夹具后照常绿，这才是"来源换了、渲染出来的还是文档那一份"的证据。**"改的是来源不是构造"的反证**：`git diff --name-only -- backend/tests/unit` 只回一个名字——`test_kb_upsert_sql.py`，而那 `+3` 行全在 `test_profile指针与身份键不进set_` 那条的 docstring 里（补一句"来源变了、这条口径没变"，断言一个字没动）；四张 `test_kb_card_*`（golden / identity / rows / text）在 `sync_cards` 签名变化之后**零改动**，一行断言都没跟着动 |
 | 向量路的**两只脚**（as-built(P4-028)：生产侧唯一的 `app/services/embedding_client.py` + 闸内替身 `scripts/fake_embedding_server.py`，判据见 ADR-0015） | 纯半边（编请求体 / 读响应体）走单测不碰网络；凡需要客户端**真发一次 HTTP** 的一律 `live`——**没有第三条路**，因为 `EmbeddingClient.__init__` 有意不收 `httpx`/`transport` 参数（`test_构造签名里没有_transport_注入点` 用 `inspect.signature` 钉着那条接缝不存在） | 单测十一条（`tests/unit/test_embedding_client.py`）：① 请求体是 `{model, input:[…]}` 的手写字面量（**单条也发数组**，两条请求形状等于只测到其中一条）；② 归位读 `data[i].index` 而不是数组下标——用例把 `data` 故意倒序摆，按下标取就回成 `[c,a,b]`，那种错在库里两行都合法、只是卡片 A 从此挂着卡片 B 的向量，检索永远指错表且一条日志都没有；③ 维度不符是**一整档专属错误**（`EmbeddingDimensionMismatch`，029 靠它把整颗作业判 `failed`）且文案里期望维度与实收维度两个数都在场；④ 形状坏（缺 `data`、条目不是 `{index,embedding}`、`index` 缺失或非数、向量元素非数值、少回一条）全落 `EmbeddingBadResponse` 而不是 `KeyError`/`JSONDecodeError`——裸异常冒出去是一个没有 envelope 的 500，而"少回一条"若退化成"返回拿到的那几条"，调用方 zip 短对齐时后面的向量会悄悄挂到前面的卡片上；⑤ 重试词表 `{408,429,500,502,503,504}` 逐字钉且**断 400/401 不在场**（替身对未知 model 回 400，被重试就永远拿不到那条可辨识的失败）。live 十二条（**数目订正 as-built(P4-029)：那张文件今天是 13 条**——029 在其中加了
