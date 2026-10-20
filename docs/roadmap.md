@@ -703,6 +703,14 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    词表与逐枚语义见 nl2sql-safety §1.1.1；**"统计"那一半不属本片**（没有查询、没有页面、没有聚合），
    它的前提是这里给出的封闭值域，落地在 §P9 验收 4 的 admin 页；
 (b) 守卫**执行的是重生成的 SQL**，并断言"重生成后再 parse 一次的 AST 与首次 parse 的 AST 归一化相同"；
+   **as-built(P5-036)**：这半句的两个主语都要按实物换过才算兑现——① 比对的两侧不是"首次 parse 的 AST"
+   而是**钳位之后的 `final`** 与 `parse(sql_final)`（拿模型原文那棵去比，每一条缺 `LIMIT` 的合法查询都会
+   报内部故障，因为补 `LIMIT` 本来就是守卫自己的动作）；② "归一化"没有现成函数可用，036 把它落成
+   **一条不动点 + 三格承重事实**（不动点/顶层形状/表引用/顶层行数，见 nl2sql-safety §1.3），
+   工单字面的 `Expression.__eq__` 两头都不对：给 UNION 臂加括号就**过火**（今天合法的输入判成漂移），
+   30.19 下看不见注释丢失又**不及物**。新增第 18 枚 `regeneration_drift`，红了按拒答处理不降级 warning。
+   "守卫执行的是重生成的 SQL"那一半早在 036 之前就是实物（管线消费 `sql_final`），036 补的是它缺的那条
+   **运行期**自校验：每次 `guard()` 都跑，1000 次实测 0.702 → 1.273 ms/次。
 (c) dry-run 失败信息回喂模型自动重试一次（`retry_with_error`），最多 1 次。
 
 验收：
@@ -714,6 +722,15 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
 5. 用非只读账号连数据源时 `test_connection` 报 `readonly_capability_missing`（能力探测前置）。
 
 踩坑预警：① **`comments=False` 会把 hint 一起剥掉，造成"守卫看到的 ≠ 执行的"** → 检测到 hint 直接拒；
+   **as-built(P5-036)**：结论（拒）不动，**这句因果对 MySQL 是错的**——MySQL 的 `/*+ … */` 在 sqlglot 的树上
+   是 `args["hint"]`（`exp.Hint`）而不是注释，`comments=False` **剥不掉它**，它会原样穿过钳位与重生成被源库
+   真执行（实测 `.scratch/p5-sql-guard-hardening/evidence/hint_probe036.txt`，钉子
+   `test_hint_在_MySQL_的树上活得过_comments_false`）。真正挡住它的是 `_strip_comments` 里那发**方言无关**的
+   裸文本判定，所以 PG 那一支（`/*+ x */` 只是普通注释、重生成后确实消失）与 MySQL 那一支走的是同一道门。
+   顺带一条实测否掉的可能性：036 新加的运行期自校验**不能**当 hint 的防线——实测 MySQL 那支 hint 在比对的
+   两侧逐字一致，四格里没有一格会红（量的是探针 `hint_probe036.txt`，不是那三条参数化用例：hint 在**裸文本层**
+   就被 `_strip_comments` 拒了，根本走不到自校验那一步。`test_hint_三种形状两条接缝同码` 钉的是"两条接缝
+   给同一枚成员"，`test_hint_在_MySQL_的树上活得过_comments_false` 钉的是"它在树上活着"，两件事不要混着记）。
 ② `PROCEDURE ANALYSE()`、`INTO @var`、`FOR UPDATE` 都要单独规则，sqlglot 宽容 parser 可能不识别子结构 →
 必须有正则级兜底；③ `SET SESSION TRANSACTION READ ONLY` 前不能在已有事务里；
 ④ asyncmy 的 `read_timeout` 与 `MAX_EXECUTION_TIME` 谁先触发要实测。

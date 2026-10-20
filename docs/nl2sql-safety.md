@@ -72,10 +72,15 @@ def guard(
 顺序就是 `guard()` 的判定顺序（预处理 → 裸文本 → 解析 → 顶层 → 子结构 → 函数 → 表 → 钳位/重生成）；
 "落点"写**函数名不写行号**，行号会随施工漂。语料条数是本轮实测：54 条必拒语料的期望值分布，
 逐条相加正好 54。**"没有一枚码没人证过"这件事的判据从 036 起改了形**：钉住处可以是语料的一条期望值，
-也可以是某条**永久用例**直接点这枚成员的名——`regeneration_drift` 属后者，因为它是**我们自己代码的内部
+也可以是某条**永久用例的断言**直接点这枚成员的名——`regeneration_drift` 属后者，因为它是**我们自己代码的内部
 一致性故障**，今天没有任何一支模型 SQL 能触发它（实测：18 条必放行语料逐条走等价自校验，漂移候选 0 条），
 硬要往语料里塞一条就只能是靠 monkeypatch 才过得去的死条目。机械用例仍表驱动、零平行清单：
-它扫 `tests/guard/` 全目录对 `GuardRuleId.<成员>` 的引用，与语料期望值取并集（036 拍板，见 §1.1.1 末）。
+它扫 `tests/guard/` 全目录**断言里**对 `GuardRuleId.<成员>` 的属性引用，与语料期望值取并集（036 拍板，见 §1.1.1 末）。
+> **as-built(P5-036 收尾)：这一档"放宽"被双轴审出过一个空洞，已按实物补严**。判据第一版扫的是全文件的
+> 属性引用并预先 `node.attr in members` 过滤过——那个过滤让"有人把成员名拼错、或删了成员"这一类**永远红不了**
+> （非成员值在构造上就进不了集合）。收尾版改成两问分别断：**只认 `ast.Assert` 里的引用**（写在注释、docstring
+> 或游离赋值里的点名不算钉住），**且不预先过滤**，非成员的名字单独一条用例红。放宽的代价（"点过名"≠"分支被走过"）
+> 仍然靠 `regeneration_drift` 自己那条失败路径用例兜，机械判据管不到那一层，这一句留在文档里而不是藏在注释里。
 
 | `rule_id` 的值 | 拦的是什么 | 落点 | 语料条数 |
 |---|---|---|---|
@@ -96,7 +101,7 @@ def guard(
 | `sleep_function` | MySQL `SLEEP()`：它让语句超时形同虚设 | `_function_violations` | 1 |
 | `danger_function` | **兜底那一档**：sqlglot 认不出的函数一律落成 `exp.Anonymous`，一律拒。新增的危险函数无需改这里就已经被挡 | `_function_violations` | 2 |
 | `table_not_allowed` | 两种：系统字典表（`information_schema`/`mysql`/`pg_catalog`… **即便已授权也拒**）、白名单外 | `_table_violations` | 7 |
-| `regeneration_drift` | **第 18 枚，也是唯一一枚防的是我们自己的代码**：`final` 序列化出的 `sql_final` 再 parse 一次，两次文本或两棵树不一致——它红了就意味着"不知道执行的是哪条 SQL"，按拒答处理。它**不是**用户 SQL 违规，所以不许挂 `unsupported_construct`（那等于把我们的 bug 报成用户的错） | `guard` 出口处的 `_regeneration_violation`（§1.3） | 0（钉在 `tests/guard/test_regeneration_invariant.py`，理由见本节开头） |
+| `regeneration_drift` | **第 18 枚，也是唯一一枚防的是我们自己的代码**：`final` 序列化出的 `sql_final` 再 parse 一次，**一条不动点加三格承重事实**（顶层形状 / 表引用 / 顶层行数）任一格红即漂移——它红了就意味着"不知道执行的是哪条 SQL"，按拒答处理。它**不是**用户 SQL 违规，所以不许挂 `unsupported_construct`（那等于把我们的 bug 报成用户的错） | `guard` 出口处的 `regeneration_violation`（§1.3） | 0（钉在 `tests/guard/test_regeneration_invariant.py`，理由见本节开头） |
 
 **与 §1.2 那些大写名的关系**（评审期写法速记，实物从来不是这个拼法）：
 `MULTI_STATEMENT`→`multi_statement`、`ROW_LOCKING`→`locking_clause`、
@@ -237,8 +242,8 @@ sql_final = stmt.sql(dialect=dialect, comments=False, pretty=False)
 |---|---|---|
 | 顶层 LIMIT 恒 `<= max_rows + 1` | **测试侧** `tests/guard/test_guard_api.py::test_钳位不变式_守卫输出的顶层_LIMIT_恒不超过_max_rows_plus_1` | 对 11 种形状逐条 parse 输出、**独立**读一遍顶层行数（不复用 `_limit_row_count`，否则是自证） |
 | 输出不含 `;`、不含 `/*` | **测试侧** `tests/guard/test_allow_corpus.py::test_合法只读查询被放行并强制带上limit` | 18 条必放行语料逐条 |
-| 重生成的 SQL 还能被严格解析（幂等） | **测试侧**，同上一条用例的最后两行 | 再 parse + 再生成，两次文本逐字相等 |
-| **重生成等价**：`parse(sql_final)` 与 `final` 是同一棵树 | **守卫内部** `_regeneration_violation`（036 起，每次 `guard()` 都跑） | 见下 |
+| 重生成的 SQL 还能被严格解析（幂等） | **守卫内部**（036 起），另有测试侧同一件事的用例 `tests/guard/test_allow_corpus.py::test_合法只读查询被放行并强制带上limit` 最后两行 | 再 parse + 再生成，两次文本逐字相等。**as-built(P5-036)**：这一行的落点原来只写"测试侧"，036 起它自己就是那四格里的 ① 不动点；另外"再 parse 都过不去""落回两条语句"这两种形状也由 `regeneration_violation` 归 `regeneration_drift`（钉子：`test_端出去的文本连再解析都过不去时归因还是regeneration_drift`、`test_端出去的文本落回两条语句时那一格红`），测试侧那条用例保留不动 |
+| **重生成等价**：`final` 判过的那些**承重事实**在 `parse(sql_final)` 里还在 | **守卫内部** `regeneration_violation`（036 起，每次 `guard()` 都跑） | 见下。**as-built(P5-036) 收尾**：这个名字**不带下划线是刻意的**，它是本节这张表的一个公共面——用例要能**单独**把某一格驱动成红，就必须直接递给它一对（树，文本）；只从 `guard()` 那一道缝进，②③④ 三格今天没有任何输入能让它们红而另外三格绿。所以它按"文档化的对外面"记账，不视作可随手私有的内部 helper |
 
 > **as-built(2026-09-29)**：第一条原来是 `endswith("LIMIT 1001") or "LIMIT" in upper()`——那个 `or`
 > 让任何带 LIMIT 的语句都算通过，等于没断。钳位落地后它才第一次有内容：**顶层 LIMIT 恒不超过
@@ -249,36 +254,74 @@ sql_final = stmt.sql(dialect=dialect, comments=False, pretty=False)
 - **比对的两侧是钳位之后的 `final` 与 `parse(sql_final)`，不是模型原文那棵 `stmt`**。
   `guard()` 自己会注入/改写顶层 LIMIT，所以"重生成 ≠ 原文"是**设计**而不是漂移——拿 `stmt` 来比，
   每一条缺 LIMIT 的合法查询都会报内部故障。这一格是整节最写错就全反的地方。
-- **两条腿一起跑，缺一条就有一类故障看不见**：
+- **跑的是"一条不动点 + 三格承重事实"，每一格都有自己的红法**：
   ① **不动点**：`sql_final` 再 parse、再 `.sql(comments=False)`，两次文本**逐字**相等；
-  ② **结构相等**：`final == parse(sql_final)`（sqlglot 的 `Expression.__eq__`）。
-  分工是实测出来的，不是推理的：30.19 下 `__eq__` **看不见注释的丢失**——带注释的那棵树与把它剥掉
-  再 parse 回来的树，`==` 给出 `True`（`evidence/hint_probe036.txt` 每一支都有这一行）。
-  所以"结构相等"单独用会放过内容被抹掉那一类，而"不动点"单独用会放过同义改写（`AS` 补全、
-  括号形状变了但文本自洽）。
+  ② **顶层形状**：`type(final) is type(parse(sql_final))`；
+  ③ **表引用**：重 parse 回来那棵树引用的表集合与白名单判过的 `refs` **逐字相同**（比集合不比顺序）；
+  ④ **顶层行数**：两边用同一个 `_limit_row_count` 读出的那个数一致。
+  > **as-built(P5-036)：②③④ 这三格是**换掉** `Expression.__eq__` 得来的**，本节第一版按工单字面写的
+  > 是"不动点 + 结构相等两条腿"。对着实物发现 `__eq__` **两头都不对**：
+  > 它**过火**——`SELECT id FROM customer LIMIT 5000 UNION ALL SELECT id FROM payment_record LIMIT 3`
+  > 今天合法放行，而生成器会给带 LIMIT 的那条臂加括号，重 parse 回来 `.this` 从 `Select` 变成
+  > `Subquery`，树差就落在这一格上（`evidence/drift_diagnosis036.txt`），语义一字未变却判成漂移；
+  > 它又**不及物**——30.19 下 `__eq__` **看不见注释的丢失**：探针里 PG 那支 `/*+ SeqScan(t1) */`
+  > 重 parse 回来树上已经没有那个节点（同一支里并排写着"重 parse 之后 hint 还在树上？ False"与
+  > "tree == reparsed（sqlglot `__eq__`）？ True"），MySQL 的普通注释那支同形
+  > （`evidence/hint_probe036.txt`；注意**不是**"带注释那份重 parse 回来 == 原树"那一行——那一行比的是
+  > 带注释的往返，`True` 是应当的，证不了 blindness）。
+  > 换形的口径由用户 2026-10-20 拍板：**按守卫判过的那些承重事实比，渲染形状不进判定**。
+  > 钉子是 `test_守卫给臂加的括号不算漂移`——`__eq__` 那一版它红，四格这一版它绿。
+  四格的分工人也是实测出来的：`evidence/mutation_drift036.txt` 的 B/C/D/E 四格各把一格改成
+  "永不成立"，每格**只**红自己那一条用例、`tests/guard` 整目录（本轮 213 条）一条不多红——
+  没有哪两格互为重复。
 - **红了就拒答，不降级成 warning**：`guard()` 把它收成一条 `Violation(regeneration_drift)` 返回
   `ok=False, sql_final=None`；`check()` 那一侧同码抛 `SqlGuardError`。理由同 §9 那族"证不了就按最严的一档"——
   这一条红了我们连"执行的是哪句话"都不知道。
-- **它今天是一条永真的保险丝**（这是实测结论，不是修辞）：18 条必放行语料逐条走这两条腿，
-  漂移候选 0；而工单 036 验收 2 指定的那发变异（把 `.limit(...)` 改成对已带 LIMIT 的语句也钳一次）
-  **造不出漂移**——`.limit()` 是替换不是叠加，钳位后那棵树自己就是自洽的。所以 036 的变异记账
-  改成两发：摘掉自校验 → 全绿（证明它是纯保险丝、不改变任何现有判定）；把出口生成改成
-  `pretty=True` → 结构相等那腿仍过、不动点那腿红（证明两条腿各自有独立的捕获面）。
-  如实写在这里，不为了"验收 2 变红"去故意写错实现。
+- **它今天是一条永真的保险丝**（这是实测结论，不是修辞）：18 条必放行语料逐条走四格，漂移候选 **0**
+  （量的是 `final` 与 `parse(sql_final)` 这一对，也就是本表第一行那句"比对的两侧"）；
+  `evidence/hint_probe036.txt` 末节那个"漂移候选 **4** 条"**不是另一个结论**，它量的是**另一对**——
+  模型原文 `stmt` 与钳位之后的 `final`，而那 4 条逐条标着"钳位改了形状（预期内）"，
+  正是 §1.3 开头那句"重生成 ≠ 原文是**设计**"的实物清单。两个数各说各的两侧，不许互相引用来改口径。
+  而工单 036 验收 2 字面指定的两发变异**都造不出漂移**——`.limit()` 是替换不是叠加（电池里的 J 格实测：
+  钳位条件恒真之后红的是**钳位语义**那三条用例，036 的自校验一条都不红，因为钳位后那棵树自己就是自洽的）；
+  注释在 parse **之前**就被 `_strip_comments` 抹掉，树上一个 `.comments` 节点都没有，
+  所以把出口的 `.sql(comments=False)` 写成 `comments=True` 对守卫的输出**逐字相同**
+  （实测 `evidence/comment_free_parse036.txt`：5 支带注释的必放行语料两版一字不差）。
+  如实记在这里，不为了"验收 2 变红"去故意写错实现。
+- **变异自证因此重排成十格**（`evidence/mutation_drift036.txt`，每格 try/finally + md5 逐字复原；
+  实录的源文件 md5 是 `78a91357…`——**最终 shipped 那一份**。上一版电池跑在 mypy 那两处理顺**之前**的
+  `f2c8dd4a…` 上，锚点 `type(tree)` 与 `set(refs)` 在最终字节上已经不存在，按 035 立的
+  "补跑而不是解释"这条纪律整电池重跑过）：
+  A 摘掉整道自校验 → **只**红在"接线"那两条（出口真的又解析了一次 / 出口解析失败按拒答处理），
+  其余一条不红——这就是"纯保险丝"的实物形态：真实输入的判定不因它而变；
+  B~E 一格一格关掉 → 每格只红自己那一条（上一条说的分工实证）；
+  F 就是工单字面那一发（`comments=True`）→ 0 红，**等价变异**，理由见上一条；
+  G 把比对左侧从 `final` 换成入口那棵 `stmt` → 14 红，全是钳位过的合法查询被误判成内部故障——
+  这一发证明"比对的两侧是 `final` 与 `parse(sql_final)`，不是 `stmt`"那句话是**承重**的，不是措辞；
+  H/I 两发不是今天存在的 bug，而是这道自校验**存在的理由**：把端出去的文本里 ` LIMIT 1001` 抹掉
+  → 15 红，把 `customer` 换成 `payment_record` → 27 红，两发都在守卫出口被拦下（分别打在 ④ 与 ③）；
+  J 钳位条件恒真（工单字面第一发的实物版）→ 3 红，红的**全是钳位语义**那三条
+  （`test_上限之下的_LIMIT_原样保留`、带 OFFSET 那支语料、括号那支钉子），**自校验一条都不红**——
+  这一格就是"那一发造不出漂移"的凭证，不是分析句。
 - **运行期这一条不是 Python 的 `assert`**：`python -O` 会把它整条剥掉，而这条断言的全部意义是
-  "生产路径上每次守卫都跑"。它是一次真调用（`_regeneration_violation`）加一条永久用例。
+  "生产路径上每次守卫都跑"。它是一次真调用（`regeneration_violation`）加一条永久用例。
   工单 036 验收 3 的字面"`grep -n assert` 从此不再是零命中"因此按实物兑现为
   "守卫内部有一条真会生效的运行期自校验，且它的失败路径有永久用例"——
-  顺带记一笔：035 之后 `grep -n assert app/services/sql_guard.py` 命中的那**一**行住在本模块的
-  docstring 里（写的是 `check()` 那族测试的断言），不是运行期语句。
-- **性能这一格量化在这里**（口径没改，两条腿都在运行期跑）：`guard()` 单次 0.619 ms →
-  加自校验后 1.090 ms/次（+0.471 ms，+76%；单跑一次 `parse(sample).sql(comments=False)` 是 0.443 ms）。
+  顺带记一笔：035 之后 `grep -n assert app/services/sql_guard.py` 命中的那**一**行住在
+  `GuardRuleId` 这枚枚举的类 docstring 里（写的是 `check()` 那族测试的断言该长什么样），不是运行期语句。
+- **性能这一格量化在这里**（口径没改，四格都在运行期每次都跑）：关掉自校验的 `guard()` 0.702 ms/次
+  → shipped 1.273 ms/次（+0.571 ms，+81.2%；参照物：单跑一次 `parse(sample).sql(comments=False)`
+  是 0.502 ms。1000 次取均值，`evidence/perf036.txt`）。
+  文档半边那一版记的是 0.619 → 1.090，那是 `__eq__` 版的同一口径实测（`evidence/hint_probe036.txt` 末节），
+  换形之后按实物复测过才写这两个新数。**收尾又复跑了一次**：上一版记的 0.712 → 1.279 落在最后一次改动
+  （把比对里重复三次的 `set(refs)` 提出去）之前的字节上，同一份 shipped 字节（md5 `78a91357…`）连跑三轮
+  的增量落在 0.571~0.592 ms——**这个幅度的来回是噪声，不要读成"那一次提取省了什么"**。
   绝对值相对一次 LLM 调用与一次真库查询差着两到三个数量级，所以不拿"只抽样几条"糊过去，
-  也不改成"结构相等为主"。数字来源 `evidence/hint_probe036.txt` 末节。
+  也不因为"多一次解析太贵"而把某几格挪出运行期。
 
 以及"重生成后再 parse 一次的 AST 与首次 parse 的 AST 归一化相同"——这句话的**主语在 036 订正为
 `final`**（上一条第一个项目），原写的"首次 parse 的 AST"按实物是错的。
-"归一化"的定义就是那两条腿，不另造一套规范化。
+"归一化"的定义就是那四格（一条不动点 + 三格承重事实），不另造一套规范化。
 重跑（`POST /chat/messages/{id}/rerun`）**绝不复用旧 `sql_final`**，同样走完整 guard。
 
 > **"守卫执行的是重生成的 SQL"这一半早在 036 之前就是实物**，第一次点名链：
@@ -327,9 +370,13 @@ AI 写了 `LIMIT 10` 给 PG 也能被重写成合法形态。重生成结果必�
   它已经是会被序列化出去的一部分了。
 - **`comments=False` 不是 hint 防线**，它是**可执行注释**（`/*! … */`）的防线，
   且那一条也靠 `_strip_comments` 先拒（`executable_comment`）才成立——两件事原来写在一起，现在分开。
-- **重生成等价自校验（§1.3）看不见 hint 被剥掉**这一维要靠结构相等之外的那条腿吗？实测答案是不必：
-  MySQL 的 hint 在两条腿上都"一致"（它活过了序列化，两边都有它），所以等价自校验**不能**当 hint 防线用，
-  hint 归 hint、等价归等价，两族用例各钉各的。
+- **重生成等价自校验（§1.3）不能当 hint 的防线用**——四格的口径下这一点更要说清：MySQL 的 hint 在
+  四格上**全都一致**，它活过了序列化，`final` 与 `parse(sql_final)` 两边都带着它，顶层形状、表引用、
+  顶层行数没有一格会因为它而变（`evidence/hint_probe036.txt` 的 MySQL 两支都记着
+  "两次文本逐字相等？ True" 与 "tree == reparsed（sqlglot `__eq__`）？ True"）。等价自校验量的是"端出去的还是不是
+  判过的那句"，而 hint 的问题是"判的时候就不该放行"，两件事正交。
+  所以 hint 归 hint、等价归等价，两族用例各钉各的：前者钉在
+  `test_hint_在_MySQL_的树上活得过_comments_false`，后者钉在 `test_regeneration_invariant.py`。
 
 > **顺带把 §1.3 那两条测试侧断言的辖区说清**（036 实测，探针表末行）：
 > `";" not in sql_final` 与 `"/*" not in sql_final` **不是对全体合法输入都成立的不变式**——
@@ -765,6 +812,7 @@ def test_allow(sql):
 | §1.1/§1.2 要求 | 实现现状 |
 |---|---|
 | ① "每条拒绝都带**枚举化**的 `rule_id`" | **as-built(P5-035)**：这半句在 035 之前一直是"文档有字、实物无枚举"——§1.1 的注解写的就是 `code: str`，17 枚码由 **20 处"首参是裸字符串"的调用点**（12 处 `SqlGuardError` ＋ 8 处 `Violation`）外加 `_scan_raw_text` 的 `(pattern, code, hint)` 三元组表里那 3 枚维持一致，没有任何一处能穷举出值域。035 落 `GuardRuleId(StrEnum)`（不是 `(str, Enum)`：后者的 `__str__` 出 `'GuardRuleId.multi_statement'`，而 `SqlGuardError` 的正文拼的是 `f"[{rule_id}] {message}"`，那是用户可见文案；`StrEnum` 的 `__str__` 就是值，ruff 的 `UP042` 也只认这一种写法）＋ 一条表驱动的封闭集合用例。**对外值一字未改**：54 条必拒语料改动前后逐条同码，对照表在 `.scratch/p5-sql-guard-hardening/evidence/ruleid_{before,after}035.txt`。工单 035 记的"22 个拒绝点"是它的计数口径（14 个 `SqlGuardError` 调用点 + 8 处 `Violation` 字面构造）；本轮 AST 实测调用点总数 **23**（14 处 `SqlGuardError` ＋ 9 处 `Violation`）、其中首参是裸串字面量的 **20** 处（12 raise ＋ 8 构造，另加 `_scan_raw_text` 三元组表那 3 枚字面量）。两个数说的是同一批点位，换算写在这里免得下人再数一遍：工单那 14 处 raise 含 `:223`（传变量 `code`）与 `check()`（把 `Violation` 翻成 raise）两处非字面量，22 减这两处就是本轮的 20；23 比 22 多的那一处是 `SqlGuardError.violation` 属性内部那次 `Violation(...)` 构造——不是拒绝点而是适配器 |
+| ① 的**封闭集合判据**（035 落在 `test_rule_id_closed_set.py`）与 §8.1/§8.2 的**语料条数** | **as-built(P5-036)：两处各放宽了一格，按本节开头那条规矩先改本文再改实现**。① 判据从"每枚码都要出现在 54 条必拒语料的期望值里"放宽成"**语料期望值 ∪ `tests/guard/` 里以 `GuardRuleId.<成员>` 形式点名的 AST 扫描**"，因为 036 带来了第一枚**不可能有语料**的码 `regeneration_drift`（它防的是守卫自己的代码，实测 18 条必放行语料一条都触发不了它）。**代价要说清**：属性引用只证明"有用例点了这枚码的名"，不证明那条分支真被走过，所以这一档的码必须**另配一条失败路径用例**才算钉住（036 的那发是 `test_regeneration_invariant.py` 里手工造漂移那一支）；语料那一档保持 035 的原强度，期望值仍由 `test_reject_corpus` 逐条断言。② 工单 036 验收 4 的 (B) 支字面要求"补必拒语料"，实物**只补了规则与用例、没动 `corpus.py` 那 54/18 两条计数**——它自己的"已定口径"写着"语料的期望值不许动，本片只往新增文件里加用例"，两句话冲突时按工单自己那条口径走，hint 的三支形状钉子落在 `tests/guard/test_regeneration_invariant.py::test_hint_三种形状两条接缝同码`。 |
 | `allowed_schemas` 单独入参 | 折进 `allowed`（表白名单里已带 `db`，短表名由 `default_schema` 补全）→ 效果等价且更严 |
 | `forbid_files: bool = True` | 恒为真，不给关 |
 | ⑥ `CROSS_CATALOG` 独立规则 | 归 `table_not_allowed`（catalog 非空的白名单条目本来就不存在） |
