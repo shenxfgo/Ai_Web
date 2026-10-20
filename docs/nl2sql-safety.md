@@ -22,8 +22,15 @@
 ### 1.1 接口
 
 ```python
+class GuardRuleId(str, Enum):
+    """拒绝词表：成员名是内部名，**值才是对外接口**（落 `guard_result` JSONB、进验收字面）。
+    17 枚逐枚的"拦的是什么"见下面 §1.1.1 那张表——那张表是词表的唯一清单，值与它第一列一字不差。"""
+
+    multi_statement = "multi_statement"   # …其余 16 枚显式赋值，不用 AUTO：值不许跟着成员名漂
+    ...
+
 @dataclass(frozen=True)
-class Violation:  code: str; message: str; node: str | None = None
+class Violation:  code: GuardRuleId; message: str; node: str | None = None
 
 @dataclass(frozen=True)
 class GuardResult:
@@ -44,6 +51,59 @@ def guard(
 
 按顺序执行，任一失败即 `ok=False`，但**收集全部 violations 再返回**，便于前端一次展示所有问题。
 每条拒绝都带枚举化的 `rule_id`（便于统计模型常犯哪一类）。
+
+> **as-built(P5-035)**：上面那句"枚举化"在 035 之前**只有字面没有实物**——`code` 的注解是 `str`，
+> 17 枚码散在 20 个"首参是裸字符串"的调用点里各自维持一致（另有 `_scan_raw_text` 的
+> `(pattern, code, hint)` 三元组表带 3 枚），全仓**没有任何一处能回答"这套系统一共有哪些拒绝原因"**。
+> 035 把它收成 `GuardRuleId(str, Enum)` ＋ 一条"越界就红"的机械用例，**对外值一字未改**
+> （54 条必拒语料改动前后逐条同码，对照表见 §1.1.1 末与 verification §1.11）。
+> 这一枚枚举是**对外词表**：新增拒绝分支只能用它的成员，改名或改值都要先改本文。
+>
+> **一条必须写进接口的 Python 事实**：`GuardRuleId` 继承 `str` 之后，3.12 的
+> `Enum.__str__` 让 `str(成员)` 与 `f"[{成员}]"` 出 `'GuardRuleId.multi_statement'` 而不是值，
+> 而 `SqlGuardError` 的异常正文是 `f"[{rule_id}] {message}"`、`pipeline` 落库的
+> `sql_validation_error` 也拼同一支串——所以**必须显式 `__str__` 返回 `self.value`**，
+> 否则一次纯类型重构会顺手改掉用户可见的文案。`json.dumps` 走的是 `_value_`，不受这条影响。
+
+### 1.1.1 拒绝词表（17 枚，as-built(P5-035)）
+
+顺序就是 `guard()` 的判定顺序（预处理 → 裸文本 → 解析 → 顶层 → 子结构 → 函数 → 表 → 钳位/重生成）；
+"落点"写**函数名不写行号**，行号会随施工漂。语料条数是本轮实测：54 条必拒语料的期望值分布，
+逐条相加正好 54，**没有一枚码在用例里没有对应**——那条机械用例钉的就是这件事（035 验收 3）。
+
+| `rule_id` 的值 | 拦的是什么 | 落点 | 语料条数 |
+|---|---|---|---|
+| `empty_statement` | 剥围栏、去尾随 `;` 之后没有内容；以及"整条都是注释" | `_preprocess`、`_scan_raw_text` | 2 |
+| `too_large` | 长度超 8000 字符 | `_preprocess` | 1 |
+| `unsupported_construct` | **证不了的四种**：控制字符、块注释未闭合、sqlglot 任何解析错误（`ParseError`/`TokenError`/`UnsupportedError`）、解析结果不是 AST 表达式 | `_preprocess`、`_strip_comments`、`parse` | 6 |
+| `hint_not_allowed` | `/*+ … */` 优化器 hint——放行等于承认"注释里能塞指令"，而重生成又会抹掉注释，两者不能兼得 | `_strip_comments` | 1 |
+| `executable_comment` | `/*!50100 … */` 这类 MySQL 里**真会执行**的可执行注释 | `_strip_comments` | 2 |
+| `procedure_analyse` | `PROCEDURE ANALYSE(`：会让 parser 直接失败，只能靠裸文本兜住 | `_scan_raw_text` 三元组表 | 1 |
+| `locking_clause` | `FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE`：`FOR SHARE o.id` 这种带目标写法解析不了，所以走裸文本 | `_scan_raw_text` 三元组表 | 3 |
+| `into_outfile` | 导出与建表两类：`INTO OUTFILE`/`DUMPFILE`/`INTO @var`（裸文本），`SELECT … INTO`（AST 里的 `exp.Into`） | `_scan_raw_text` 三元组表、`_shape_violations` | 3 |
+| `multi_statement` | `;` 拼贴（`SELECT 1; DROP TABLE x`）：`len(stmts) != 1` | `parse` | 3 |
+| `prepared_statement` | `PREPARE`/`EXECUTE`/`DEALLOCATE`/`DISCARD`：正文绕过静态分析 | `_check_top_level` | 2 |
+| `top_level_not_select` | 顶层不是 `Select/Union/Except/Intersect`（`SHOW`/`DESCRIBE` 落成 `Command` 也被这一支挡） | `_check_top_level` | 10 |
+| `dml_in_cte` | CTE / 子查询里藏 `INSERT`/`UPDATE`/`DELETE`/`MERGE` | `_shape_violations` | 1 |
+| `variable_access` | 变量、占位符、`:=`：取值要到运行时才知道 | `_variable_violations` | 5 |
+| `pg_file_access` | pg 侧读文件/目录/时钟/锁/取消后端的具名特权函数（`pg_read_file`、`pg_sleep`…） | `_function_violations` | 4 |
+| `sleep_function` | MySQL `SLEEP()`：它让语句超时形同虚设 | `_function_violations` | 1 |
+| `danger_function` | **兜底那一档**：sqlglot 认不出的函数一律落成 `exp.Anonymous`，一律拒。新增的危险函数无需改这里就已经被挡 | `_function_violations` | 2 |
+| `table_not_allowed` | 两种：系统字典表（`information_schema`/`mysql`/`pg_catalog`… **即便已授权也拒**）、白名单外 | `_table_violations` | 7 |
+
+**与 §1.2 那些大写名的关系**（评审期写法速记，实物从来不是这个拼法）：
+`MULTI_STATEMENT`→`multi_statement`、`ROW_LOCKING`→`locking_clause`、
+`VARIABLE_ACCESS`→`variable_access`、`TABLE_NOT_ALLOWED`→`table_not_allowed`、
+`SELECT_INTO`/`INTO_OUTFILE`/`INTO_DUMPFILE`→**合成为一枚** `into_outfile`、
+`CROSS_CATALOG` **没有对应成员**（实现折进 `table_not_allowed`，见 §9.2）。
+反过来，17 枚里有 **12 枚是 §1.2 没有的**（`empty_statement`、`too_large`、`unsupported_construct`、
+`hint_not_allowed`、`executable_comment`、`procedure_analyse`、`prepared_statement`、
+`top_level_not_select`、`dml_in_cte`、`pg_file_access`、`sleep_function`、`danger_function`）——
+它们来自 003 施工时"sqlglot 宽容 parser 需要正则级兜底"与"未知一律拒"那两条实测（§9.1）。
+**词表以本表为准**，§1.2 的大写名不要再当可 grep 的码。
+
+`TOO_COSTLY`（§0 表与 §2 的 dry-run 拒因）**不在这 17 枚里**：它属第二层，今天零实现，
+随工单 037 加进同一枚枚举——所以 035 的机械检查是**表驱动**的，加成员只动枚举一处。
 
 ### 1.2 规则清单
 
@@ -623,6 +683,7 @@ def test_allow(sql):
 
 | §1.1/§1.2 要求 | 实现现状 |
 |---|---|
+| ① "每条拒绝都带**枚举化**的 `rule_id`" | **as-built(P5-035)**：这半句在 035 之前一直是"文档有字、实物无枚举"——§1.1 的注解写的就是 `code: str`，17 枚码由 **20 处"首参是裸字符串"的调用点**（12 处 `SqlGuardError` ＋ 8 处 `Violation`）外加 `_scan_raw_text` 的 `(pattern, code, hint)` 三元组表里那 3 枚维持一致，没有任何一处能穷举出值域。035 落 `GuardRuleId(str, Enum)` ＋ `__str__` 返回 `self.value`（3.12 的 `Enum.__str__` 会把 `f"[{rule_id}] {message}"` 变成 `'[GuardRuleId.multi_statement] …'`，那是用户可见文案）＋ 一条表驱动的封闭集合用例。**对外值一字未改**：54 条必拒语料改动前后逐条同码，对照表在 `.scratch/p5-sql-guard-hardening/evidence/ruleid_{before,after}035.txt`。工单 035 记的"22 个拒绝点"是它的计数口径（14 个 `SqlGuardError` 调用点 + 8 处 `Violation` 字面构造）；本轮 AST 实测调用点总数 **23**，多的那处是 `SqlGuardError.__init__` 内部把 `rule_id` 转发给 `Violation`，不是拒绝点而是适配器 |
 | `allowed_schemas` 单独入参 | 折进 `allowed`（表白名单里已带 `db`，短表名由 `default_schema` 补全）→ 效果等价且更严 |
 | `forbid_files: bool = True` | 恒为真，不给关 |
 | ⑥ `CROSS_CATALOG` 独立规则 | 归 `table_not_allowed`（catalog 非空的白名单条目本来就不存在） |

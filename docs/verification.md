@@ -1086,6 +1086,37 @@ in 499.67s (0:08:19)`，**exit 0**——用户按下面 runbook 补了 `ANALYZE;
 
 ---
 
+### 1.11 P5 守卫加固的闸门口径（工单 035 起头）
+
+P5 是**零迁移**片，所以本节开头重复 §1.8.1 那个探针的动作：查实真库版本。本轮（2026-10-20）跑
+`cd backend && .venv/Scripts/alembic.exe current` → **`0009 (head)`**，与 P4 实录里"探针第一行 = `0009`"
+同一个落点。
+P5 全程**不该出现第二个数**；041 收口时再跑一次做对照，若那一刻读到 `0010`，就是有人往零迁移片里
+塞了迁移，先回工单再说。
+
+闸门基线沿用 §1.10 的第三跑：**1230 passed / 2 skipped、exit 0**（HEAD `0cba24f`）。
+`tests/guard` 一族本轮实测收集 **186 条**（`pytest tests/guard --collect-only -q` 逐文件：
+`test_reject_corpus` 54 + `test_allow_corpus` 20 + `test_corpus_mutation` 90 + `test_guard_api` 8 +
+`test_postgres_dialect` 14）。注意 **54 与 18 是语料条数、20 与 186 是收集条数**：allow 那一族
+`ALLOW_CASES` 是 18 条，收集出 20 是因为另有两条非参数化用例。035 的口径是**只加不减**，
+新增全部落新文件 `tests/guard/test_rule_id_closed_set.py`，一条现有用例都不改——真改了，
+说明动的不是类型而是判定或值域，那是越界，回滚重做。
+
+035 的验收 1 不靠"跑过了"这句话，靠**同一份探针跑两遍**：脚本
+`.scratch/p5-sql-guard-hardening/evidence/snap_ruleid035.py`（只读探针，不改任何文件、不连任何库）
+把 54 条必拒语料的 `expected / actual / type(rule_id).__name__ / violations 条数 / message 原文`，
+与 18 条必放行语料的 `tables / sql_final 原文`逐条落盘，改动前后各跑一次。两份文件的 diff
+**只允许出现在两处**：`kind` 那一栏（`str` → `GuardRuleId`）与文件头那行"`GuardRuleId` 在场？"。
+before 那一跑的本轮实录：`lines=224 / mismatch=0 / kind=str / GuardRuleId 在场？ False`。
+
+同一份探针顺带钉住 §1.1.1 那张词表的算术：17 枚码在 54 条语料里的期望值分布逐枚相加
+正好 **54**，且**双向无孤儿**——没有一枚码在用例里点不到名，也没有一条期望值不是文件里在场的码。
+这两个"没有"就是那条封闭集合用例的靶子（表驱动，036/037 加新码时只动枚举一处、不维护平行清单）。
+
+后续 036~040 的实测与手测往本节续写，一格一把；041 收口时把 P5 五条验收逐条对上这里的证据路径。
+
+---
+
 ## 2. 测试分层
 
 ### 2.1 单元测试重点（纯函数，不碰 DB / 不碰网络）
