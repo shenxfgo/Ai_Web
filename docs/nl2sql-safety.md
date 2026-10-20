@@ -24,9 +24,9 @@
 ```python
 class GuardRuleId(StrEnum):
     """拒绝词表：成员名是内部名，**值才是对外接口**（落 `guard_result` JSONB、进验收字面）。
-    17 枚逐枚的"拦的是什么"见下面 §1.1.1 那张表——那张表是词表的唯一清单，值与它第一列一字不差。"""
+    18 枚逐枚的"拦的是什么"见下面 §1.1.1 那张表——那张表是词表的唯一清单，值与它第一列一字不差。"""
 
-    multi_statement = "multi_statement"   # …其余 16 枚显式赋值，不用 AUTO：值不许跟着成员名漂
+    multi_statement = "multi_statement"   # …其余 17 枚显式赋值，不用 AUTO：值不许跟着成员名漂
     ...
 
 @dataclass(frozen=True)
@@ -67,11 +67,15 @@ def guard(
 > 直接继承 `StrEnum`（`__str__` 本就是值），且 ruff 的 `UP042` 在 `target-version=py312` 下就只认这一种写法。
 > `json.dumps` 走的是 `_value_`，两种写法都不受影响。
 
-### 1.1.1 拒绝词表（17 枚，as-built(P5-035)）
+### 1.1.1 拒绝词表（18 枚，as-built(P5-036)）
 
 顺序就是 `guard()` 的判定顺序（预处理 → 裸文本 → 解析 → 顶层 → 子结构 → 函数 → 表 → 钳位/重生成）；
 "落点"写**函数名不写行号**，行号会随施工漂。语料条数是本轮实测：54 条必拒语料的期望值分布，
-逐条相加正好 54，**没有一枚码在用例里没有对应**——那条机械用例钉的就是这件事（035 验收 3）。
+逐条相加正好 54。**"没有一枚码没人证过"这件事的判据从 036 起改了形**：钉住处可以是语料的一条期望值，
+也可以是某条**永久用例**直接点这枚成员的名——`regeneration_drift` 属后者，因为它是**我们自己代码的内部
+一致性故障**，今天没有任何一支模型 SQL 能触发它（实测：18 条必放行语料逐条走等价自校验，漂移候选 0 条），
+硬要往语料里塞一条就只能是靠 monkeypatch 才过得去的死条目。机械用例仍表驱动、零平行清单：
+它扫 `tests/guard/` 全目录对 `GuardRuleId.<成员>` 的引用，与语料期望值取并集（036 拍板，见 §1.1.1 末）。
 
 | `rule_id` 的值 | 拦的是什么 | 落点 | 语料条数 |
 |---|---|---|---|
@@ -92,6 +96,7 @@ def guard(
 | `sleep_function` | MySQL `SLEEP()`：它让语句超时形同虚设 | `_function_violations` | 1 |
 | `danger_function` | **兜底那一档**：sqlglot 认不出的函数一律落成 `exp.Anonymous`，一律拒。新增的危险函数无需改这里就已经被挡 | `_function_violations` | 2 |
 | `table_not_allowed` | 两种：系统字典表（`information_schema`/`mysql`/`pg_catalog`… **即便已授权也拒**）、白名单外 | `_table_violations` | 7 |
+| `regeneration_drift` | **第 18 枚，也是唯一一枚防的是我们自己的代码**：`final` 序列化出的 `sql_final` 再 parse 一次，两次文本或两棵树不一致——它红了就意味着"不知道执行的是哪条 SQL"，按拒答处理。它**不是**用户 SQL 违规，所以不许挂 `unsupported_construct`（那等于把我们的 bug 报成用户的错） | `guard` 出口处的 `_regeneration_violation`（§1.3） | 0（钉在 `tests/guard/test_regeneration_invariant.py`，理由见本节开头） |
 
 **与 §1.2 那些大写名的关系**（评审期写法速记，实物从来不是这个拼法）：
 `MULTI_STATEMENT`→`multi_statement`、`ROW_LOCKING`→`locking_clause`、
@@ -103,9 +108,13 @@ def guard(
 `top_level_not_select`、`dml_in_cte`、`pg_file_access`、`sleep_function`、`danger_function`）——
 它们来自 003 施工时"sqlglot 宽容 parser 需要正则级兜底"与"未知一律拒"那两条实测（§9.1）。
 **词表以本表为准**，§1.2 的大写名不要再当可 grep 的码。
+（as-built(P5-036)：第 18 枚 `regeneration_drift` **同样不在 §1.2 里**，且它连"拦的是一段 SQL"都不是——
+§1.2 那张清单从头到尾讲的是"模型的 SQL 里有什么不许"，而这一枚讲的是"守卫自己的输出对不对"。
+两者不该混在一张清单里，所以 §1.2 不加行。）
 
-`TOO_COSTLY`（§0 表与 §2 的 dry-run 拒因）**不在这 17 枚里**：它属第二层，今天零实现，
-随工单 037 加进同一枚枚举——所以 035 的机械检查是**表驱动**的，加成员只动枚举一处。
+`TOO_COSTLY`（§0 表与 §2 的 dry-run 拒因）**不在这 18 枚里**：它属第二层，今天零实现，
+随工单 037 加进同一枚枚举——所以 035 的机械检查是**表驱动**的，加成员只动枚举一处；
+036 把"钉住处"从"必须是语料"放宽成"语料或用例"（见本节开头），是因为第一个**不可能有语料**的成员出现了。
 
 ### 1.2 规则清单
 
@@ -221,22 +230,62 @@ sql_final = stmt.sql(dialect=dialect, comments=False, pretty=False)
 
 ### 1.3 守卫一致性不变式（防 rewrite 漂移）
 
-守卫**执行的是重生成的 SQL**，并断言：
+本节原来把三条都写成"守卫内部的动作"。**as-built(P5-036) 对着实物改口**：三条里有两条今天住在
+测试侧，第三条（等价自校验）从 036 起才真在守卫内部。落点逐条写明，不再含糊：
 
-```python
-assert 顶层 LIMIT 存在 and 顶层 LIMIT <= max_rows + 1      # §1.2 ⑦ 钳位后的真不变式
-assert ";" not in out.sql and "/*" not in out.sql          # 重生成后的硬不变式
-assert guard.parse(out.sql, error_level=RAISE)             # 幂等：可再解析
-```
+| 不变式 | 落点（as-built 036） | 实物 |
+|---|---|---|
+| 顶层 LIMIT 恒 `<= max_rows + 1` | **测试侧** `tests/guard/test_guard_api.py::test_钳位不变式_守卫输出的顶层_LIMIT_恒不超过_max_rows_plus_1` | 对 11 种形状逐条 parse 输出、**独立**读一遍顶层行数（不复用 `_limit_row_count`，否则是自证） |
+| 输出不含 `;`、不含 `/*` | **测试侧** `tests/guard/test_allow_corpus.py::test_合法只读查询被放行并强制带上limit` | 18 条必放行语料逐条 |
+| 重生成的 SQL 还能被严格解析（幂等） | **测试侧**，同上一条用例的最后两行 | 再 parse + 再生成，两次文本逐字相等 |
+| **重生成等价**：`parse(sql_final)` 与 `final` 是同一棵树 | **守卫内部** `_regeneration_violation`（036 起，每次 `guard()` 都跑） | 见下 |
 
 > **as-built(2026-09-29)**：第一条原来是 `endswith("LIMIT 1001") or "LIMIT" in upper()`——那个 `or`
 > 让任何带 LIMIT 的语句都算通过，等于没断。钳位落地后它才第一次有内容：**顶层 LIMIT 恒不超过
-> `max_rows+1`**（值不一定是 `max_rows+1`，模型写了个更小的数时就是那个数）。钉子是
-> `tests/guard/test_guard_api.py::test_钳位不变式_守卫输出的顶层_LIMIT_恒不超过_max_rows_plus_1`，
-> 它对 11 种形状逐条 parse 输出、独立读一遍顶层行数（不复用 `_limit_row_count`，否则就是自证）。
+> `max_rows+1`**（值不一定是 `max_rows+1`，模型写了个更小的数时就是那个数）。
 
-以及"重生成后再 parse 一次的 AST 与首次 parse 的 AST 归一化相同"——防 rewrite 漂移。
+**守卫内部那一条的确切形状（这是本节唯一的实物新增，防的不是模型而是我们自己的代码）**：
+
+- **比对的两侧是钳位之后的 `final` 与 `parse(sql_final)`，不是模型原文那棵 `stmt`**。
+  `guard()` 自己会注入/改写顶层 LIMIT，所以"重生成 ≠ 原文"是**设计**而不是漂移——拿 `stmt` 来比，
+  每一条缺 LIMIT 的合法查询都会报内部故障。这一格是整节最写错就全反的地方。
+- **两条腿一起跑，缺一条就有一类故障看不见**：
+  ① **不动点**：`sql_final` 再 parse、再 `.sql(comments=False)`，两次文本**逐字**相等；
+  ② **结构相等**：`final == parse(sql_final)`（sqlglot 的 `Expression.__eq__`）。
+  分工是实测出来的，不是推理的：30.19 下 `__eq__` **看不见注释的丢失**——带注释的那棵树与把它剥掉
+  再 parse 回来的树，`==` 给出 `True`（`evidence/hint_probe036.txt` 每一支都有这一行）。
+  所以"结构相等"单独用会放过内容被抹掉那一类，而"不动点"单独用会放过同义改写（`AS` 补全、
+  括号形状变了但文本自洽）。
+- **红了就拒答，不降级成 warning**：`guard()` 把它收成一条 `Violation(regeneration_drift)` 返回
+  `ok=False, sql_final=None`；`check()` 那一侧同码抛 `SqlGuardError`。理由同 §9 那族"证不了就按最严的一档"——
+  这一条红了我们连"执行的是哪句话"都不知道。
+- **它今天是一条永真的保险丝**（这是实测结论，不是修辞）：18 条必放行语料逐条走这两条腿，
+  漂移候选 0；而工单 036 验收 2 指定的那发变异（把 `.limit(...)` 改成对已带 LIMIT 的语句也钳一次）
+  **造不出漂移**——`.limit()` 是替换不是叠加，钳位后那棵树自己就是自洽的。所以 036 的变异记账
+  改成两发：摘掉自校验 → 全绿（证明它是纯保险丝、不改变任何现有判定）；把出口生成改成
+  `pretty=True` → 结构相等那腿仍过、不动点那腿红（证明两条腿各自有独立的捕获面）。
+  如实写在这里，不为了"验收 2 变红"去故意写错实现。
+- **运行期这一条不是 Python 的 `assert`**：`python -O` 会把它整条剥掉，而这条断言的全部意义是
+  "生产路径上每次守卫都跑"。它是一次真调用（`_regeneration_violation`）加一条永久用例。
+  工单 036 验收 3 的字面"`grep -n assert` 从此不再是零命中"因此按实物兑现为
+  "守卫内部有一条真会生效的运行期自校验，且它的失败路径有永久用例"——
+  顺带记一笔：035 之后 `grep -n assert app/services/sql_guard.py` 命中的那**一**行住在本模块的
+  docstring 里（写的是 `check()` 那族测试的断言），不是运行期语句。
+- **性能这一格量化在这里**（口径没改，两条腿都在运行期跑）：`guard()` 单次 0.619 ms →
+  加自校验后 1.090 ms/次（+0.471 ms，+76%；单跑一次 `parse(sample).sql(comments=False)` 是 0.443 ms）。
+  绝对值相对一次 LLM 调用与一次真库查询差着两到三个数量级，所以不拿"只抽样几条"糊过去，
+  也不改成"结构相等为主"。数字来源 `evidence/hint_probe036.txt` 末节。
+
+以及"重生成后再 parse 一次的 AST 与首次 parse 的 AST 归一化相同"——这句话的**主语在 036 订正为
+`final`**（上一条第一个项目），原写的"首次 parse 的 AST"按实物是错的。
+"归一化"的定义就是那两条腿，不另造一套规范化。
 重跑（`POST /chat/messages/{id}/rerun`）**绝不复用旧 `sql_final`**，同样走完整 guard。
+
+> **"守卫执行的是重生成的 SQL"这一半早在 036 之前就是实物**，第一次点名链：
+> `guard()` 返回 `sql_final=final.sql(dialect=dialect, comments=False)`（`app/services/sql_guard.py`
+> 的 `guard` 出口）→ `pipeline.ask()` 里 `out.sql_final = msg.sql_final = guarded.sql_final` →
+> 同函数下一步 `execute_readonly(..., sql_final=guarded.sql_final or "", ...)`。
+> 中间没有任何一步把模型的 `sql_raw` 递给执行器。
 
 ---
 
@@ -247,9 +296,8 @@ assert guard.parse(out.sql, error_level=RAISE)             # 幂等：可再解�
 天然挡住这条经典绕过（对应语料 `executable_comment`）。顺带完成方言归一：
 AI 写了 `LIMIT 10` 给 PG 也能被重写成合法形态。重生成结果必须满足不变式：**不含 `;`、不含 `/*`**。
 
-**副作用与对策（这是设计里最微妙的一条）**：`comments=False` 同时会剥掉优化器 hint——
-MySQL 的 `/*+ MAX_EXECUTION_TIME(n) */` 也是注释。这会造成"**守卫看到的 SQL ≠ 实际执行的 SQL**"，
-属于最危险的一类不一致。因此定稿的规则是：
+**副作用与对策（这是设计里最微妙的一条）**：`comments=False` 会剥掉注释，而 hint 长得像注释——
+这会造成"**守卫看到的 SQL ≠ 实际执行的 SQL**"，属于最危险的一类不一致。因此定稿的规则是：
 
 1. **检测到任何 hint 节点即拒绝**（`rule_id = hint_not_allowed`）——模型本来就不该生成 hint。
 2. **超时必须走会话变量而不是 hint**：MySQL 用 `SET SESSION MAX_EXECUTION_TIME = <ms>`，
@@ -259,6 +307,37 @@ MySQL 的 `/*+ MAX_EXECUTION_TIME(n) */` 也是注释。这会造成"**守卫看
 
 > 早期草案曾打算在 SQL 前挂 `/*+ MAX_EXECUTION_TIME(n) */` 做双保险（因为 session 变量可能被中间件重置），
 > 该做法与 `comments=False` 冲突，已作废；现在只保留 `SET SESSION` 路径。
+
+**as-built(P5-036)：上面那句"`comments=False` 会剥掉 hint"按两支方言分开订正**（实测见
+`.scratch/p5-sql-guard-hardening/evidence/hint_probe036.txt`，sqlglot 30.19.0）：
+
+| 形状 | 树上的落点 | `.sql(comments=False)` 之后 | 结论 |
+|---|---|---|---|
+| MySQL `/*+ MAX_EXECUTION_TIME(1) */`、`/*+ NO_ICP */`（含 JOIN 那一支） | **`args["hint"]` 上的 `exp.Hint` 真节点**，内含 `Anonymous`/`Var` | **`/*+ … */` 原样在场**，且再 parse 一次它还活着 | **剥不掉**。`comments=False` 只处理 `Comment`，不处理 `exp.Hint` |
+| PG `/*+ SeqScan(t1) */`、PG `/*+ x */` | 树上**没有** `exp.Hint`（落成注释） | 不在场（`comments=True` 才出 `/* + x */`） | 剥得掉 |
+| MySQL `/* +MAX_EXECUTION_TIME(1) */`（`+` 前有空白） | 没有 `exp.Hint` | 不在场 | 放行是**对的**：MySQL 的 hint 语法要求 `/*+` 紧贴，源库不执行它。我们的判据是 `body.startswith("+")`，**与源库同构**，不是写松也不是写紧 |
+| `SELECT '/*+ MAX_EXECUTION_TIME(1) */' AS remark`（hint 写在字符串字面量里） | 没有 `exp.Hint` | **在场**，因为它是数据 | 放行是**对的**。掩码扫描先把它认成字面量，所以既不误拒也不漏判 |
+
+由此得到三条要长期成立的口径：
+
+- **hint 的防线只有一道，就是裸文本层**。`_strip_comments` 在 AST 之前抛 `hint_not_allowed`，
+  今天语料里那条 `SELECT 1 /*+ MAX_EXECUTION_TIME(1) */` 钉的就是它。它**不是**"额外保险"——
+  MySQL 那一支如果摘掉，hint 会原样穿过钳位与重生成、被源库真的执行，而守卫的 `sql_final` 里
+  也看得见它（表第一行）。这就是为什么拒绝必须落在裸文本层而不是等 AST：AST 层看见 hint 时，
+  它已经是会被序列化出去的一部分了。
+- **`comments=False` 不是 hint 防线**，它是**可执行注释**（`/*! … */`）的防线，
+  且那一条也靠 `_strip_comments` 先拒（`executable_comment`）才成立——两件事原来写在一起，现在分开。
+- **重生成等价自校验（§1.3）看不见 hint 被剥掉**这一维要靠结构相等之外的那条腿吗？实测答案是不必：
+  MySQL 的 hint 在两条腿上都"一致"（它活过了序列化，两边都有它），所以等价自校验**不能**当 hint 防线用，
+  hint 归 hint、等价归等价，两族用例各钉各的。
+
+> **顺带把 §1.3 那两条测试侧断言的辖区说清**（036 实测，探针表末行）：
+> `";" not in sql_final` 与 `"/*" not in sql_final` **不是对全体合法输入都成立的不变式**——
+> `SELECT '/*+ MAX_EXECUTION_TIME(1) */' AS remark FROM customer` 这类把 hint 写在**字符串字面量**里的
+> 查询是合法的、且 `sql_final` 里就带着 `/*`（同理 `SELECT 'a;b'` 带着 `;`）。它们今天全绿是因为
+> 18 条必放行语料里没有这种字面量。真正要钉的性质是"注释与 hint 不会以**语法成分**的身份进到树上"，
+> 不是"这两个子串不出现"。下一位若把这两条当全称量词去推广，就会在加语料的那一刻撞红——
+> 撞红了是对的（说明该重新表述），不要改成"跳过字面量"了事，那样这条断言就谁也不防了。
 
 ---
 
