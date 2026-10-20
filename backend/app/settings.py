@@ -165,6 +165,8 @@ class RetrievalGroup(BaseModel):
     token_budget: int = 12000
     catalog_digest_max_tables: int = 1000
     trgm_threshold: float = 0.08
+    # 键保留、**无读取点**。归属 architecture §5.2 那档 "(0) LLM 改写/指代消解"，
+    # spec §6 明确不做，P4-034 复核过也没建空壳。
     enable_rewrite: bool = False
     few_shot_examples: int = 3
     few_shot_token_budget: int = 1500
