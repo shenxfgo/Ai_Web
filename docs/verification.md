@@ -1094,10 +1094,13 @@ P5 是**零迁移**片，所以本节开头重复 §1.8.1 那个探针的动作�
 P5 全程**不该出现第二个数**；041 收口时再跑一次做对照，若那一刻读到 `0010`，就是有人往零迁移片里
 塞了迁移，先回工单再说。
 
-闸门基线沿用 §1.10 的第三跑：**1230 passed / 2 skipped、exit 0**（HEAD `0cba24f`）。
-`tests/guard` 一族本轮实测收集 **186 条**（`pytest tests/guard --collect-only -q` 逐文件：
+闸门基线沿用 §1.10 的第三跑：**1230 passed / 2 skipped、exit 0**（HEAD `0cba24f`）；
+035 施工半边整轮实跑 **1238 passed / 2 skipped、exit 0**（正是基线 + 本片新增 8 条，一条未减），
+`ruff format --check app scripts tests alembic` 195 files clean、`mypy app` 57 files 零问题。
+`tests/guard` 一族在 035 之前实测收集 **186 条**（`pytest tests/guard --collect-only -q` 逐文件：
 `test_reject_corpus` 54 + `test_allow_corpus` 20 + `test_corpus_mutation` 90 + `test_guard_api` 8 +
-`test_postgres_dialect` 14）。注意 **54 与 18 是语料条数、20 与 186 是收集条数**：allow 那一族
+`test_postgres_dialect` 14），035 之后是 **194 条**（多出的 8 条全在新文件）。
+注意 **54 与 18 是语料条数、20 与 186 是收集条数**：allow 那一族
 `ALLOW_CASES` 是 18 条，收集出 20 是因为另有两条非参数化用例。035 的口径是**只加不减**，
 新增全部落新文件 `tests/guard/test_rule_id_closed_set.py`，一条现有用例都不改——真改了，
 说明动的不是类型而是判定或值域，那是越界，回滚重做。
@@ -1105,13 +1108,31 @@ P5 全程**不该出现第二个数**；041 收口时再跑一次做对照，若
 035 的验收 1 不靠"跑过了"这句话，靠**同一份探针跑两遍**：脚本
 `.scratch/p5-sql-guard-hardening/evidence/snap_ruleid035.py`（只读探针，不改任何文件、不连任何库）
 把 54 条必拒语料的 `expected / actual / type(rule_id).__name__ / violations 条数 / message 原文`，
-与 18 条必放行语料的 `tables / sql_final 原文`逐条落盘，改动前后各跑一次。两份文件的 diff
-**只允许出现在两处**：`kind` 那一栏（`str` → `GuardRuleId`）与文件头那行"`GuardRuleId` 在场？"。
-before 那一跑的本轮实录：`lines=224 / mismatch=0 / kind=str / GuardRuleId 在场？ False`。
+与 18 条必放行语料的 `tables / sql_final 原文`逐条落盘，改动前后各跑一次。before 用 `git show` 把头
+那份 `sql_guard.py` 的字节回灌到工作树再跑，跑完按 md5 断言换回来——快照对 `actual` 与 `message` 原文
+逐条落盘，所以"before"必须真是改动前那份实物，不能是我记的实物。两份各 **230 行**，
+`ruleid_before035.txt` / `ruleid_after035.txt` 的 unified diff 共 **56 行**，逐行分类实测：
+标题那行（`label=before/after`）**1**、"GuardRuleId 在场？"（False→True）**1**、
+`kind=` 那一栏（`str`→`GuardRuleId`，即异常里 `rule_id` 的实际类型换了）**54**——
+抹掉这三类后两份**逐行完全相同**（脚本断言归一化后相等），54 条的 `expected`/`actual`/`message`
+与 18 条的 `sql_final` **没有一个字变过**，两份汇总行都是 `期望与实测不一致的条数 = 0`。
 
 同一份探针顺带钉住 §1.1.1 那张词表的算术：17 枚码在 54 条语料里的期望值分布逐枚相加
 正好 **54**，且**双向无孤儿**——没有一枚码在用例里点不到名，也没有一条期望值不是文件里在场的码。
 这两个"没有"就是那条封闭集合用例的靶子（表驱动，036/037 加新码时只动枚举一处、不维护平行清单）。
+
+验收 3 要的"故意塞一枚假成员必须红"是**一次性变异**，实现在
+`.scratch/p5-sql-guard-hardening/evidence/mut_ruleid035.py`（结论落同目录 `mutation_ruleid035.txt`，
+**没有**留进永久用例）。四格每格都先断锚点在源文件里正好命中一次，写脏后跑整族 `tests/guard`，
+再 `try/finally` + md5 复原；四格与实测红格：
+① 塞一枚没有语料点过名的假成员 → 红 **2** 条（"双向无孤儿"与"可穷举"）；
+② 把一枚成员的值改脏（多一个 `s`）→ 红 **25** 条（语料逐条归因 3 + 放行侧攻击变异 18 + 枚举手自身 4），
+这一格就是"对外值不许变"那条口径的实物防线；
+③ 把一个调用点的首参退回裸字符串 → 红 **3** 条（两条 `ast` 机械检查，外加"两条接缝同一枚成员"那条的
+`is` 身份断言——裸串与成员相等但不 `is`，所以身份断言不是多余的）；
+④ 把 `_scan_raw_text` 三元组表里一枚码退回裸字符串 → **只**红 1 条（"码字面量只住枚举手"）：
+首参那条抓不到它，因为传进去的是变量——**这一格正是第二条检查存在的理由**，否则它就是重复劳动。
+四格各自 `rc=1`，复原后整目录回 `rc=0`。
 
 后续 036~040 的实测与手测往本节续写，一格一把；041 收口时把 P5 五条验收逐条对上这里的证据路径。
 

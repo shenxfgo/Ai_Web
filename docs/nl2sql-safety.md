@@ -22,7 +22,7 @@
 ### 1.1 接口
 
 ```python
-class GuardRuleId(str, Enum):
+class GuardRuleId(StrEnum):
     """拒绝词表：成员名是内部名，**值才是对外接口**（落 `guard_result` JSONB、进验收字面）。
     17 枚逐枚的"拦的是什么"见下面 §1.1.1 那张表——那张表是词表的唯一清单，值与它第一列一字不差。"""
 
@@ -55,15 +55,17 @@ def guard(
 > **as-built(P5-035)**：上面那句"枚举化"在 035 之前**只有字面没有实物**——`code` 的注解是 `str`，
 > 17 枚码散在 20 个"首参是裸字符串"的调用点里各自维持一致（另有 `_scan_raw_text` 的
 > `(pattern, code, hint)` 三元组表带 3 枚），全仓**没有任何一处能回答"这套系统一共有哪些拒绝原因"**。
-> 035 把它收成 `GuardRuleId(str, Enum)` ＋ 一条"越界就红"的机械用例，**对外值一字未改**
+> 035 把它收成 `GuardRuleId(StrEnum)` ＋ 一条"越界就红"的机械用例，**对外值一字未改**
 > （54 条必拒语料改动前后逐条同码，对照表见 §1.1.1 末与 verification §1.11）。
 > 这一枚枚举是**对外词表**：新增拒绝分支只能用它的成员，改名或改值都要先改本文。
 >
-> **一条必须写进接口的 Python 事实**：`GuardRuleId` 继承 `str` 之后，3.12 的
-> `Enum.__str__` 让 `str(成员)` 与 `f"[{成员}]"` 出 `'GuardRuleId.multi_statement'` 而不是值，
-> 而 `SqlGuardError` 的异常正文是 `f"[{rule_id}] {message}"`、`pipeline` 落库的
-> `sql_validation_error` 也拼同一支串——所以**必须显式 `__str__` 返回 `self.value`**，
-> 否则一次纯类型重构会顺手改掉用户可见的文案。`json.dumps` 走的是 `_value_`，不受这条影响。
+> **一条必须写进接口的 Python 事实**：成员值会同时被三处消费——`SqlGuardError` 的异常正文
+> `f"[{rule_id}] {message}"`、`pipeline` 落库的 `sql_validation_error` 同一支串、以及
+> `guard_result` 那格 JSONB。3.12 的 `Enum.__str__` 会让 `str(成员)` 与 `f"[{成员}]"` 出
+> `'GuardRuleId.multi_statement'` 而不是值，所以 `(str, Enum)` 那种混写**要么显式补
+> `__str__` 返回 `self.value`、要么一次纯类型重构就顺手改掉用户可见的文案**。这里选的是后者更省的一面：
+> 直接继承 `StrEnum`（`__str__` 本就是值），且 ruff 的 `UP042` 在 `target-version=py312` 下就只认这一种写法。
+> `json.dumps` 走的是 `_value_`，两种写法都不受影响。
 
 ### 1.1.1 拒绝词表（17 枚，as-built(P5-035)）
 
@@ -683,7 +685,7 @@ def test_allow(sql):
 
 | §1.1/§1.2 要求 | 实现现状 |
 |---|---|
-| ① "每条拒绝都带**枚举化**的 `rule_id`" | **as-built(P5-035)**：这半句在 035 之前一直是"文档有字、实物无枚举"——§1.1 的注解写的就是 `code: str`，17 枚码由 **20 处"首参是裸字符串"的调用点**（12 处 `SqlGuardError` ＋ 8 处 `Violation`）外加 `_scan_raw_text` 的 `(pattern, code, hint)` 三元组表里那 3 枚维持一致，没有任何一处能穷举出值域。035 落 `GuardRuleId(str, Enum)` ＋ `__str__` 返回 `self.value`（3.12 的 `Enum.__str__` 会把 `f"[{rule_id}] {message}"` 变成 `'[GuardRuleId.multi_statement] …'`，那是用户可见文案）＋ 一条表驱动的封闭集合用例。**对外值一字未改**：54 条必拒语料改动前后逐条同码，对照表在 `.scratch/p5-sql-guard-hardening/evidence/ruleid_{before,after}035.txt`。工单 035 记的"22 个拒绝点"是它的计数口径（14 个 `SqlGuardError` 调用点 + 8 处 `Violation` 字面构造）；本轮 AST 实测调用点总数 **23**，多的那处是 `SqlGuardError.__init__` 内部把 `rule_id` 转发给 `Violation`，不是拒绝点而是适配器 |
+| ① "每条拒绝都带**枚举化**的 `rule_id`" | **as-built(P5-035)**：这半句在 035 之前一直是"文档有字、实物无枚举"——§1.1 的注解写的就是 `code: str`，17 枚码由 **20 处"首参是裸字符串"的调用点**（12 处 `SqlGuardError` ＋ 8 处 `Violation`）外加 `_scan_raw_text` 的 `(pattern, code, hint)` 三元组表里那 3 枚维持一致，没有任何一处能穷举出值域。035 落 `GuardRuleId(StrEnum)`（不是 `(str, Enum)`：后者的 `__str__` 出 `'GuardRuleId.multi_statement'`，而 `SqlGuardError` 的正文拼的是 `f"[{rule_id}] {message}"`，那是用户可见文案；`StrEnum` 的 `__str__` 就是值，ruff 的 `UP042` 也只认这一种写法）＋ 一条表驱动的封闭集合用例。**对外值一字未改**：54 条必拒语料改动前后逐条同码，对照表在 `.scratch/p5-sql-guard-hardening/evidence/ruleid_{before,after}035.txt`。工单 035 记的"22 个拒绝点"是它的计数口径（14 个 `SqlGuardError` 调用点 + 8 处 `Violation` 字面构造）；本轮 AST 实测调用点总数 **23**（14 处 `SqlGuardError` ＋ 9 处 `Violation`）、其中首参是裸串字面量的 **20** 处（12 raise ＋ 8 构造，另加 `_scan_raw_text` 三元组表那 3 枚字面量）。两个数说的是同一批点位，换算写在这里免得下人再数一遍：工单那 14 处 raise 含 `:223`（传变量 `code`）与 `check()`（把 `Violation` 翻成 raise）两处非字面量，22 减这两处就是本轮的 20；23 比 22 多的那一处是 `SqlGuardError.violation` 属性内部那次 `Violation(...)` 构造——不是拒绝点而是适配器 |
 | `allowed_schemas` 单独入参 | 折进 `allowed`（表白名单里已带 `db`，短表名由 `default_schema` 补全）→ 效果等价且更严 |
 | `forbid_files: bool = True` | 恒为真，不给关 |
 | ⑥ `CROSS_CATALOG` 独立规则 | 归 `table_not_allowed`（catalog 非空的白名单条目本来就不存在） |
