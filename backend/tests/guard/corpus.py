@@ -116,10 +116,15 @@ REJECT_CASES: tuple[tuple[str, str], ...] = (
     ("SELECT * FROM order_main FOR UPDATE", "locking_clause"),
     ("SELECT * FROM order_main LOCK IN SHARE MODE", "locking_clause"),
     ("SELECT * FROM customer c JOIN order_main o ON c.id=o.cid FOR SHARE o.id", "locking_clause"),
-    # §8.1 可执行注释与优化器 hint：注释里的 SQL 会被 MySQL 真的执行，
-    # 而 comments=False 的重生成会把它整个抹掉——两道防线都不能只靠 AST
+    # §8.1 可执行注释与优化器 hint：注释里的 SQL 会被 MySQL 真的执行，所以两道防线都不能只靠 AST
     ("SELECT /*!50100 DROP TABLE user */ FROM dual", "executable_comment"),
     ("SELECT /*!32302 1/0, */ 1 AS x", "executable_comment"),
+    # 这一支的归因理由在 036 订正过：`comments=False` **抹不掉 MySQL 的 hint**——sqlglot 30.19 把
+    # `/*+ … */` 落成 `args["hint"]`（`exp.Hint`），它是 AST 的一部分，重生成后原样在场
+    # （实测 `evidence/hint_probe036.txt`）。挡住它的只有这一层裸文本判定，AST 层那道自校验帮不上。
+    # 工单 036 验收 4 另量的三种形状（带 JOIN 的 MySQL 支、PG 的 `/*+ SeqScan(t1) */`、PG 方言里的
+    # `/*+`）住在 `test_regeneration_invariant.py::test_hint_三种形状两条接缝同码`，没往这里加：
+    # 语料 54 条按 036 的"已定口径"不许动（差额记在 safety.md §9.2 的 036 那一行）。
     ("SELECT 1 /*+ MAX_EXECUTION_TIME(1) */", "hint_not_allowed"),
     # §8.1 CTE 里塞 DML：顶层是 SELECT，白名单也全过，只有递归检查能抓到（PG 的写法）
     (

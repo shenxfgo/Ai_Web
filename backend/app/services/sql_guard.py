@@ -4,7 +4,8 @@
 所以新增语法形态的默认结果是拒，不是放。
 
 规则有先后：预处理 → 裸文本（注释/锁定/INTO）→ 解析 → 单语句 → 顶层类型 → 子结构
-（CTE 内 DML、SELECT INTO、变量）→ 函数 → 表白名单 → 强制 LIMIT → 重生成。
+（CTE 内 DML、SELECT INTO、变量）→ 函数 → 表白名单 → 强制 LIMIT → 重生成 → **重生成等价自校验**。
+最后那一步防的不是模型而是本模块自己：它红了就拒答（§1.3）。
 `check()` 命中第一条即抛错，`guard()` 收集全部违规（HTTP 层要一次展示所有问题）。
 """
 
@@ -54,6 +55,7 @@ class GuardRuleId(StrEnum):
     sleep_function = "sleep_function"
     danger_function = "danger_function"
     table_not_allowed = "table_not_allowed"
+    regeneration_drift = "regeneration_drift"
 
 
 _MAX_SQL_LEN = 8_000
@@ -417,6 +419,102 @@ def _table_violations(
     return out
 
 
+def regeneration_violation(
+    final: exp.Expression,
+    sql_final: str,
+    *,
+    dialect: Dialect,
+    default_schema: str,
+    refs: tuple[QualifiedTable, ...],
+) -> Violation | None:
+    """§1.3 的重生成等价自校验：守卫端出去的那句话，必须**还是它判过的那句话**。
+
+    比对的左侧是 `final`（钳位**之后**那棵树）与白名单判过的那批表 `refs`，右侧是
+    `parse(sql_final)`——不是模型原文那棵 `stmt`：`guard()` 自己会注入/改写顶层 LIMIT，
+    "重生成 ≠ 原文"是设计而不是漂移。
+
+    跑**一条不动点 + 三格语义承重**，每条都有自己的红法：
+
+    ① **不动点**：`sql_final` 再解析、再生成，两次文本逐字相等；
+    ② **顶层形状**：`type(final) is type(parse(sql_final))`；
+    ③ **表引用**：重 parse 回来的那棵树引用的表集合，与白名单判过的 `refs` **逐字相同**
+       （比集合不比顺序：生成器换 JOIN 写法不是换表）；
+    ④ **顶层行数**：两边用同一个 `_limit_row_count` 读出的那个数一致。
+
+    > **为什么不是 `Expression.__eq__`**（工单 036 已定口径按实测改的形，证据
+    > `.scratch/p5-sql-guard-hardening/evidence/drift_diagnosis036.txt`）：
+    > `__eq__` 在实物上**两头都不对**。它过火——
+    > `SELECT id FROM customer LIMIT 5000 UNION ALL SELECT id FROM payment_record LIMIT 3`
+    > 今天合法放行，而生成器会给带 LIMIT 的那条臂加括号、重 parse 回来是 `Subquery`
+    > （树差 `.this: Select vs Subquery`），语义一字未变却判成漂移，等于误杀；
+    > 它又不及物——sqlglot 30.19 下 `__eq__` **看不见注释的丢失**：PG 那支 `/*+ SeqScan(t1) */`
+    > 重 parse 回来树上已经没有那个节点（探针里写的是"重 parse 之后 hint 还在树上？ False"），
+    > 而 `tree == reparsed` 仍是 `True`（`.scratch/.../evidence/hint_probe036.txt`）。
+    > ②③④ 这三格挑的是"守卫判过的那些**承重事实**在执行的那句话里还在不在"，
+    > 括号、`AS`、空白这类渲染形状不进判定。
+
+    红了按**拒答**处理（不降级成 warning）：这一条红了我们连"执行的是哪句话"都不知道。
+    它是**内部一致性故障**，所以挂 `regeneration_drift` 而绝不挂 `unsupported_construct`——
+    后者等于把我们的 bug 报成用户的 SQL 违规。
+    """
+    try:
+        stmts = sqlglot.parse(sql_final, read=dialect, error_level=sqlglot.ErrorLevel.RAISE)
+    except sqlglot.errors.SqlglotError as exc:
+        return Violation(
+            GuardRuleId.regeneration_drift,
+            f"重生成不等价：端出去的 SQL 连再解析一次都过不去（{sql_final[:80]!r}）",
+            type(exc).__name__,
+        )
+    if len(stmts) != 1 or stmts[0] is None:
+        return Violation(
+            GuardRuleId.regeneration_drift,
+            f"重生成不等价：端出去的 SQL 不再是一条语句（{sql_final[:80]!r}）",
+            f"语句数={len(stmts)}",
+        )
+    again = stmts[0]
+
+    fixed_point = again.sql(dialect=dialect, comments=False)
+    if fixed_point != sql_final:
+        return Violation(
+            GuardRuleId.regeneration_drift,
+            "重生成不等价：不动点那一格红——再解析再生成之后文本变了"
+            f"（{sql_final[:80]!r} → {fixed_point[:80]!r}）",
+            "不动点",
+        )
+
+    if type(final) is not type(again):
+        return Violation(
+            GuardRuleId.regeneration_drift,
+            "重生成不等价：顶层形状那一格红——守卫那棵树是 "
+            f"{type(final).__name__}，端出去的 SQL 解析回来是 {type(again).__name__}"
+            f"（{sql_final[:80]!r}）",
+            "顶层形状",
+        )
+
+    judged = set(refs)
+    reparsed_refs = set(_table_refs(again, default_schema))
+    if reparsed_refs != judged:
+        only_new = sorted(f"{r.catalog}.{r.db}.{r.name}" for r in reparsed_refs - judged)
+        only_old = sorted(f"{r.catalog}.{r.db}.{r.name}" for r in judged - reparsed_refs)
+        return Violation(
+            GuardRuleId.regeneration_drift,
+            "重生成不等价：表引用那一格红——白名单判过 "
+            f"{len(refs)} 张表，端出去的 SQL 引用的是另一批（多出 {only_new}／少了 {only_old}）",
+            "表引用",
+        )
+
+    final_rows = _limit_row_count(final)
+    again_rows = _limit_row_count(again)
+    if final_rows != again_rows:
+        return Violation(
+            GuardRuleId.regeneration_drift,
+            f"重生成不等价：顶层行数那一格红——守卫那棵树是 {final_rows}，"
+            f"端出去的 SQL 读出来是 {again_rows}（{sql_final[:80]!r}）",
+            "顶层行数",
+        )
+    return None
+
+
 def _limit_row_count(stmt: exp.Expression) -> int | None:
     """顶层 LIMIT 那个**确定的**非负行数；不是这个形状就返回 None。
 
@@ -464,18 +562,28 @@ def guard(
     if violations:
         return GuardResult(ok=False, sql_final=None, tables=refs, violations=tuple(violations))
 
-    final: exp.Expr = stmt
+    final: exp.Expression = stmt
     rows = _limit_row_count(stmt)
     if rows is None or rows >= max_rows:
         # 不包一层子查询：MySQL 5.7 优化器会丢掉子查询里的 ORDER BY，直接加在最外层更稳。
         # limit() 只长在 exp.Query 上，而 _check_top_level 已经保证 stmt 是它的后代。
         # 只在"读得出一个确定且小于上限的行数"时保留模型自己写的数（"前 5 名"不该被抬到上限）；
         # 其余一律钳成 max_rows+1：它既是缺 LIMIT 时的探针，也是超限/不可证时的内存上限。
-        final = cast("exp.Query", stmt).limit(max_rows + 1)
+        # 外面那层 cast 是类型桩的事：sqlglot 的 `Query` 在桩里不是 `Expression` 的后代，
+        # 运行时是（`SELECT` 那棵树同时是两者），所以钳位回来的那棵树要按 Expression 记。
+        final = cast("exp.Expression", cast("exp.Query", stmt).limit(max_rows + 1))
+
+    sql_final = final.sql(dialect=dialect, comments=False)
+    drift = regeneration_violation(
+        final, sql_final, dialect=dialect, default_schema=default_schema, refs=refs
+    )
+    if drift is not None:
+        # 自校验红 = 我们不知道执行的是哪句话。按拒答处理，不降级成 warning（§1.3）。
+        return GuardResult(ok=False, sql_final=None, tables=refs, violations=(drift,))
 
     return GuardResult(
         ok=True,
-        sql_final=final.sql(dialect=dialect, comments=False),
+        sql_final=sql_final,
         tables=refs,
         violations=(),
     )
