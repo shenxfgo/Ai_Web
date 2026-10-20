@@ -12,12 +12,49 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Literal, cast
 
 import sqlglot
 from sqlglot import exp
 
 Dialect = Literal["mysql", "postgres"]
+
+
+class GuardRuleId(StrEnum):
+    """拒绝词表——**对外契约**，不是内部名册。
+
+    值是接口：它落进 `chat_messages.guard_result`（JSONB）、被 `tests/guard/corpus.py` 每一条必拒
+    语料点名、被 roadmap §P2/§P3/P5 的验收字面引用。所以成员一律**显式赋值**（不用
+    `AUTO`），且成员名与值保持一字不差——`tests/guard/test_rule_id_closed_set.py` 钉住这点。
+    新增拒绝分支只能加在这里；改名或改值都要先改 `docs/nl2sql-safety.md` §1.1.1 那张表。
+    `TOO_COSTLY` 之类第二层的码随各自的工单加入同一枚枚举。
+
+    继承 `str` 是硬要求：否则 JSONB 序列化变、`assert ei.value.rule_id == "multi_statement"`
+    那一族断言整片红。选 `StrEnum` 而不是 `(str, Enum)` 是为了 `__str__`：后者的 `__str__` 出
+    `'GuardRuleId.multi_statement'`，而 `SqlGuardError` 的正文拼的是 `f"[{rule_id}] {message}"`——
+    纯类型重构会顺手改掉用户可见文案。`StrEnum` 的 `__str__` 就是值，
+    ruff 的 UP042 也只要这一种写法。
+    """
+
+    empty_statement = "empty_statement"
+    too_large = "too_large"
+    unsupported_construct = "unsupported_construct"
+    hint_not_allowed = "hint_not_allowed"
+    executable_comment = "executable_comment"
+    procedure_analyse = "procedure_analyse"
+    locking_clause = "locking_clause"
+    into_outfile = "into_outfile"
+    multi_statement = "multi_statement"
+    prepared_statement = "prepared_statement"
+    top_level_not_select = "top_level_not_select"
+    dml_in_cte = "dml_in_cte"
+    variable_access = "variable_access"
+    pg_file_access = "pg_file_access"
+    sleep_function = "sleep_function"
+    danger_function = "danger_function"
+    table_not_allowed = "table_not_allowed"
+
 
 _MAX_SQL_LEN = 8_000
 
@@ -79,7 +116,7 @@ _SYSTEM_SCHEMAS = frozenset(
 class Violation:
     """一条拒绝理由。`code` 可枚举，用于统计模型最常踩哪条规则。"""
 
-    code: str
+    code: GuardRuleId
     message: str
     node: str | None = None
 
@@ -87,7 +124,7 @@ class Violation:
 class SqlGuardError(Exception):
     """拒绝执行。`rule_id` 与 `violation` 同源，抛/不抛两条接缝共用一套规则。"""
 
-    def __init__(self, rule_id: str, message: str, node: str | None = None) -> None:
+    def __init__(self, rule_id: GuardRuleId, message: str, node: str | None = None) -> None:
         super().__init__(f"[{rule_id}] {message}")
         self.rule_id = rule_id
         self.message = message
@@ -129,12 +166,14 @@ def _unfence(sql: str) -> str:
 def _preprocess(sql: str) -> str:
     stripped = _unfence(sql).strip().rstrip(";").strip()
     if not stripped:
-        raise SqlGuardError("empty_statement", "语句为空，没有可执行的查询")
+        raise SqlGuardError(GuardRuleId.empty_statement, "语句为空，没有可执行的查询")
     if len(stripped) > _MAX_SQL_LEN:
-        raise SqlGuardError("too_large", f"SQL 长度 {len(stripped)} 超过上限 {_MAX_SQL_LEN}")
+        raise SqlGuardError(
+            GuardRuleId.too_large, f"SQL 长度 {len(stripped)} 超过上限 {_MAX_SQL_LEN}"
+        )
     # \t \n \r 之外的一切 C0 控制字符都是注入手法（\x00 截断、\x1a 反向转义）
     if any(ord(c) < 0x20 and c not in "\t\n\r" for c in stripped):
-        raise SqlGuardError("unsupported_construct", "SQL 含控制字符")
+        raise SqlGuardError(GuardRuleId.unsupported_construct, "SQL 含控制字符")
     return stripped
 
 
@@ -184,14 +223,16 @@ def _strip_comments(sql: str, *, escape_backslash: bool) -> tuple[str, str]:
         if ch == "/" and sql.startswith("/*", i):
             end = sql.find("*/", i + 2)
             if end < 0:
-                raise SqlGuardError("unsupported_construct", "块注释没有闭合，无法判断其内容")
+                raise SqlGuardError(
+                    GuardRuleId.unsupported_construct, "块注释没有闭合，无法判断其内容"
+                )
             body = sql[i + 2 : end]
             if body.startswith("+"):
                 # 超时靠 SET SESSION MAX_EXECUTION_TIME，不靠 hint：hint 一旦放行就等于开了
                 # "注释里能塞指令"的口子，而重生成又会把注释抹掉，两者不能兼得。
-                raise SqlGuardError("hint_not_allowed", f"禁止优化器 hint：{body[:40]}")
+                raise SqlGuardError(GuardRuleId.hint_not_allowed, f"禁止优化器 hint：{body[:40]}")
             if body.startswith("!"):
-                raise SqlGuardError("executable_comment", f"禁止可执行注释：{body[:40]}")
+                raise SqlGuardError(GuardRuleId.executable_comment, f"禁止可执行注释：{body[:40]}")
             clean.append(" ")
             masked.append(" ")
             i = end + 2
@@ -212,11 +253,11 @@ def _scan_raw_text(sql: str, *, dialect: Dialect) -> str:
     """AST 之前先看裸文本：sqlglot 解析不了的结构，不能等到 AST 再管。"""
     cleaned, masked = _strip_comments(sql, escape_backslash=dialect == "mysql")
     if not cleaned.strip():
-        raise SqlGuardError("empty_statement", "注释之外没有内容")
+        raise SqlGuardError(GuardRuleId.empty_statement, "注释之外没有内容")
     for pattern, code, hint in (
-        (_PROCEDURE_ANALYSE, "procedure_analyse", "禁止 PROCEDURE ANALYSE"),
-        (_LOCKING, "locking_clause", "禁止锁定子句"),
-        (_INTO_TARGET, "into_outfile", "禁止 INTO 导出"),
+        (_PROCEDURE_ANALYSE, GuardRuleId.procedure_analyse, "禁止 PROCEDURE ANALYSE"),
+        (_LOCKING, GuardRuleId.locking_clause, "禁止锁定子句"),
+        (_INTO_TARGET, GuardRuleId.into_outfile, "禁止 INTO 导出"),
     ):
         match = pattern.search(masked)
         if match:
@@ -231,14 +272,14 @@ def parse(sql: str, *, dialect: Dialect) -> exp.Expression:
     except sqlglot.errors.SqlglotError as exc:
         # 不只是 ParseError：未闭合字符串抛 TokenError、部分方言语法抛 UnsupportedError。
         # 任何一条漏出去就是 HTTP 500 而不是 400 sql_guard_rejected。
-        raise SqlGuardError("unsupported_construct", f"无法解析：{exc}") from exc
+        raise SqlGuardError(GuardRuleId.unsupported_construct, f"无法解析：{exc}") from exc
     if len(stmts) != 1 or stmts[0] is None:
-        raise SqlGuardError("multi_statement", "一次只允许一条语句")
+        raise SqlGuardError(GuardRuleId.multi_statement, "一次只允许一条语句")
     stmt = stmts[0]
     if not isinstance(stmt, exp.Expression):
         # sqlglot 的类型签名是 Expr，比 Expression 更宽；后面的规则全部按 Expression 走
         raise SqlGuardError(
-            "unsupported_construct", f"解析结果不是 AST 表达式：{type(stmt).__name__}"
+            GuardRuleId.unsupported_construct, f"解析结果不是 AST 表达式：{type(stmt).__name__}"
         )
     return stmt
 
@@ -247,8 +288,12 @@ def _check_top_level(stmt: exp.Expression) -> None:
     if isinstance(stmt, _TOP_LEVEL):
         return
     if isinstance(stmt, exp.Command) and stmt.name.upper() in _PREPARED_COMMANDS:
-        raise SqlGuardError("prepared_statement", "预编译语句的正文绕过静态分析，不予执行")
-    raise SqlGuardError("top_level_not_select", f"只允许 SELECT，当前是 {type(stmt).__name__}")
+        raise SqlGuardError(
+            GuardRuleId.prepared_statement, "预编译语句的正文绕过静态分析，不予执行"
+        )
+    raise SqlGuardError(
+        GuardRuleId.top_level_not_select, f"只允许 SELECT，当前是 {type(stmt).__name__}"
+    )
 
 
 def _ident(node: exp.Expression, key: str) -> str:
@@ -300,22 +345,30 @@ def _function_violations(stmt: exp.Expression) -> list[Violation]:
     for fn in stmt.find_all(exp.Anonymous):
         name = fn.name.lower()
         if name in _PG_PRIVILEGED_FUNCTIONS:
-            out.append(Violation("pg_file_access", f"禁止访问服务器文件/时钟的函数 {name}()"))
+            out.append(
+                Violation(GuardRuleId.pg_file_access, f"禁止访问服务器文件/时钟的函数 {name}()")
+            )
         elif name in _SLEEP_FUNCTIONS:
-            out.append(Violation("sleep_function", f"禁止时间函数 {name}()，它让语句超时形同虚设"))
+            out.append(
+                Violation(
+                    GuardRuleId.sleep_function, f"禁止时间函数 {name}()，它让语句超时形同虚设"
+                )
+            )
         else:
-            out.append(Violation("danger_function", f"白名单外的函数 {name}()，无法判定其副作用"))
+            out.append(
+                Violation(GuardRuleId.danger_function, f"白名单外的函数 {name}()，无法判定其副作用")
+            )
     return out
 
 
 def _shape_violations(stmt: exp.Expression) -> list[Violation]:
     """顶层是 SELECT 不代表整棵树只读：CTE 里能藏 DML，SELECT 后能挂 INTO。"""
     out = [
-        Violation("dml_in_cte", f"子查询/CTE 里禁止 {type(dml).__name__}")
+        Violation(GuardRuleId.dml_in_cte, f"子查询/CTE 里禁止 {type(dml).__name__}")
         for dml in stmt.find_all(exp.Insert, exp.Update, exp.Delete, exp.Merge)
     ]
     if stmt.find(exp.Into) is not None:
-        out.append(Violation("into_outfile", "禁止 SELECT INTO 建表"))
+        out.append(Violation(GuardRuleId.into_outfile, "禁止 SELECT INTO 建表"))
     return out
 
 
@@ -330,7 +383,7 @@ def _variable_violations(stmt: exp.Expression) -> list[Violation]:
         return []
     return [
         Violation(
-            "variable_access",
+            GuardRuleId.variable_access,
             "禁止变量/占位符/`:=` 赋值：取值要到运行时才知道，静态分析覆盖不到",
             "、".join(sorted(hits)),
         )
@@ -349,14 +402,14 @@ def _table_violations(
         if ref.db in _SYSTEM_SCHEMAS or ref.catalog in _SYSTEM_SCHEMAS:
             out.append(
                 Violation(
-                    "table_not_allowed",
+                    GuardRuleId.table_not_allowed,
                     f"系统字典表 {ref.catalog}.{ref.db}.{ref.name} 禁止访问（即使已授权）",
                 )
             )
         elif ref not in allowed:
             out.append(
                 Violation(
-                    "table_not_allowed",
+                    GuardRuleId.table_not_allowed,
                     f"表 {ref.catalog}.{ref.db}.{ref.name} 不在白名单内"
                     + ("" if default_schema else "（未提供 default_schema，短表名无法补全）"),
                 )
