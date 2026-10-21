@@ -194,6 +194,12 @@ class QueryGroup(BaseModel):
     rate_limit_per_user_per_min: int = 20
     max_explain_rows: int = 50_000_000
     allow_sql_edit: Literal["admin", "all", "none"] = "admin"
+    # 第二层（引擎 `EXPLAIN` dry-run）的总开关，safety §3.3。**默认 true**（工单 037 格子 ②，
+    # 2026-10-20 拍板）：代价一并认下——每条问数在源库上多一次往返，
+    # 且 prod 被 `check_env` 锁死不能关。
+    # 生效点只有 `executor.py` 一处（`check_env` 的部署前自检读同一格判 prod 能不能关，那是策略闸、
+    # 不是这条链路的开关），与 `resolve_timeout` 同一条纪律：**调用方无法指定**，只能改这一格。
+    dry_run: bool = True
 
 
 class ResultGroup(BaseModel):

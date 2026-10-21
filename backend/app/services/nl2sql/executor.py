@@ -27,6 +27,7 @@ from app.core.errors import (
 from app.core.logging import get_logger
 from app.models.datasource import DataSource
 from app.services.datasource_service import grants_verdict, root_cause
+from app.services.nl2sql.dry_run import run_dry_run
 from app.services.source_manager import create_source_engine
 from app.settings import get_settings
 
@@ -281,6 +282,8 @@ async def execute_readonly(
     口径都在 safety §4 / 工单「开工前拍板」里钉死，这里只把它们串起来：
     ① 建只读会话**之前**先 `SHOW GRANTS` 复用 `grants_verdict` 硬阻断（判定不缓存）；
     ② 依次执行 §4.1 的 SET 序列（READ ONLY 在前；MAX_EXECUTION_TIME 不支持则降级靠驱动超时）；
+    ②.5 第二层 dry-run（safety §3.1）：在②之后、发真 SQL 之前跑 `EXPLAIN` 并裁决，位置不能换——
+      发在 ① 之前那时会话还没只读，发在取行之后钱已经花完了。`query.dry_run` 关掉时一条语句都不发；
     ③ 一次 execute 缓冲取回——**这是 §4.1 "无缓冲 cursor + fetchmany 逐 1000" 的诚实降级**：
       守卫保证顶层 LIMIT **至多** `row_limit+1`（缺则补、超则钳），内存上限由那个上界钉住，
       与是否流式无关；
@@ -321,6 +324,18 @@ async def execute_readonly(
                     # 非降级的 SET 失败直接上抛，由外层 except 统一分档——
                     # 在这里再调一次 classify 的话，非超时异常会被分档两遍。
                     raise
+
+            # 第二层（safety §3.1）：只读会话已经建好、真 SQL 一个字都还没发，这一格是它唯一的位置。
+            # 开关与阈值都在这里现场读设置——**调用方无法指定**，与 resolve_timeout 同一条纪律，
+            # 否则"分层独立有效"里"关掉第二层"那一半就变成调用方的口头承诺。
+            query = get_settings().query
+            if query.dry_run:
+                await run_dry_run(
+                    conn,
+                    dialect=row.kind,
+                    sql_final=sql_final,
+                    max_explain_rows=query.max_explain_rows,
+                )
 
             result = await conn.execute(text(sql_final))
             columns = list(result.keys())

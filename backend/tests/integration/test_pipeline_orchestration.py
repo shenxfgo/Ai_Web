@@ -33,6 +33,7 @@ from app.services.nl2sql.join_graph import (
 )
 from app.services.nl2sql.prompt_builder import SchemaTable
 from app.services.nl2sql.retriever import CardMatch, RetrievedTable
+from app.services.sql_guard import GuardRuleId, SqlGuardError
 from app.settings import LlmGroup, get_settings
 
 pytestmark = pytest.mark.pg
@@ -532,6 +533,72 @@ async def test_模型硬产出_DROP_时守卫拦下且一次都不进执行器(
         assert stored.sql_raw == "DROP TABLE orders"  # 拒了也要留下模型原文当现场
         assert stored.executed is False
     # 验收 ⑤：拒答不写 CSV、也不留半截文件（目录压根不该被动过）
+    assert not results_dir.exists() or list(results_dir.glob("*")) == []
+
+
+@respx.mock
+async def test_第二层拒绝时落早退而不是_500(
+    session_factory, spies: Spies, monkeypatch: pytest.MonkeyPatch, results_dir: Path
+) -> None:
+    """工单 037 的编排半边（safety §3.5）：dry-run 的 `SqlGuardError` 抬到这一层必须**变成答案**。
+
+    为什么这一条不能没有：第二层住在 `execute_readonly` 里面，它抬的是 `SqlGuardError`——
+    而那一族异常**不是** `AppError` 的后代，`except AppError` 兜不住它。所以没有这一支的话，
+    它对用户的表现就是 500"我们坏了"，对模型的表现是"这一轮没有错误正文可回喂"（038 的输入被
+    提前掐断）。第一层那一支早就落早退了，两层抬上来的是同一枚异常类型，收场也必须同一个形状。
+
+    桩件打的是 `execute_readonly` 整颗：真实链路里那一次 `EXPLAIN` 由
+    `tests/unit/test_dry_run_wiring.py` 与 live 那一族负责，这里只管编排层怎么接。
+    """
+
+    async def dry_run_rejected(row: Any, **kwargs: Any) -> Any:
+        raise SqlGuardError(
+            GuardRuleId.dry_run_engine_rejected,
+            "源库在执行 EXPLAIN 时就拒了这条 SQL：1054 Unknown column 'nope' in 'field list'",
+        )
+
+    monkeypatch.setattr(pipeline, "execute_readonly", dry_run_rejected)
+    async with session_factory() as session:
+        user, ds = await _seed_user_and_source(session)
+        route = _draft_route(sql=DRAFT_SQL)
+
+        outcome = await pipeline.ask(
+            session,
+            actor=user,
+            question="2024 年每个月的订单总金额是多少",
+            datasource_ids=[ds.id],
+            retriever=FakeRetriever([_found(ds.id, ds.id * 10 + 1)]),
+            llm=LlmClient(llm=READY_LLM, http=httpx.AsyncClient()),
+        )
+
+        # 早退而不是抬异常：调用方拿到的是 AskOutcome，不是 500
+        assert outcome.error_code == "sql_guard_rejected"
+        assert outcome.executed is False
+        assert "Unknown column 'nope' in 'field list'" in outcome.error_message
+        # 正文带 `[rule_id]` 前缀（与第一层同形），038 回喂时靠它分辨是哪一层拒的
+        assert outcome.error_message.startswith("[dry_run_engine_rejected]")
+        # `guard_result` 里落的是同一枚枚举值（§3.2 第 4 格：两层共用一列）
+        assert outcome.guard_result is not None
+        assert outcome.guard_result["ok"] is False
+        assert outcome.guard_result["violations"][0]["code"] == "dry_run_engine_rejected"
+        # 第一层放行过的那条 sql_final 是事实，不许被第二层的拒绝抹掉
+        assert outcome.sql_final is not None
+        assert route.call_count == 1  # 结论那一次也不该发
+        # 步梯停在 `dry_run`：踩坑 ② 问"卡在哪一步"，答 guard 就是把第二层的往返算进第一层头上
+        assert [name for name, _ in outcome.steps] == [
+            "retrieve",
+            "join_graph",
+            "schema",
+            "prompt",
+            "generate",
+            "guard",
+            "dry_run",
+        ]
+        stored = await session.get(ChatMessage, outcome.message_id)
+        assert stored is not None
+        assert stored.executed is False and stored.error_code == "sql_guard_rejected"
+        assert stored.error_message is not None
+        assert "[dry_run_engine_rejected]" in stored.error_message
     assert not results_dir.exists() or list(results_dir.glob("*")) == []
 
 

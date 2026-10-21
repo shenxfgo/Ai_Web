@@ -313,29 +313,26 @@ async def ask(
                 max_rows=row_limit,
             )
         except SqlGuardError as exc:
-            msg.guard_result = out.guard_result = _guard_outcome(
-                ok=False, violations=[exc.violation]
-            )
-            early = _exit_early(
-                msg,
-                out,
-                "sql_guard_rejected",
-                f"[{exc.rule_id}] {exc.message}",
-            )
-            watch.lap("guard")
-            return early
+            return _rejected_by_guard(msg, out, watch, exc, step="guard")
         watch.lap("guard")
         out.sql_final = msg.sql_final = guarded.sql_final
         msg.guard_result = out.guard_result = _guard_outcome(ok=True, violations=[])
 
-        result = await execute_readonly(
-            ds,
-            password=decrypt_secret(ds.secret_enc),
-            sql_final=guarded.sql_final or "",
-            row_limit=row_limit,
-            max_cell_chars=settings.result.max_cell_chars,
-            result_dir=settings.result.dir,
-        )
+        try:
+            result = await execute_readonly(
+                ds,
+                password=decrypt_secret(ds.secret_enc),
+                sql_final=guarded.sql_final or "",
+                row_limit=row_limit,
+                max_cell_chars=settings.result.max_cell_chars,
+                result_dir=settings.result.dir,
+            )
+        except SqlGuardError as exc:
+            # 第二层（dry-run）住在执行器里面，抬上来的还是同一枚 `SqlGuardError`——
+            # 而它**不是** `AppError` 的后代，外面那一支兜不住它。没有这一支的话，
+            # "这条 SQL 被拒"这一轮的答案对用户就是 500"我们坏了"（safety §3.5 明写不许这样），
+            # 对 038 则是那句可回喂的正文被提前掐断。
+            return _rejected_by_guard(msg, out, watch, exc, step="dry_run")
         watch.lap("execute")
         out.executed = msg.executed = True
         out.columns, out.rows = result.columns, result.rows
@@ -347,8 +344,10 @@ async def ask(
         msg.result_stats = {
             "row_count": result.row_count,
             "truncated": result.truncated,
-            # §2.7 那一格的 `elapsed_ms` 是**源库执行**那一步的耗时，不是整条链的合计
+            # §2.7 那一格的 `elapsed_ms` 是**源库那一步**的耗时，不是整条链的合计
             # （合计在 `latency_ms` 列）。两列分开才答得出"慢在模型还是在源库"。
+            # 037 起这一步含第二层那一次 `EXPLAIN` 往返（实测净增与重复噪声同量级，safety §3.6）；
+            # 被第二层**拒**时不落这一格，落 `dry_run` 那一步（见 `_rejected_by_guard` 的 `step`）。
             "elapsed_ms": watch.last_ms,
             "run_id": result.run_id,
             # 只存引用不存路径：result_file 是服务端绝对路径，进库就等于把部署拓扑写进数据
@@ -524,3 +523,23 @@ def _exit_early(msg: ChatMessage, out: AskOutcome, code: str, message: str) -> A
     msg.error_code, msg.error_message = code, message
     msg.executed = False
     return out
+
+
+def _rejected_by_guard(
+    msg: ChatMessage, out: AskOutcome, watch: _Stopwatch, exc: SqlGuardError, *, step: str
+) -> AskOutcome:
+    """第一层与第二层**共用**的收场（safety §3.5 / §9.2 那条"早退形状不用新写一套"）。
+
+    两层抬的是同一枚 `SqlGuardError`，所以收场也必须同形：`guard_result` 里落同一枚枚举值
+    （`chat_messages.guard_result` 是一列 JSONB，不是两列——第二层覆盖第一层的"通过"快照是有意的，
+    这一列的用途是"这轮为什么没有答案"，而拒绝它的那一格才是答案），错误正文带 `[rule_id]` 前缀，
+    `executed=false`。038 回喂模型读的就是这句，不需要先分辨是哪一层拒的。
+
+    `step` 是步梯上留下的那一格名字（踩坑 ②："卡在哪一步"必须是事实）：第一层拒在 `guard`，
+    第二层拒在 `dry_run`——**不是** `execute`。钱没花完就不能记在执行那一格上，
+    而把第二层的往返算进 `guard` 会把"第一层跑得真快"这件好事说成假话。
+    """
+    msg.guard_result = out.guard_result = _guard_outcome(ok=False, violations=[exc.violation])
+    early = _exit_early(msg, out, "sql_guard_rejected", f"[{exc.rule_id}] {exc.message}")
+    watch.lap(step)
+    return early

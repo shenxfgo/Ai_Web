@@ -4,7 +4,8 @@
 所以新增语法形态的默认结果是拒，不是放。
 
 规则有先后：预处理 → 裸文本（注释/锁定/INTO）→ 解析 → 单语句 → 顶层类型 → 子结构
-（CTE 内 DML、SELECT INTO、变量）→ 函数 → 表白名单 → 强制 LIMIT → 重生成 → **重生成等价自校验**。
+（CTE 内 DML、SELECT INTO、变量）→ 函数 → 表白名单 → **连接条件**（037 起）→ 强制 LIMIT → 重生成
+→ **重生成等价自校验**。
 最后那一步防的不是模型而是本模块自己：它红了就拒答（§1.3）。
 `check()` 命中第一条即抛错，`guard()` 收集全部违规（HTTP 层要一次展示所有问题）。
 """
@@ -29,7 +30,9 @@ class GuardRuleId(StrEnum):
     语料点名、被 roadmap §P2/§P3/P5 的验收字面引用。所以成员一律**显式赋值**（不用
     `AUTO`），且成员名与值保持一字不差——`tests/guard/test_rule_id_closed_set.py` 钉住这点。
     新增拒绝分支只能加在这里；改名或改值都要先改 `docs/nl2sql-safety.md` §1.1.1 那张表。
-    `TOO_COSTLY` 之类第二层的码随各自的工单加入同一枚枚举。
+    as-built(P5-037)：第二层那三枚（`too_costly`/`dry_run_unreadable`/`dry_run_engine_rejected`）
+    已随 037 加入，所以这一枚枚举今天是**三层共用**的词表，不再只住第一层；名字保留 `GuardRuleId`
+    是因为对外那一格（`chat_messages.guard_result`）从第一天就叫 `guard_result`。
 
     继承 `str` 是硬要求：否则 JSONB 序列化变、`assert ei.value.rule_id == "multi_statement"`
     那一族断言整片红。选 `StrEnum` 而不是 `(str, Enum)` 是为了 `__str__`：后者的 `__str__` 出
@@ -55,7 +58,14 @@ class GuardRuleId(StrEnum):
     sleep_function = "sleep_function"
     danger_function = "danger_function"
     table_not_allowed = "table_not_allowed"
+    cartesian_product = "cartesian_product"
     regeneration_drift = "regeneration_drift"
+    # 下面三枚属**第二层**（引擎 `EXPLAIN` dry-run，`app/services/nl2sql/dry_run.py`）。
+    # 它们与上面那些共用一枚枚举是刻意的：落进 `chat_messages.guard_result` 的是同一种东西，
+    # 词表开两处就等于对外契约开两处。依赖方向单向 `dry_run.py → sql_guard.py`。
+    too_costly = "too_costly"
+    dry_run_unreadable = "dry_run_unreadable"
+    dry_run_engine_rejected = "dry_run_engine_rejected"
 
 
 _MAX_SQL_LEN = 8_000
@@ -419,6 +429,44 @@ def _table_violations(
     return out
 
 
+def _join_violations(stmt: exp.Expression) -> list[Violation]:
+    """§1.2 ⑥.1 的连接条件扫描（新枚 `cartesian_product`，工单 037 实测定的落点）。
+
+    判据逐 scope：一个 `exp.Join` 的 `on`/`using`/`side`/`kind`/`method` **五格全空**，
+    且它所在的那个 `Select` 没有 `WHERE` → 连接条件无从推出，结果行数是两表之积。
+    口径与每条实测（`FROM a JOIN b` 不写 `ON` 与逗号连接逐字同形、`NATURAL` 住在 `method`、
+    派生表内层可见）都在 `docs/nl2sql-safety.md` §3.4 与 §1.2 ⑥.1，证据文件
+    `.scratch/p5-sql-guard-hardening/evidence/probe_cartesian_ast037.txt`。
+
+    `method` 那一格是实测逼出来的：sqlglot 把 `NATURAL` 放进了 `args["method"]`，而 `side`/`kind`
+    都是空串——不查它就会把**自带连接条件**的 `NATURAL JOIN` 一起误拒。
+
+    这一支今天挡住的只有"完全没条件"那一档。`FROM a, b WHERE a.x > 1`（笛卡尔积 + 无关条件）
+    照样放行：实测它与合法的老式写法在 AST 上同构，再往下判要把连接图重建一遍（§9 已知限制）。
+    """
+    out: list[Violation] = []
+    for join in stmt.find_all(exp.Join):
+        args = join.args
+        if any(args.get(key) for key in ("on", "using", "side", "kind", "method")):
+            continue
+        scope = join.find_ancestor(exp.Select)
+        # 找不到 `Select` 祖先这一支今天不可达，`_check_top_level` 已把语句限定在 SELECT/UNION 族。
+        # 但"不可达"不等于"放行"：这一模块的默认结果是拒（见文件头第 4 行），
+        # 判不出来就按最严的一档——与 §1.2 ⑦"证不了它小就按最严"同一条纪律。
+        if scope is not None and scope.args.get("where") is not None:
+            continue
+        table = join.this.sql()
+        out.append(
+            Violation(
+                GuardRuleId.cartesian_product,
+                f"表 {table} 与前面的表没有任何连接条件"
+                "（没有 ON/USING，所在作用域也没有 WHERE），会做笛卡尔积",
+                table,
+            )
+        )
+    return out
+
+
 def regeneration_violation(
     final: exp.Expression,
     sql_final: str,
@@ -558,6 +606,7 @@ def guard(
         *_variable_violations(stmt),
         *_function_violations(stmt),
         *_table_violations(refs, allowed, default_schema=default_schema),
+        *_join_violations(stmt),
     ]
     if violations:
         return GuardResult(ok=False, sql_final=None, tables=refs, violations=tuple(violations))

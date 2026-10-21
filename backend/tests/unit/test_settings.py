@@ -86,6 +86,20 @@ def test_app_defaults_are_local_dev() -> None:
     assert settings.extract.sample_distinct is False  # 真相源：roadmap 分组 7「扫源库数据，默认关」
 
 
+def test_第二层开关默认开且能被环境关掉(monkeypatch: pytest.MonkeyPatch) -> None:
+    """工单 037 格子 ②（2026-10-20 拍板）：`AIWEB_QUERY__DRY_RUN` 默认 `true`。
+
+    期望值出处是 safety §3.3 那句"本片新建的键，默认 true"与 roadmap §P5 的原话，不是代码里的
+    缺省值——这一格选 `true` 是有代价的（每条问数在源库上多一次往返），所以它必须由文档说话。
+    `false` 那一支也要真读得进来：验收 2 的靶子是"dry_run=False 时源库一条 EXPLAIN 都没收到"，
+    键如果只能开不能关，那个用例就没有东西可以关。prod 不许关闭那一条不归这里，住 `check_env`。
+    """
+    monkeypatch.delenv("AIWEB_QUERY__DRY_RUN", raising=False)
+    assert Settings(_env_file=None).query.dry_run is True
+    monkeypatch.setenv("AIWEB_QUERY__DRY_RUN", "false")
+    assert Settings(_env_file=None).query.dry_run is False
+
+
 def test_card_template_version_is_int_defaulting_to_1(monkeypatch: pytest.MonkeyPatch) -> None:
     """kb-workflow §5 的 `AIWEB_EXTRACT__CARD_TEMPLATE_VERSION`，落进 §2.6 的 int 列。
 

@@ -105,6 +105,30 @@ def check_embedding_gate(settings: Settings, checks: list[Check], exts: dict[str
     )
 
 
+def check_dry_run_gate(settings: Settings, checks: list[Check]) -> None:
+    """第二层的开关（safety §3.3）：prod 不许关，其余环境只提醒。
+
+    这一档与 `jwt.secret` 那一条同形（`== "prod"` 才红）但**动机不同**：jwt 判的是"这一台机器
+    现在安不安全"，这里判的是"prod 有没有把一层防御关掉"——它是策略闸，不看源库、不发语句，
+    读的就是那两个键的组合。红必须点名 `AIWEB_QUERY__DRY_RUN`：只说"第二层已关闭"人改不了，
+    键名才是可执行的信息。
+    """
+    dry_run = settings.query.dry_run
+    prod = settings.app.environment == "prod"
+    if dry_run:
+        checks.append(Check("query.dry_run", "ok", "已开启（引擎 EXPLAIN dry-run）"))
+        return
+    checks.append(
+        Check(
+            "query.dry_run",
+            "fail" if prod else "warn",
+            "AIWEB_QUERY__DRY_RUN=false，第二层（引擎 EXPLAIN dry-run）已关闭",
+            "safety §3.3：prod 禁止关闭这一层，把它改回 true；"
+            "dev/staging 要省掉那一次源库往返可以保持关闭，代价是估行超阈值的 SQL 不再被拦",
+        )
+    )
+
+
 async def check_pg(settings: Settings, checks: list[Check]) -> None:
     pg = settings.pg
     min_pg = tuple(int(x) for x in settings.extract.min_pg_version.split("."))
@@ -366,6 +390,7 @@ async def main() -> int:
     check_secrets(settings, checks)
     check_dirs(settings, checks)
     check_sql_guard(checks)
+    check_dry_run_gate(settings, checks)
     await check_pg(settings, checks)
     check_llm(settings, checks)
     check_embedding(settings, checks)

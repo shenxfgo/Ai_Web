@@ -1,9 +1,9 @@
 """工单 035 验收 3 的永久版：拒绝词表是一个**封闭集合**，不是一族各自维持一致的字符串。
 
 这里的断言全部**表驱动**——期望值来自两个独立真相源：枚举手自己的成员、以及"谁把这枚码钉住了"
-（`tests/guard/corpus.py` 里必拒语料的期望 `rule_id`，加上 `tests/guard/` 各用例文件对
-`GuardRuleId.<成员>` 的属性引用）。本文件一处都没有把码名再抄成一份清单，所以 036/037 往枚举里
-加新码时只需要动枚举与**钉住它的那一处**（语料或用例）。
+（`tests/guard/corpus.py` 里必拒语料的期望 `rule_id`，加上 `tests/guard/` 与
+`tests/unit/test_dry_run_*.py` 各用例文件对 `GuardRuleId.<成员>` 的属性引用）。本文件一处都没有
+把码名再抄成一份清单，所以 036/037 往枚举里加新码时只需要动枚举与**钉住它的那一处**（语料或用例）。
 
 > **as-built(P5-036)：判据从"必须是语料"放宽成"语料或用例"**，因为出现了第一枚**不可能有语料**的码
 > `regeneration_drift`：它防的是守卫自己的代码，今天没有任何一支输入能触发它
@@ -18,6 +18,20 @@
 > `node.attr in members` 让"拼错或删了成员名"这一类在构造上永远红不了，现在非成员的名字由
 > `test_用例点名的成员全在枚举里` 单独红。两道都不改变"值域不可穷举即红"的强度，只是把
 > "点过名"这个词的定义收窄到它本来该指的东西。
+>
+> **as-built(P5-037)：两处扫描根都放宽了，放宽的都是"词表的宿主不止 `sql_guard.py` 这一个文件"
+> 这件事**，036 那一档判据没有变松：
+> ① 用例引用根从 `tests/guard/` 扩到再收 `tests/unit/test_dry_run_*.py`——第二层那三枚码
+> 是 036 那个口子（"不可能有语料"）的**第二批住户**，而且一次三枚：语料是喂 `guard()` 的
+> **SQL 文本**，`too_costly` 的输入是引擎返回的**计划行**、`dry_run_unreadable` 的输入是
+> "计划行全读不出来"这个形状、`dry_run_engine_rejected` 的输入是一条**源库错误**，三者都不在
+> 任何一支 SQL 文本的形状空间里。036 那条"光被点名不算钉住，要另配失败路径用例"在这里是真落地的：
+> `test_dry_run_shape.py`（前两枚，逐档断裁决）与 `test_dry_run_wiring.py`（第三枚，桩连接上
+> 源库真报错）各有**把分支走到**的断言，不是只点了名。
+> ② 源码扫描（首参与字面量那两条）从单文件扩到 `sql_guard.py` + `dry_run.py`。这一处不是放宽
+> 而是**补漏**：第二层那三枚码的 `SqlGuardError(...)` 物理上住在 `dry_run.py`，只扫前者的话
+> "封闭集合在自己家里漏了一格"这句话对第二层根本不成立。`dry_run.py` 没有 `GuardRuleId` 类，
+> 它的字面量允许集就是空——这一格现在红得起，是因为它确实一个裸字面量都没有。
 """
 
 from __future__ import annotations
@@ -31,14 +45,20 @@ from pathlib import Path
 import pytest
 
 from app.services import sql_guard
+from app.services.nl2sql import dry_run
 from app.services.sql_guard import GuardRuleId, SqlGuardError
 from tests.guard.corpus import DEMO_TABLES, REJECT_CASES
 
 _CORPUS_VALUES = {rule for _, rule in REJECT_CASES}
 
+# 词表的**宿主文件**：035/036 只有 `sql_guard.py` 一枚，037 起第二层那三枚码住在
+# `nl2sql/dry_run.py`——那才是它们唯一的拒绝点。扫描根不收这个文件，等于"码的字面量只出现在
+# 枚举手自己身上"这条判据对第二层根本不成立：有人在 dry_run.py 里维护一份平行清单也红不了。
+_SOURCE_FILES: tuple[str, ...] = (sql_guard.__file__, dry_run.__file__)
+
 
 def _referenced_in_asserts() -> set[str]:
-    """`tests/guard/` 每一个 `GuardRuleId.<成员>` 属性引用，**只看断言里那一些**。
+    """每一个 `GuardRuleId.<成员>` 属性引用，**只看断言里那一些**。
 
     两个收窄都是机械判据自己要的强度：
     ① 只认 `ast.Assert` 里的引用——写在注释、docstring 或一句游离赋值里的点名不算钉住，
@@ -46,9 +66,19 @@ def _referenced_in_asserts() -> set[str]:
     ② **不预先过滤成员名**（036 的双轴审查指出的洞：一旦写成 `node.attr in members`，
        这个集合在构造上就不可能产出非成员值，"点到名却不在枚举"那半句判据就成了空话）。
        这里原样收属性名的字符串，非成员值留给下面那条双向断言去红。
+
+    扫描根 037 起放宽一处：除 `tests/guard/`（第一层与自校验的码都钉在那里）之外，
+    还收 `tests/unit/test_dry_run_*.py`。第二层那三枚码**不可能有语料**——语料是喂给 `guard()`
+    的 SQL 文本，而 `too_costly` 的输入是引擎返回的**计划行**，`dry_run_engine_rejected` 的输入是
+    **源库错误**，两者都不在任何一支 SQL 文本的形状空间里（036 开的那个"不可能有语料"的口子
+    第一次有了第二批住户）。所以它们只能走 036 定下的第二档：用例断言里的属性引用 +
+    一条失败路径用例——后者就是 `test_dry_run_shape.py` 那族逐档断言本身。
     """
+    files = sorted(Path(__file__).parent.glob("test_*.py")) + sorted(
+        (Path(__file__).parent.parent / "unit").glob("test_dry_run_*.py")
+    )
     found: set[str] = set()
-    for path in sorted(Path(__file__).parent.glob("test_*.py")):
+    for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for stmt in ast.walk(tree):
             if not isinstance(stmt, ast.Assert):
@@ -123,18 +153,23 @@ def test_成员名就是对外值所以改名必然被看见() -> None:
 def test_守卫源码里每一个拒绝点的首参都是枚举成员() -> None:
     """机械检查：`SqlGuardError(...)` 与 `Violation(...)` 的首参**不许是裸字符串**。
     这条是"以后有人新写一支 `SqlGuardError("unsupported_construct", …)`"的唯一防线——
-    mypy 管不到字符串本身，也管不到不在它覆盖范围内的写法。"""
-    tree = ast.parse(Path(sql_guard.__file__).read_text(encoding="utf-8"))
-    bare = [
-        (node.lineno, node.func.id, node.args[0].value)  # type: ignore[union-attr]
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id in {"SqlGuardError", "Violation"}
-        and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[0].value, str)
-    ]
+    mypy 管不到字符串本身，也管不到不在它覆盖范围内的写法。
+
+    源码范围 037 起是两个文件（`_SOURCE_FILES` 那条注的理由）：第二层那三枚码的拒绝点
+    物理上住在 `dry_run.py`，只扫 `sql_guard.py` 的判据等于对第二层豁免。"""
+    bare: list[tuple[int, str, str]] = []
+    for path in _SOURCE_FILES:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+        bare.extend(
+            (node.lineno, node.func.id, node.args[0].value)  # type: ignore[union-attr]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"SqlGuardError", "Violation"}
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        )
     assert bare == []
 
 
@@ -142,24 +177,30 @@ def test_码的字面量在源码里只出现在枚举手自己身上() -> None:
     """上一条只看调用点首参，这一条把 `_scan_raw_text` 那张 `(pattern, code, hint)` 三元组表
     也管住：三元组里的 `code` 是 `SqlGuardError(code, …)` 的来源，它若还是裸字符串，
     封闭集合就在自己家里漏了一格。全文件扫一遍，任何等于某枚码的字符串字面量都必须
-    住在 `GuardRuleId` 的类体内——想再维护一份平行清单也维护不了。"""
-    tree = ast.parse(Path(sql_guard.__file__).read_text(encoding="utf-8"))
-    enum_lines: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef) and node.name == "GuardRuleId":
-            assert node.end_lineno is not None
-            enum_lines = set(range(node.lineno, node.end_lineno + 1))
-    assert enum_lines, "sql_guard.py 里没有 GuardRuleId 这个类"
+    住在 `GuardRuleId` 的类体内——想再维护一份平行清单也维护不了。
 
+    逐文件算"类体行号"：`dry_run.py` 没有 `GuardRuleId` 类，它的允许集就是**空**——
+    那里面出现任何一枚码的字面量都是红的（037 之后它确实一个都没有，只引用成员）。"""
     values = {m.value for m in GuardRuleId}
-    leaked = [
-        (node.lineno, node.value)
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Constant)
-        and isinstance(node.value, str)
-        and node.value in values
-        and node.lineno not in enum_lines
-    ]
+    leaked: list[tuple[str, int, str]] = []
+    for path in _SOURCE_FILES:
+        tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+        enum_lines: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "GuardRuleId":
+                assert node.end_lineno is not None
+                enum_lines = set(range(node.lineno, node.end_lineno + 1))
+        if path == sql_guard.__file__:
+            assert enum_lines, "sql_guard.py 里没有 GuardRuleId 这个类"
+
+        leaked.extend(
+            (Path(path).name, node.lineno, node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in values
+            and node.lineno not in enum_lines
+        )
     assert leaked == []
 
 

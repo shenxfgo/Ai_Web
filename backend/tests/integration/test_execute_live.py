@@ -9,10 +9,16 @@
   （order_main 30000 行、amount DECIMAL、created_at DATETIME）
 - 会话只读用的账号是只读的 `aiweb_ro`（工单 002），口令从 gitignored 的 `.setup/aiweb_ro.cnf` 读
 - 结果落盘目录用 pytest 的 tmp_path，绝不写进仓库的 `data/results/`
+
+关于第二层（工单 037）：037 在执行器里、取行之前插了一道引擎 `EXPLAIN` dry-run，它会在
+源库拒写**之前**先把写语句判成我们自己的 `SqlGuardError`——本文件那一格验收 ① 就再也看不见
+`DBAPIError` 了。所以这一族整体把 `query.dry_run` 关掉：本文件证的始终是"**第三层独立有效**"。
+第二层开着时的行为另有 live 文件（`test_dry_run_mysql_live.py`），两边不许互相冒充。
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -22,12 +28,30 @@ from app.core.errors import QueryTimeout
 from app.models.datasource import DataSource
 from app.services.nl2sql.executor import execute_readonly
 from app.services.sql_guard import QualifiedTable, SqlGuardError, check
+from app.settings import get_settings
 from tests.integration.conftest import DbAccount
 
 pytestmark = pytest.mark.live
 
 DEMO_DB = "ai_web_demo"
 ALLOWED = frozenset({QualifiedTable("", DEMO_DB, "order_main")})
+
+
+@pytest.fixture(autouse=True)
+def second_layer_off(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """整族跑在"第二层关着"上——本文件的靶子是第三层，不许被前面新加的一层替它挡。
+
+    走真实配置通道（环境变量 + 清缓存），理由同 `tests/integration/test_dry_run_mysql_live.py`
+    那一族的 `second_layer_on` 夹具（这一枚与它反着钉）：执行器里的读取点是 `get_settings().query`，
+    给模块属性打桩盖不住它。这一族不需要钉 `MAX_EXPLAIN_ROWS`——第二层关着，那一格在这条路径上
+    没有读取点。
+    """
+    monkeypatch.setenv("AIWEB_QUERY__DRY_RUN", "false")
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        get_settings.cache_clear()
 
 
 def _row(account: DbAccount, *, timeout_ms: int = 15000) -> DataSource:
@@ -106,6 +130,10 @@ async def test_会话只读生效_引擎拒绝写_而这不是应用拒的(accou
     应用层：守卫看到 UPDATE 直接 SqlGuardError（第一层 AST 白名单）。
     引擎层：把守卫当空气、硬把 UPDATE 塞进 execute_readonly，源库自己会拒绝它——
     报的是驱动原文的 DBAPIError（不是我们的任何 AppError），证明拦下来的是 MySQL 不是我们。
+
+    这里拦下它的是**第三层**（会话 `READ ONLY` 与只读账号那把权限），命中码 1792/1142 是源库
+    原文；第二层在本文件整体是关着的（见模块 docstring），否则 037 那道 EXPLAIN 会先替源库
+    答这句话，这一格就变成"证了我们自己"。
     """
     # 应用层拒
     with pytest.raises(SqlGuardError):

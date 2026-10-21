@@ -49,6 +49,9 @@ ALLOW_CASES: tuple[str, ...] = (
     "EXCEPT SELECT r.order_id FROM refund_record r",
     "SELECT p.name, s.* FROM product_stats_wide s JOIN product p ON p.id=s.product_id "
     "ORDER BY s.gmv DESC LIMIT 1",
+    # §8.2 #11（as-built P5-037）：老式逗号连接把条件写在 WHERE 里，MySQL 自己都会改写成 join。
+    # 它是 `cartesian_product` 判据里"且该作用域没有 WHERE"那半句存在的唯一理由（§1.2 ⑥.1）。
+    "SELECT c.id, o.id FROM customer c, order_main o WHERE c.id=o.customer_id",
     "SELECT id FROM customer LIMIT 5 OFFSET 10",
     "SELECT ai_web_demo.customer.name FROM customer LIMIT 5",
     # 行首注释是模型最常见的输出形态之一，不能被当成"整条都是注释"
@@ -124,7 +127,9 @@ REJECT_CASES: tuple[tuple[str, str], ...] = (
     # （实测 `evidence/hint_probe036.txt`）。挡住它的只有这一层裸文本判定，AST 层那道自校验帮不上。
     # 工单 036 验收 4 另量的三种形状（带 JOIN 的 MySQL 支、PG 的 `/*+ SeqScan(t1) */`、PG 方言里的
     # `/*+`）住在 `test_regeneration_invariant.py::test_hint_三种形状两条接缝同码`，没往这里加：
-    # 语料 54 条按 036 的"已定口径"不许动（差额记在 safety.md §9.2 的 036 那一行）。
+    # 那句"语料不许动"约束的是**不许为 hint 这一档往语料里加条**（036 已定口径），差额记在
+    # safety.md §9.2 的 036 那一行。037 的 `cartesian_product` 是另一回事——它按"AST 可见 → 归第一层
+    # + 进语料"那条口径进的语料（必拒 54→57、必放行 18→19），不是给 hint 开后门。
     ("SELECT 1 /*+ MAX_EXECUTION_TIME(1) */", "hint_not_allowed"),
     # §8.1 CTE 里塞 DML：顶层是 SELECT，白名单也全过，只有递归检查能抓到（PG 的写法）
     (
@@ -152,6 +157,14 @@ REJECT_CASES: tuple[tuple[str, str], ...] = (
     # §1.2 ②：MySQL 语义下 `\'` 把字符串吞到语句末尾，sqlglot 抛的是 TokenError。
     # 必须是 SqlGuardError，否则 HTTP 层拿到 500 而不是 400 sql_guard_rejected
     (r"SELECT 'a\' AS x, id FROM ai_web_demo.customer FOR UPDATE", "unsupported_construct"),
+    # §1.2 ⑥.1（as-built P5-037，新枚 cartesian_product）：三条各钉判据的一格，
+    # 口径见 §3.4、落点理由见 §8.1 那条注。
+    # ①本节原话那唯一一支——无连接条件的逗号连接
+    ("SELECT * FROM customer, order_main", "cartesian_product"),
+    # ②覆盖面比原话宽那一格的偏差本身：显式 JOIN 不写 ON，AST 与逗号连接逐字同形
+    ("SELECT * FROM customer JOIN order_main", "cartesian_product"),
+    # ③判据是**逐 scope** 的：只测顶层那一条证不了"逐 scope"这三个字
+    ("SELECT * FROM (SELECT c.id FROM customer c, order_main o) t", "cartesian_product"),
 )
 
 
