@@ -1291,10 +1291,54 @@ P5 仍是零迁移片，真库版本沿用本节开头那个探针（`0009`）�
 所以新加的分流维度是**回喂那一段在不在 `messages` 里**：第一次（无回喂段）回坏 SQL、第二次（有回喂段）
 回好 SQL，而"叫了几次"仍是独立断言。
 
-本节下面这几格由 038 的施工半边填，**写下上面这些字的时候它们还没有对应的字节**：用例分配（四档 +
-第一层边界档 + 零开销档）、`guard_result.retries` 的库里真读（验收 3 要求查库不查日志）、
-变异电池、重试路径不跑时的净成本（必须是零）、整轮闸与两发快闸。口径与理由在 nl2sql-safety §3.5，
-形状与七条决定在 metadata-model §2.7 ⑦。
+**038 施工半边实录（as-built(P5-038 施工半边)，2026-10-21）**：口径与理由在 nl2sql-safety §3.5，
+形状与那七条决定在 metadata-model §2.7 ⑦，这一格只放"跑过什么、量出多少"。
+
+- **用例分配**：`tests/unit/test_prompt_retry.py` 5 条（回喂那段纯函数半边）+
+  `tests/integration/test_pipeline_retry_pg.py` 9 条（编排四档 + 第一层边界档 + 零开销档 + 步梯档）。
+  收集数 1316 → **1330**（+14，一条既有用例都没删）。桩的三条口径决定（spy 按 SQL 内容裁决、
+  分流键是"回喂段在不在"、次数尺子用 `respx.Route.call_count`）写在 safety §3.7，不在这儿重复。
+- **库里真读（验收 3）**：`test_第二次成功时执行的是重生成的sql且库里两次都在` 断的是
+  `session.get(ChatMessage, …)` 那一行的四件事——第一次端出去的 `sql_final`、被点名的列、
+  `rule_id == "dry_run_engine_rejected"`、源库原话一字未改；终局三格读的是同一次 `ask` 的第二趟。
+  查库不查日志这一条没有任何"从 outcome 对象读"的替身。
+- **变异电池十三格**（`evidence/mutation_retry038.txt`，套件 41 条 = 5+9+22+5，pristine 与复原各一遍全绿）：
+  A 7 红 / B 2 / C 5 / D 4 / E 2 / F 3 / G 7 / H 精确 1 / I 4 / J 2 / K 7 / L 2 / M 精确 1，**无绿格**。
+  **这份 artifact 是第三轮**：第一轮在 H 格被我作废（我看后台任务报"完成"就写回了 shipped 字节，
+  而 `python` 子进程还活着——那一跑输入不唯一），留在 `mutation_retry038_round1.txt` 当反面教材；
+  第二轮整电池重跑但锚的是审查前的 `pipeline.py ef9a78f0…`；第三轮锚审查后的 `6ced9ab9…`
+  （`_guard_sentence` 从"自己再拼一遍前缀"改成 `str(exc)`，见 safety §3.7 那格），
+  **十三格红数第二轮与第三轮逐格相同**。声明清单里 F/G/I 三格是看着第一轮实测补的，
+  所以"盲测"这句话只配 A/B/C/D/E/H/J/K/L/M 十格——区别写在 artifact 头部与 safety §3.7，不在这儿再辩一遍。
+- **验收 5 的"零开销"按实物收窄**：证到的是**不多发一次往返 + 形状不变**
+  （`call_count == 1` 与 `guard_result == {"ok": True, "violations": []}` 全等两条钉子），
+  不是字面零成本（每次 `ask` 多一个空 `list` 和一次 `len()` 判）。这句话在 safety §3.7 有专格。
+- **闸与快闸（锚 shipped 字节）**：整轮 **`1328 passed, 2 skipped` · exit 0 · `523.80s (0:08:43)`**
+  （**`evidence/gate038_post_review.txt`**，落盘 15:39:38。这一跑的输入自证：起跑前后各取一次 md5，
+  `pipeline 6ced9ab9…`／`prompt_builder 46357815…`／`nl2sql_retry.j2 6d4235a7…`／`sql_guard ff21d141…`
+  四枚逐字相同——8 分 43 秒里输入没动过）；基线是 037 补账那轮的 `1314 / 2`，+14 条全在本片。
+  审查前的字节另有一跑（`evidence/gate038_final.txt`，14:50:48，`1328 passed, 2 skipped in 535.09s`，
+  锚 `pipeline ef9a78f0…`）：计数相同、时长只差本机负载，**留档但不作结论**，权威那一格是上面 post-review。
+  两发快闸在新字节上重跑过：`ruff check` All checks passed、`ruff format --check` **203 files** clean、
+  `mypy app` **58 files** 零问题。
+- **闸之后补跑"把文档当测试输入"的那一发**（`evidence/doc_input_rerun038.txt`：**`59 passed` · rc=0**，
+  四发 = 读 `docs/verification.md` 的 `test_demo_mysql_script.py` 与 `test_demo_pg_script.py`、
+  读 `docs/metadata-model.md` 的 `test_sync_force_pg.py`、加本片没碰但同样 `read_text` 一份文档的
+  `test_kb_card_golden.py`）。
+  **为什么要单独跑而不是靠上面那一轮闸**：`metadata-model.md` 的 ⑦.3 改字落在 15:36:23，而整轮闸在
+  15:30:55～15:39:38 之间跑——那一发的输入在闸的时间里不唯一，"闸全绿"对它不作数。
+  **这一格的"跑的就是这份字节"由 artifact 自己首部那两行 md5 自证**（跑之前现取、跑完再取一次，
+  两份文档逐字相同才算这一跑数），而不是把 md5 抄进本节——本节这几枚文档正是那一跑的输入，
+  把读数写回它们会自指，写进 `.scratch/` 里的那份 artifact 不在任何用例的读路径上。
+- **零迁移再确认**：本片没碰 `alembic/versions/`、没碰 ORM 列定义，`guard_result` 是那块 JSONB
+  里多一个键。`alembic current` 探针本片有**两次**：开工（本节开头）与收尾各一次，都是 `0009 (head)`，
+  `versions/` 仍是九个文件——"P5 零迁移"由这两个读数夹住，不是由一句声明撑着。
+
+**038 把 037 的一条断言改了读数，这一笔单独记在这里**（代码注释之外必须有一处）：
+`test_pipeline_orchestration.py::test_第二层拒绝时落早退而不是_500` 从 `call_count == 1`、步梯 7 段
+变成 `== 2`、10 段。判据一字未动（"第二层拒了要早退、不许 500"），改的是"拒了以后现在会再试一次"
+这个新事实的读数；若不写这一句，下一片会把它读成"为了变绿松了手"。
+
 
 ---
 
