@@ -8,8 +8,8 @@
 
 | 层 | 位置 | 手段 | 失败表现 |
 |---|---|---|---|
-| **第一层** | `app/services/sql_guard.py` | sqlglot 正向 AST 白名单 + 危险子结构/函数扫描 + 表白名单 + 强制 LIMIT + **重生成** | 400 `sql_guard_rejected` + `rule_id` + violations |
-| **第二层** | `sql_guard` 末尾，引擎侧 | `EXPLAIN` dry-run（不执行，只验证与估行） | 拒 `TOO_COSTLY` / `CARTESIAN_PRODUCT` / 语法对象不存在 |
+| **第一层** | `app/services/sql_guard.py` | sqlglot 正向 AST 白名单 + 危险子结构/函数扫描 + 表白名单 + **连接条件扫描**（`cartesian_product`，as-built(P5-037)：这一支原本挂在第二层，实测归这里，§3.4）+ 强制 LIMIT + **重生成** | 400 `sql_guard_rejected` + `rule_id` + violations |
+| **第二层** | `app/services/nl2sql/dry_run.py`——**由 `executor.py` 在取行之前调用**，跑在第三层那条只读会话上（as-built(P5-037)：本行原来写的位置是"`sql_guard` 末尾"，那是零实现时代的字面。dry-run 要在真库连接上发 `EXPLAIN`，它不可能住在纯 AST 的第一层里） | `EXPLAIN <sql_final>`（不执行，只验证与估行）。PG 那一支今天**只有 SQL 形状、没有真跑**——执行路对 PG 直接 501，见 §3 | 抛 `SqlGuardError`，码是 `too_costly` / `dry_run_unreadable` / `dry_run_engine_rejected`（"语法/对象不存在"就是这一枚，正文带源库原话）。本行原来写的 `TOO_COSTLY` / `CARTESIAN_PRODUCT` 是两个大写字面：**前者按实物订正成小写**，**后者根本不住这一层**——实测逗号连接在 AST 上可见，归第一层（§3 的落点实测） |
 | **第三层** | `app/services/nl2sql/executor.py` | 会话级只读 + 语句超时 + 行数上限 + 单元格/payload 截断 + 并发与限流 | 驱动报错（不是守卫报错），事务回滚 |
 
 外加两条贯穿性约束：**数据源口令 Fernet 加密且永不回传**（§6），
@@ -24,9 +24,14 @@
 ```python
 class GuardRuleId(StrEnum):
     """拒绝词表：成员名是内部名，**值才是对外接口**（落 `guard_result` JSONB、进验收字面）。
-    18 枚逐枚的"拦的是什么"见下面 §1.1.1 那张表——那张表是词表的唯一清单，值与它第一列一字不差。"""
+    22 枚逐枚的"拦的是什么"见下面 §1.1.1 那张表——那张表是词表的唯一清单，值与它第一列一字不差。
+    as-built(P5-037)：这枚枚举从"第一层的词表"变成**三层共用的拒绝词表**——第二层那三枚
+    （`too_costly` / `dry_run_unreadable` / `dry_run_engine_rejected`）进的也是它，因为它们要落进
+    **同一格** `chat_messages.guard_result`（§3.2 第 4 格）。**名字仍叫 `GuardRuleId`**：值是对外契约，
+    改名要动的是 JSONB 落库字面、54→57 条语料期望值、以及 roadmap §P2/§P3/§P5 的验收字面，
+    而"它不再只由 `sql_guard.py` 产出"这件事用一句注释就写得下。"""
 
-    multi_statement = "multi_statement"   # …其余 17 枚显式赋值，不用 AUTO：值不许跟着成员名漂
+    multi_statement = "multi_statement"   # …其余 21 枚显式赋值，不用 AUTO：值不许跟着成员名漂
     ...
 
 @dataclass(frozen=True)
@@ -67,15 +72,33 @@ def guard(
 > 直接继承 `StrEnum`（`__str__` 本就是值），且 ruff 的 `UP042` 在 `target-version=py312` 下就只认这一种写法。
 > `json.dumps` 走的是 `_value_`，两种写法都不受影响。
 
-### 1.1.1 拒绝词表（18 枚，as-built(P5-036)）
+### 1.1.1 拒绝词表（22 枚，as-built(P5-037)）
 
-顺序就是 `guard()` 的判定顺序（预处理 → 裸文本 → 解析 → 顶层 → 子结构 → 函数 → 表 → 钳位/重生成）；
-"落点"写**函数名不写行号**，行号会随施工漂。语料条数是本轮实测：54 条必拒语料的期望值分布，
-逐条相加正好 54。**"没有一枚码没人证过"这件事的判据从 036 起改了形**：钉住处可以是语料的一条期望值，
+顺序就是 `guard()` 的判定顺序（预处理 → 裸文本 → 解析 → 顶层 → 子结构 → 函数 → 表 → 连接条件 → 钳位/重生成），
+第二层那三枚排在最后——**它们不由 `guard()` 产出**，落点在 `dry_run.py`（§3）。
+"落点"写**函数名不写行号**，行号会随施工漂。语料那一列的分母是**本轮实测**：现存 54 条必拒语料的
+期望值分布逐条相加正好 54（17 枚有语料、`regeneration_drift` 与第二层那三枚各 0），18 条必放行同理——
+这两个数是 037 文档半边的**基线**，不是 037 的结果。
+037 在此基础上补 **3 条必拒 + 1 条必放行**（→ 57 / 19）：笛卡尔积那一族的落点经实测归第一层，按 §3.4
+补三条必拒；必放行补的是"逗号连接 + `WHERE` 里写连接条件"那支老式合法写法——
+它比新增的拒绝分支更需要钉子，因为**误伤它就等于误伤一类合法 SQL**。
+那 57/19 两个数要到 037 施工半边把语料写进去、机械用例跑完才成立，本节按 §9.2 开头那条规矩
+（先改本文再改实现）**先落口径**；对不上时以重测为准并回来改这一格。
+**"没有一枚码没人证过"这件事的判据从 036 起改了形**：钉住处可以是语料的一条期望值，
 也可以是某条**永久用例的断言**直接点这枚成员的名——`regeneration_drift` 属后者，因为它是**我们自己代码的内部
-一致性故障**，今天没有任何一支模型 SQL 能触发它（实测：18 条必放行语料逐条走等价自校验，漂移候选 0 条），
+一致性故障**，今天没有任何一支模型 SQL 能触发它（实测：18 条必放行语料逐条走等价自校验，漂移候选 0 条——
+那是 **036 收尾时**量的那一批字节；037 往必放行那一组补了一条，这一格**必须在施工半边按新字节重跑**并回到
+§1.3 末与 verification §1.11 更新，文档半边不许替它先答），
 硬要往语料里塞一条就只能是靠 monkeypatch 才过得去的死条目。机械用例仍表驱动、零平行清单：
 它扫 `tests/guard/` 全目录**断言里**对 `GuardRuleId.<成员>` 的属性引用，与语料期望值取并集（036 拍板，见 §1.1.1 末）。
+> **as-built(P5-037)：扫描根加了一枚**。第二层那三枚码（`too_costly` / `dry_run_unreadable` /
+> `dry_run_engine_rejected`）**不可能住在 `tests/guard/`**——`guard()` 不碰库，`EXPLAIN` 的裁决与真发语句
+> 都属另一个模块，把它们的用例塞进 `tests/guard/` 只是为了迁就一条机械判据的目录字面，那是让尺子决定地形。
+> 判据的扫描根因此从"一个目录"变成"两枚显式列出"：`tests/guard/test_*.py` ∪ `tests/unit/test_dry_run_*.py`。
+> 放宽的**只有位置**，强度一格没动：仍只认断言里的属性引用、仍不预先过滤成员名、
+> 这三枚同样各配一条**失败路径用例**（不是"点过名"就算钉住）。
+> 036 那一条 `regeneration_drift` 的先例在这里被用上，也顺手证了它当初那条放宽是对的。
+>
 > **as-built(P5-036 收尾)：这一档"放宽"被双轴审出过一个空洞，已按实物补严**。判据第一版扫的是全文件的
 > 属性引用并预先 `node.attr in members` 过滤过——那个过滤让"有人把成员名拼错、或删了成员"这一类**永远红不了**
 > （非成员值在构造上就进不了集合）。收尾版改成两问分别断：**只认 `ast.Assert` 里的引用**（写在注释、docstring
@@ -101,7 +124,11 @@ def guard(
 | `sleep_function` | MySQL `SLEEP()`：它让语句超时形同虚设 | `_function_violations` | 1 |
 | `danger_function` | **兜底那一档**：sqlglot 认不出的函数一律落成 `exp.Anonymous`，一律拒。新增的危险函数无需改这里就已经被挡 | `_function_violations` | 2 |
 | `table_not_allowed` | 两种：系统字典表（`information_schema`/`mysql`/`pg_catalog`… **即便已授权也拒**）、白名单外 | `_table_violations` | 7 |
+| `cartesian_product` | **第 19 枚（as-built P5-037），仍属第一层**：某个 scope 里有"`on`/`using`/`side`/`kind`/`method` **五格全空**"的 join 节点，**且该 scope 没有 `WHERE`** → 连接条件无从推出，行数上限只能按两表之积（`method` 那一格是实测逼出来的，不查它就会误拒自带条件的 `NATURAL JOIN`，§1.2 ⑥.1）。实测覆盖面比 §3 原话（"只拒无 join 条件的逗号连接"）宽一格：`FROM a JOIN b`（不写 `ON`）在 sqlglot 里与逗号连接**逐字同形**，AST 分不开（§3.4）。`CROSS`/`NATURAL`/`STRAIGHT_JOIN` 与"逗号连接 + `WHERE`"不在这一支 | `_join_violations` | 3 |
 | `regeneration_drift` | **第 18 枚，也是唯一一枚防的是我们自己的代码**：`final` 序列化出的 `sql_final` 再 parse 一次，**一条不动点加三格承重事实**（顶层形状 / 表引用 / 顶层行数）任一格红即漂移——它红了就意味着"不知道执行的是哪条 SQL"，按拒答处理。它**不是**用户 SQL 违规，所以不许挂 `unsupported_construct`（那等于把我们的 bug 报成用户的错） | `guard` 出口处的 `regeneration_violation`（§1.3） | 0（钉在 `tests/guard/test_regeneration_invariant.py`，理由见本节开头） |
+| `too_costly` | **第二层第一枚**：`EXPLAIN` 逐行 `rows` 的**最大值**（单次扫描的最大估行）> `AIWEB_QUERY__MAX_EXPLAIN_ROWS`。尺子为什么取最大值而不是乘积/求和，见 §3.2 的实测表——乘积会把一条合法的 `UNION` 问句拒掉 | `dry_run.explain_verdict`（§3.2） | 0（语料管不到第二层，钉在 `tests/unit/test_dry_run_shape.py`，见本节开头那条扫描根注） |
+| `dry_run_unreadable` | **第二层第二枚**：`EXPLAIN` 回的结果里**一行估行都读不出来**（全 `NULL`／没有 `rows` 这一列／回零行），而引擎又没有逐行自证 `optimized away`。**2026-10-20 拍板**（工单 037 留给施工的第三格）：新枚而不是挂 `unsupported_construct`——后者是"sqlglot 证不了"，这一枚是"引擎的读数取不到"，两件事的修法与责任方不同 | `dry_run.explain_verdict` | 0（同上；演示源上今天不可达，由桩件驱动，见 §3.2 第 2 格） |
+| `dry_run_engine_rejected` | **第二层第三枚**：`EXPLAIN` 语句**自己**被源库拒（实测 `1054 Unknown column`／`1146 Table doesn't exist`／`1221 UNION 与 LIMIT`），message 带**源库原话**——它是 038 回喂模型的正文来源，所以"用户的 SQL 违规"与"我们读不出来"必须是两枚码（§3.2 第 3 格） | `dry_run.run_dry_run` | 0（同上） |
 
 **与 §1.2 那些大写名的关系**（评审期写法速记，实物从来不是这个拼法）：
 `MULTI_STATEMENT`→`multi_statement`、`ROW_LOCKING`→`locking_clause`、
@@ -117,9 +144,19 @@ def guard(
 §1.2 那张清单从头到尾讲的是"模型的 SQL 里有什么不许"，而这一枚讲的是"守卫自己的输出对不对"。
 两者不该混在一张清单里，所以 §1.2 不加行。）
 
-`TOO_COSTLY`（§0 表与 §2 的 dry-run 拒因）**不在这 18 枚里**：它属第二层，今天零实现，
-随工单 037 加进同一枚枚举——所以 035 的机械检查是**表驱动**的，加成员只动枚举一处；
-036 把"钉住处"从"必须是语料"放宽成"语料或用例"（见本节开头），是因为第一个**不可能有语料**的成员出现了。
+> **as-built(P5-037)：`TOO_COSTLY` 这一格被实测否掉，订正如下**。本节原来写的是"`TOO_COSTLY`（§0 表与
+> §2 的 dry-run 拒因）**不在这 18 枚里**：它属第二层，今天零实现，随工单 037 加进同一枚枚举"。
+> 三件事都只对了一半：① 加进枚举这件事 037 做了，但**加了四枚而不是两枚**——`too_costly`、
+> `dry_run_unreadable`（工单点名的那两枚），外加 `cartesian_product`（§3.4：实测证明笛卡尔积的形状在 AST
+> 上可见，归第一层）与 `dry_run_engine_rejected`（§3.2 第 3 格：`EXPLAIN` 自己被源库拒既不是"读不出来"
+> 也不是 sqlglot 的解析失败，而 038 要拿它的正文回喂模型。工单只钉了两枚的命名，第三、第四枚按它
+> "施工时定、定了就进枚举并写进文档"那条口径落在施工时，这里就是那份记录）；
+> ② 码的**字面**按实物从小写：文档大写、语料期望值小写，两半边对不上时以落库那一侧为准；
+> ③ "不在这 18 枚里"这个说法本身随 037 失效——这枚枚举从"第一层的词表"变成**三层共用的拒绝词表**（§1.1）。
+> 035 的机械检查是**表驱动**的这条仍然成立：加成员只动枚举一处 + 钉住处一处。
+> 036 把"钉住处"从"必须是语料"放宽成"语料或用例"（见本节开头），037 就直接用上了那次放宽——
+> 三枚第二层的码**在结构上不可能有语料**（`guard()` 不碰库），没有那次放宽，本片要么红在封闭集合那条用例上、
+> 要么往语料里塞一条走不到的死条目，两个都是伪造证据。
 
 ### 1.2 规则清单
 
@@ -190,6 +227,38 @@ for t in ast.find_all(exp.Table):
   （**即便用户有权也拒**；元数据从我们自己库读）。
 - `exp.Column` 上带 `catalog/db` 前缀的（`SELECT x.y.z`）→ 拆出表部分同样校验，
   防 `mysql.user` 三段式绕过。
+
+**⑥.1 连接条件扫描（as-built(P5-037)，新枚 `cartesian_product`）**
+
+§3 原来把笛卡尔积挂在**第二层**。工单 037 的"已定口径"把落点交给实测：AST 可见就归第一层。
+实测（sqlglot 30.19.0，`probe_cartesian_ast037.txt`）可见，所以这一支落在守卫的 `_join_violations`，
+逐 scope 判定：
+
+```
+对每一个 Select 作用域：
+  存在 exp.Join 满足  on 空 且 using 空 且 side 空 且 kind 空 且 method 空
+  且该作用域没有 WHERE
+  → cartesian_product
+```
+
+- **`method` 那一格是实测逼出来的**（第一版只查 `side`/`kind`，会把 `NATURAL JOIN` 一起拒掉）：
+  sqlglot 30.19 的 `Join` 把修饰词分住三个 key——`side`（`LEFT`/`RIGHT`）、`kind`
+  （`CROSS`/`STRAIGHT_JOIN`）、`method`（`NATURAL`），`NATURAL JOIN` 的 `side`/`kind` **都是空串**、
+  只有 `method='NATURAL'`（`args keys` 与 `sql()` 原文实测在 `probe_cartesian_ast037.txt` 末两段）。
+  `NATURAL JOIN` 自带连接条件（按同名列），不是笛卡尔积，所以判据必须把 `method` 算进去。
+- **为什么带 `WHERE` 就放行**：`FROM a, b WHERE a.id = b.aid` 是老式合法写法，实测与"没有连接条件"
+  在 AST 上给出的信息量差别就只有"有没有 WHERE"这一格——要再往下判就得比对 WHERE 里的列属于哪张表，
+  那是把连接图重建一遍，误报率与 §9 里"其余放行"那半句同源，不在 v1 范围。
+  **代价说清**：这一支挡的是"完全没条件"的那一档，`FROM a, b WHERE a.x > 1`（笛卡尔积 + 无关条件）
+  **今天照样放行**（实测 `where=True`、形状与合法的老式写法同构）。
+- **覆盖面比 §3 原话宽一格**：`FROM a JOIN b`（显式 `JOIN` 不写 `ON`，MySQL 允许）不只节点形状相同，
+  **重生成出来的字面就是 `, b`**——与逗号连接在 AST 与文本两侧都分不开（同那段实测）。所以这一支一并拒掉。
+  要按 §3 字面只放它过就得回到原 SQL 找那个逗号——正是工单禁止的方向。理由与实测都记在 §3.4。
+- `CROSS JOIN`（实测 `kind='CROSS'`）与 `STRAIGHT_JOIN`（实测 `kind='STRAIGHT_JOIN'`）**不在这一支**：
+  判据是"`kind` 非空即跳过"，所以它们**即便没有连接条件也放行**——`FROM a STRAIGHT_JOIN b` 不带 `ON`
+  在 MySQL 里就是笛卡尔积，这一格今天挡不住，留在 §9 说清，不许在交付记录里含混过去。
+  `NATURAL JOIN` 也不在这一支，但它是**应该**放行（它自带按同名列的连接条件），理由见上面 `method` 那条。
+  派生表/子查询内部的逗号连接**在**这一支——实测 `find_all(exp.Join)` 看得见内层 scope。
 
 **⑦ 强制 LIMIT**
 
@@ -390,18 +459,111 @@ AI 写了 `LIMIT 10` 给 PG 也能被重写成合法形态。重生成结果必�
 
 ## 3. 第二层：引擎 EXPLAIN dry-run
 
-弥补 sqlglot "宽容非校验"的第二道独立闸门：
+弥补 sqlglot "宽容非校验"的第二道独立闸门。
 
-- **MySQL**：`EXPLAIN <sql_final>`（5.7 对 SELECT 支持；`EXPLAIN` 不执行）。
-- **PG**：
-  ```sql
-  BEGIN READ ONLY; SET LOCAL statement_timeout='3000ms'; EXPLAIN <sql_final>; ROLLBACK;
-  ```
-- 估行超阈值：`rows_estimated > AIWEB_QUERY__MAX_EXPLAIN_ROWS`（默认 5e7）→ 拒 `TOO_COSTLY`。
-- 笛卡尔积：v1 **只对"无 join 条件的逗号连接"硬拒**，其余放行
-  （`materialize` / `Nested Loop all` + 无索引 Join 的检测误报率高，写进 known limitation）。
-- `AIWEB_QUERY__DRY_RUN=true`；关掉即失去第三道防御之外的第二层，**prod 启动自检禁止关闭**。
-- dry-run 失败信息可回喂模型自动重试一次（`retry_with_error`），**最多 1 次**。
+> **as-built(P5-037)**：本节整块在 037 之前**是零实现**。开工前重核过的事实账（2026-10-20，认字不认行号）：
+> `AIWEB_QUERY__DRY_RUN` 这个**键根本不存在**（`settings.py` 的 `QueryGroup` 没有 `dry_run` 字段，
+> `.env.example` 的 `AIWEB_QUERY__` 那一组没有这一行）；`max_explain_rows: int = 50_000_000` **只有定义点、
+> 全仓零读取点**；`EXPLAIN` 在 `app/` 下只出现在注释里（`datasource_service.py` 说"第二层 EXPLAIN dry-run"），
+> 没有任何实现。所以三层防御当时的实物是**两层**：第一层 AST 白名单 + 第三层会话级 SET 序列。
+> 下面按落地情况把本节重写一遍，每小节末尾那一格是"今天到底有几分实物"。
+
+### 3.1 跑在哪条 SQL 上、住在哪个模块
+
+- **只跑在 `sql_final` 上，绝不跑模型原文**。036 那条"执行的就是守卫看到的"等价断言把第一层与执行钉在
+  同一件东西上，第二层必须钉在**同一件东西**上，否则两层各验各的。
+- 落点是 `app/services/nl2sql/dry_run.py`，由 `executor.py` 在**第三层那条只读会话建好之后、发真 SQL 取行之前**
+  调用。它与第三层分家成两个模块是刻意的："分层独立有效"（roadmap §P5 验收 4 的立论）要求第二层能被单独关掉、
+  单独反证；塞进 `executor.py` 它就只是第三层里的一段代码，"关掉第二层"这种用例就写不出来。
+- MySQL 一支**真跑**：`EXPLAIN <sql_final>`（5.7 对 SELECT 支持；`EXPLAIN` 不执行）。
+- **PG 那一支今天只有 SQL 形状、没有真跑**（2026-10-20 拍板）。`explain_statements("postgres", …)` 编译出
+  §3.1.1 那四条文本、由用例逐字断（`BEGIN READ ONLY` 在 `EXPLAIN` 之前、`ROLLBACK` 在最后、
+  `SET LOCAL statement_timeout` 用的是 `'3000ms'` 那个字面），但执行路径今天对 PG 直接
+  `NotImplementedSource`（`executor.py` 那一发 501），语句发不出去，也就**没有真库行为证据**。
+  行为用例等"PG 只读执行"落地那天补——那是另一件更大的事，不属本片。
+
+```sql
+-- 3.1.1 PG 的四条（形状已钉，今天无真跑）
+BEGIN READ ONLY; SET LOCAL statement_timeout='3000ms'; EXPLAIN <sql_final>; ROLLBACK;
+```
+
+### 3.2 估行怎么读（这一段是实测写的，不是设计写的）
+
+尺子住在纯函数 `explain_verdict(lines, *, max_explain_rows)` 里——**裁决不连库**，真发语句那一半在
+`run_dry_run(...)`。实物口径来自真 MySQL 5.7.17 + 演示库 `ai_web_demo` 的 13 条"用户真会问"的形状
+（`.scratch/p5-sql-guard-hardening/evidence/probe_explain037.txt`、`probe_explain_null037.txt`、
+`probe_explain_json037.txt`）：
+
+| 实测事实 | 对裁决的后果 |
+|---|---|
+| 传统 `EXPLAIN` 回 12 列（`id/select_type/table/partitions/type/possible_keys/key/key_len/ref/rows/filtered/Extra`），估行在 `rows` 那一列，**逐表一行** | 尺子就是"逐行读 `rows`" |
+| 13 条里 **3 条给出 `NULL`**：裸聚合 `count(*)`（`[None]`）、派生表（`[1, None]`）、`UNION`（`[30226, 87912, None]`） | "读不出来"必须先定义清楚，否则**最常见的那一类问句**（"有多少订单"）被误杀，而 `DRY_RUN` 默认开、prod 不能关 |
+| `count(*)` 那一行不是"引擎不知道"：`Extra` = `Select tables optimized away`，`FORMAT=JSON` 给的是 `"message": "Select tables optimized away"`（整个 JSON 里**没有任何 cost/rows 键**，实测原文在 `probe_explain_json037.txt`）——引擎在说**它证明了不需要扫表** | 这一格属"**证得了它小**"，不是"证不了"。它必须放行，否则第二层拦的是最便宜的那种计划 |
+| `UNION` 的两臂是**并列的两次扫描**，不是嵌套循环 | 把逐行 `rows` **相乘**会把一条合法 UNION 判成 `too_costly`（实测 30226×87912 ≈ 2.66e9 > 默认阈值 5e7）；相加也不对。尺子取**最大值**，它是"单次扫描的最大估行"，不是总代价 |
+| `EXPLAIN` 自己被源库拒的三支真在第二层就红、不到取行：`1054 Unknown column`、`1146 Table doesn't exist`、`1221 Incorrect usage of UNION and LIMIT`（后者正是模型爱写的"每臂各带 LIMIT"形状） | 这一档要单独一枚码，正文带**源库原话**（038 回喂的输入） |
+| `EXPLAIN SHOW TABLES` → `1064`；`EXPLAIN UPDATE` → `1142 command denied`；`EXPLAIN SELECT …` 到不了第二层（实测 `guard()` 对 `EXPLAIN` 前缀报 `top_level_not_select`） | `1064` 那一支在真链路上取不到，只能由桩件驱动，**不许写成"真库证过"**；`1142` 是第三层那把只读刀的功劳，不是第二层 |
+
+**裁决口径（工单 037 格子 ③ 的细化，037 施工前由用户选定，选的是"全 NULL 才算读不出来 + 认 optimized away"这一档）**：
+
+1. 取所有**非 NULL** `rows` 的**最大值**。读得出数就按它裁：`> AIWEB_QUERY__MAX_EXPLAIN_ROWS` → 拒 `too_costly`。
+   混合形状（一部分行有数、一部分 `NULL`）**按有数那些行裁**——已经读出来的那一格能证大小，
+   拿"另一行读不出来"去拒一条证得了的 SQL 是把我们的读法问题算成用户的代价。
+2. **一行都读不出来**（全 `NULL`／结果里根本没有 `rows` 这一列／`EXPLAIN` 回零行）时，先问引擎有没有自证：
+   **每一行**的 `Extra` 都含 `optimized away` → **放行**（上面那条实测就是它的理由）；
+   否则 → 拒 `dry_run_unreadable`。§1.2 ⑦ 那条既有裁决"证不了它小就按最严的一档"在这一格仍然成立，
+   只是"引擎自己说它不扫表"不在"证不了"里面。工单原话"不许停在先放行"没有被违反：停在哪一格都不是"先放行"，
+   而是"按引擎给出的证据分档"。
+3. `EXPLAIN` 语句**自己**被源库拒 → 拒 `dry_run_engine_rejected`，**message 带源库原话**。
+   这一枚码单开的理由：它既不是"估行读不出来"（那是我们的读法），也不是 `unsupported_construct`
+   （那是 sqlglot 的解析），而 038 要把这句话原样回喂模型。036 立的那条"我们的 bug 不许报成用户的 SQL 违规"
+   在这里反过来同样成立——**用户的 SQL 违规也不许报成我们读不出来**。
+4. 第二层这三枚**不进 §8.1 那批语料**：`guard()` 不碰库，语料驱动不到它们。它们的钉住处与
+   `regeneration_drift` 同族（用例断言），差别只在钉子不住在 `tests/guard/` 而在
+   `tests/unit/test_dry_run_shape.py`——封闭集合那条机械判据的扫描根随本片加一枚，见 §9.2 的 037 那一行。
+
+### 3.3 关掉这一层与 prod 启动自检
+
+- `AIWEB_QUERY__DRY_RUN`（**本片新建的键，默认 `true`**，2026-10-20 拍板：照本节原话取 `true`。
+  代价说清：它意味着每条问数在源库上多一次往返，且 prod 被自检锁死不能关）。
+  读取点在 `executor.py` 内部，与 `resolve_timeout` 同一条纪律——**调用方无法指定**，只能改这一格配置。
+- `dry_run=False` 时**一步都不发**：关掉整层的证据是"源库一条 `EXPLAIN` 都没收到"（正向断"没发"），
+  不是"结果为空"；同一次用例还要断真 SQL 照跑、结果不变。
+- 本节的"**prod 启动自检禁止关闭**"落成 `check_env.py` 的 `query.dry_run` 一档：
+  `AIWEB_APP__ENV=prod` 且 `dry_run=False` → **报红并点名是哪个键**；dev/test 下同一组合只报黄不阻断
+  （本节只禁 prod，禁到 dev 上就是给自己加墙）。
+- 关掉第二层不等于关掉防御：第三层那四条 SET 一个字不动（本片"不动第三层"是硬约束）。
+
+### 3.4 笛卡尔积：口径没变，**落点被实测改了**
+
+本节原话是"v1 只对**无 join 条件的逗号连接**硬拒，其余放行"，且挂在第二层。工单 037 的"已定口径"把落点
+交给实测（AST 可见 → 归第一层），实测结果在
+`.scratch/p5-sql-guard-hardening/evidence/probe_cartesian_ast037.txt`（sqlglot 30.19.0）：
+
+- `FROM a, b` 落成一个 `exp.Join` 节点，`side=''`、`kind=''`、`on=None`、`using` 空——**AST 可见**。
+  既然可见就该住第一层（守卫规则 + 语料），第二层拿 SQL 文本再判一次是拿字符串重做 AST 已经做过的事。
+  于是这一支落成第一层的新规则 `cartesian_product`（§1.1.1 第 19 枚）：**某个 scope 里存在
+  没有 `ON`、没有 `USING`、`kind`/`side` 都是空的 join 节点，且该 scope 没有 `WHERE`** → 拒。
+  这句是**第一版的写法**，它少了一格（`method`），完整判据见本节下面 `NATURAL` 那一格与 §1.2 ⑥.1 的伪码。
+- 一条顺带的实测发现，它让覆盖面比本节那半句**更宽**：`FROM a JOIN b`（显式 `JOIN` 不写 `ON`，MySQL 允许）
+  落成的节点与逗号连接**逐字同形**，AST 分不开。所以第一层那一支实际拒的是"任何没有连接条件、
+  又没有 `WHERE` 可依托的 join 写法"。要按本节字面只放逗号连接过，就必须回到 SQL 文本找那个逗号——
+  正是工单禁止的方向。**这一格偏差按 §9.2 开头那条规矩记在这里，不悄悄放行回去。**
+- `CROSS JOIN`（实测 `kind='CROSS'`）、`STRAIGHT_JOIN`（`kind='STRAIGHT_JOIN'`）、以及"逗号连接 + `WHERE`"
+  （老式写法，实测与合法形状不可分：MySQL 自己就把 `FROM a, b WHERE a.id=b.aid` 改写成 join）
+  **都不在硬拒范围**，留在 §9 的 known limitation。要说清这三格放行的**理由各不相同**：
+  `CROSS` 与 `STRAIGHT_JOIN` 是按工单"v1 只硬拒无条件的逗号连接那一族"这条已定口径放的
+  （`CROSS JOIN` 不带条件本身就是笛卡尔积，"它没错"不是理由，只是**本片不拒**）；
+  "逗号连接 + `WHERE`"是按实测放的（判不出，硬判就误伤一类合法 SQL）。
+  交付记录里不许写"笛卡尔积已全面挡住"。
+  **`NATURAL JOIN` 是另一回事**：它自带按同名列的连接条件，不是笛卡尔积，所以它**必须**放行——
+  而它挡住不了的原因很具体：sqlglot 把 `NATURAL` 放在 `Join.args["method"]` 里，`side`/`kind` 都是空串，
+  判据若不查 `method` 就会把它一起拒掉（实测在 `probe_cartesian_ast037.txt` 末两段，
+  规则那一格见 §1.2 ⑥.1）。这一发是本轮"先实测再落规则"抓出来的、否则会写进代码的误伤。
+
+### 3.5 dry-run 失败回喂模型自动重试一次（`retry_with_error`，最多 1 次）
+
+属工单 038。037 交到的状态是：失败即**早退**（不是 500），`guard_result` 里落的是同一枚枚举值、
+错误正文已经是可回喂的形状（源库原话 + `[rule_id]` 前缀）。
 
 ---
 
@@ -741,6 +903,19 @@ def test_allow(sql):
 > 第 27 条要留意：5.7 的 `PROCEDURE ANALYSE()`、`INTO @var`、`FOR UPDATE` 都需要单独规则，
 > sqlglot 的宽容 parser 可能不把 `PROCEDURE ANALYSE` 识别为子结构 → **必须有正则级兜底**。
 
+> **as-built(P5-037)：这张表不加行，语料加 3 条**。037 带来的第一层新枚 `cartesian_product`
+> （§1.2 ⑥.1）在本节没有对应编号——它防的不是"注入面"而是"代价面"，本节这张表从 #1 到 #34 讲的是
+> "这条 SQL 会做坏事"，而笛卡尔积那条做的是**合法但会扫爆**的事。所以它按语料的实际形状走三条，
+> 每条钉住判据的一格（口径见 §3.4 与 §1.2 ⑥.1，这里只记落点）：
+> ① `SELECT * FROM customer, order_main` —— 本节原话那唯一一支（无条件的逗号连接）；
+> ② `SELECT * FROM customer JOIN order_main` —— 显式 `JOIN` 不写 `ON`，就是 §3.4 说的那格"覆盖面比
+> 本节原话宽"的偏差，它必须有一条自己的钉子，否则那一支哪天被"按字面收窄回去"没人会红；
+> ③ `SELECT * FROM (SELECT c.id FROM customer c, order_main o) t` —— 判据是**逐 scope** 的，
+> 内层那个作用域里的无条件逗号连接也要被看见；只测顶层那一条证不了"逐 scope"这三个字。
+>
+> 三条都是 `guard()` 层能拒的形状，所以**它们进语料**，与第二层那三枚"结构上不可能有语料"的码是两回事
+> （§1.1.1 开头那条扫描根注）。语料期望值 54 → 57 的全部差额就是这三条。
+
 ### 8.2 必须被放行（≥6）
 
 1. `SELECT o.id, SUM(o.amount) AS total FROM order_main o JOIN customer c ON c.id=o.customer_id WHERE o.created_at >= '2024-01-01' GROUP BY o.id ORDER BY total DESC LIMIT 10`
@@ -753,6 +928,19 @@ def test_allow(sql):
 8. `SELECT json_extract(extra_col,'$.city') FROM customer LIMIT 10`
 9. `SELECT o.id FROM order_main o WHERE o.id IN (SELECT om.order_id FROM order_item om WHERE om.qty>3) EXCEPT SELECT r.order_id FROM refund_record r`
 10. `SELECT p.name, s.* FROM product_stats_wide s JOIN product p ON p.id=s.product_id ORDER BY s.gmv DESC LIMIT 1`（宽表自连接冒烟）
+
+> **as-built(P5-037)：+1 条 → 19**。新增的是 **#11 `SELECT c.id, o.id FROM customer c, order_main o WHERE c.id=o.customer_id`**
+> ——老式逗号连接把连接条件写在 `WHERE` 里，这是 MySQL 自己都会改写成 join 的合法形状（§3.4 实测），
+> 也是 §1.2 ⑥.1 那条判据里"**且该作用域没有 `WHERE`**"这半句存在的唯一理由。
+> 它比新增的拒绝分支更需要钉子：拒绝分支红了只是"少挡一条"，这支被误伤等于**误伤一类合法 SQL**，
+> 而且是模型最常见的一类写法。
+>
+> `NATURAL JOIN` / `CROSS JOIN` / `STRAIGHT_JOIN` 那三支的放行**不进本节**（语料仍 19 条），
+> 钉在规则自己的用例里。理由是两问不同：本节那条只断"这条 SQL 合法"，红了答不出红在哪一格；
+> 而这三支撑的恰好是 `method`/`kind`/`side` 三格 key 的判据本身（§1.2 ⑥.1 那条"`method` 是实测逼出来的"），
+> 一对一钉在规则文件里才能指明是哪一格掉了。`NATURAL` 那一格尤其：它挡住的理由完全取决于
+> sqlglot 把修饰词住在 `args["method"]`，**这条误伤是本轮"先实测再落规则"抓出来的**，
+> 值得一条点名 `method` 的钉子，而不是一句"语料里有它"。
 
 放行用例还要断言：`LIMIT 5 OFFSET 10` 不被改坏（幂等，不出现双 LIMIT）、
 注入的 LIMIT 值是 `max_rows + 1`（`max_rows` 来自 `resolve_row_limit(ds)`，`HARD_LIMIT` 那个键不建，
@@ -779,6 +967,16 @@ def test_allow(sql):
 - 即使模型产出了 `DROP`，`/api/chat/ask` 的 dry-run 分支也要返回 400 `sql_guard_rejected`，
   绝不落到执行层。
 
+> **as-built(P5-037)：上面第二条那句"证明第二/第三层独立有效"，在 037 之前是一句空头账**——
+> 当时第二层零实现（§3 开头那条事实账），那条用例证的从头到尾只有第三层。现在第二层有了实物，
+> 但要分清各层的反证长什么样，别让一条用例替两层签字：
+> ① 第三层的独立反证仍是上面那一条（清空黑名单 → 驱动 timeout 拦下，错误正文来自源库而非守卫）；
+> ② **第二层的独立反证是 `dry_run=False` 那一发**（§3.3）：断的是"源库一条 `EXPLAIN` 都没收到"
+> 且真 SQL 照跑、结果一字不变——正向断"没发"，不是断"结果为空"。
+> ③ 一条顺带的归因更正：`SELECT SLEEP(20)` 走不到第二层，第一层的函数规则先命中；
+> 新增的 `cartesian_product` 同样在第一层命中（§3.4），**所以"第二层挡住笛卡尔积"这句以前就算实现也不成立**。
+> 三层各自关掉时剩下的那两层要照样成立，这条验收的写法才是可测的。
+
 ---
 
 ## 9. Known limitations（诚实清单）
@@ -786,7 +984,11 @@ def test_allow(sql):
 | 项 | 现状 |
 |---|---|
 | 服务端查询无法主动 `KILL` | 只读账号没有 `KILL` 权限；依赖 `MAX_EXECUTION_TIME` 自杀 + 归还前 `ROLLBACK` |
-| 笛卡尔积检测 | v1 只对"无 join 条件的逗号连接"硬拒，其余放行（误报率高） |
+| 笛卡尔积检测 | **as-built(P5-037)：这一行整行重写**。原话"只对'无 join 条件的逗号连接'硬拒，其余放行（误报率高）"有两处与实物不符：① 落点不在第二层，第一层就能看见（`_join_violations`，§1.2 ⑥.1）；② 拒的**比原话宽**——`FROM a JOIN b`（不写 `ON`）与逗号连接在 AST 与重生成文本两侧都逐字同形，AST 分不开。今天真正挡住的是"某个 scope 里 `on`/`using`/`side`/`kind`/`method` 五格全空 **且该 scope 没有 `WHERE`**"；真正**仍放行**的是 `CROSS JOIN`、`STRAIGHT_JOIN`，以及"无条件笛卡尔积 + 一个无关 `WHERE`"（`FROM a, b WHERE a.x > 1`，实测与合法老式写法同构，再往下判要把连接图重建一遍）。交付记录里不许写"笛卡尔积已全面挡住" |
+| 第二层估行是**引擎估算**不是真行数 | `EXPLAIN` 的 `rows` 来自统计信息。`ANALYZE` 没跑过、或统计过期时，阈值会按一个错的数裁（可能误拒也可能漏放）。这一层是**代价闸门**不是**正确性闸门**：它不改变第一层与第三层的任何判定，关掉它防御仍成立（§3.3） |
+| 每条问数在源库上多一次往返 | `AIWEB_QUERY__DRY_RUN` 默认 `true`（2026-10-20 拍板），代价就是这一次 `EXPLAIN`。它和真 SQL 用同一条连接、同一个只读会话，所以不是"多建一次连接"；prod 被 `check_env` 锁死不能关，dev 想省这一次要自己改键（§3.3） |
+| `dry_run_unreadable` 在演示源上今天不可达 | 全 `NULL` 估行且引擎没自证 `optimized away` 的那个形状，13 条实测（§3.2）里一条都没落到它——它是由**桩件**驱动的分支，不是真库证过的行为。同理 `EXPLAIN SHOW TABLES` 那一支（`1064`）在真链路上取不到：`guard()` 对 `EXPLAIN` 前缀先报 `top_level_not_select`。这两格**不许写成"真跑过"** |
+| PG 那一支只有 SQL 形状、没有真库行为证据 | `explain_statements("postgres", …)` 四条文本由用例逐字断，但执行路对 PG 直接 501，语句发不出去（§3.1）。"PG 的 dry-run 行为正确"这句话今天没人能签 |
 | sqlglot 宽容 parser | 需要正则级兜底（`PROCEDURE ANALYSE` 等）；升级 sqlglot 必须先跑全语料 |
 | MySQL 5.7 `ONLY_FULL_GROUP_BY` 默认开启 | 进 prompt 约束，不在守卫里强行改写 SQL |
 | 中间件/代理重置会话变量 | 曾考虑用 hint 双保险，与 `comments=False` 冲突，改为拒绝 hint |
@@ -815,6 +1017,10 @@ def test_allow(sql):
 | ① 的**封闭集合判据**（035 落在 `test_rule_id_closed_set.py`）与 §8.1/§8.2 的**语料条数** | **as-built(P5-036)：两处各放宽了一格，按本节开头那条规矩先改本文再改实现**。① 判据从"每枚码都要出现在 54 条必拒语料的期望值里"放宽成"**语料期望值 ∪ `tests/guard/` 里以 `GuardRuleId.<成员>` 形式点名的 AST 扫描**"，因为 036 带来了第一枚**不可能有语料**的码 `regeneration_drift`（它防的是守卫自己的代码，实测 18 条必放行语料一条都触发不了它）。**代价要说清**：属性引用只证明"有用例点了这枚码的名"，不证明那条分支真被走过，所以这一档的码必须**另配一条失败路径用例**才算钉住（036 的那发是 `test_regeneration_invariant.py` 里手工造漂移那一支）；语料那一档保持 035 的原强度，期望值仍由 `test_reject_corpus` 逐条断言。② 工单 036 验收 4 的 (B) 支字面要求"补必拒语料"，实物**只补了规则与用例、没动 `corpus.py` 那 54/18 两条计数**——它自己的"已定口径"写着"语料的期望值不许动，本片只往新增文件里加用例"，两句话冲突时按工单自己那条口径走，hint 的三支形状钉子落在 `tests/guard/test_regeneration_invariant.py::test_hint_三种形状两条接缝同码`。 |
 | `allowed_schemas` 单独入参 | 折进 `allowed`（表白名单里已带 `db`，短表名由 `default_schema` 补全）→ 效果等价且更严 |
 | `forbid_files: bool = True` | 恒为真，不给关 |
+| §0 表把第二层的位置写成"`sql_guard` 末尾"、拒因写成大写 `TOO_COSTLY` / `CARTESIAN_PRODUCT` | **as-built(P5-037)：两处都被实测改掉了**。① 位置：`guard()` 不碰库，第二层要在真源库连接上发 `EXPLAIN`，物理上住不进纯 AST 模块——落成 `app/services/nl2sql/dry_run.py`，由 `executor.py` 在第三层那条只读会话建好之后、取行之前调用。与第三层**分家成两个模块**也是刻意的（"分层独立有效"要求第二层能被单独关掉、单独反证）。② 字面：`TOO_COSTLY` 订正成小写 `too_costly`（落库那一侧为准）；`CARTESIAN_PRODUCT` **根本不住第二层**——逗号连接在 sqlglot 的 AST 上可见（§3.4），归第一层新枚 `cartesian_product`，第二层拿 SQL 文本再判一次是拿字符串重做 AST 已经做过的事 |
+| §1.1 那句"`GuardRuleId` 是第一层的拒绝码枚举" | **as-built(P5-037)：这枚枚举现在是三层共用的拒绝词表**（18 → 22 枚）。名字保留、不重命名成 `RejectionCode` 之类：它的值已是对外契约（JSONB `chat_messages.guard_result`、语料期望值、roadmap §P5 验收 2 的字面），而"重命名"这件事本身会撞上 §1.1.1 那条 `value == name` 的机械断言——契约变了才算改，内部称呼不算。依赖方向单向：`dry_run.py → sql_guard.py`（第二层复用同一枚枚举与同一个 `SqlGuardError`，管线的 `guard_result` 与早退形状因此不用新写一套），**不是** `sql_guard` 认识 `dry_run` |
+| ① 的封闭集合判据：**扫描根**（035 落、036 放宽成"语料或用例"） | **as-built(P5-037)：扫描根从"一个目录"变成"两枚显式列出"**——`tests/guard/test_*.py` ∪ `tests/unit/test_dry_run_*.py`。第二层那三枚码结构上不可能住在 `tests/guard/`（`guard()` 不碰库），把它们塞进去只是为了迁就一条机械判据的目录字面，那是让尺子决定地形。放宽的**只有位置**，强度一格没动：仍只认断言里的属性引用、仍不预先过滤成员名、三枚各配一条**失败路径用例**。036 那次放宽在这里第一次被用上，也顺手证了它当初是对的（细节见 §1.1.1 开头那条注） |
+| `test_守卫源码里每一个拒绝点的首参都是枚举成员`（035 落的那条 AST 扫描；"守卫源码"当时的实物= `sql_guard.py` 一个文件） | **as-built(P5-037)：这条判据的扫描对象随实物扩了一格——不扩就会漏掉一整个模块**。037 在 `dry_run.py` 里新写 `SqlGuardError(...)` 调用点（第二层那三枚），而那条用例读的是 `Path(sql_guard.__file__)`：不改清单的话，"每一个拒绝点的首参都是枚举成员"这句话会在**我刚写下新拒绝点的那一天**变成假话，而且没人会红。所以扩成显式两枚文件清单（`sql_guard.py` + `dry_run.py`），判据本身一个字不动（`ast.Call` 首参为 str 字面量即红）。顺带一格：`test_码的字面量在源码里只出现在枚举手自己身上` 同样只扫一个文件，`dry_run.py` 里出现 `"too_costly"` 这样的裸串它看不见——本片一并把扫描范围对齐，不留两把尺子量同一件事 |
 | ⑥ `CROSS_CATALOG` 独立规则 | 归 `table_not_allowed`（catalog 非空的白名单条目本来就不存在） |
 | ③ `Union/Except/Intersect` 递归校验臂 | 未写：sqlglot 对 `SELECT 1 UNION DROP TABLE x` 直接 ParseError，规则跑不到那一层 |
 | ⑤ `AIWEB_GUARD__DANGLING_EXTRA_RULES` 追加黑名单 | 未实现。"拒绝一切 Anonymous" 已经是超集，追加黑名单只在"想放开某个函数"时才有意义，而那不在 v1 计划里 |
