@@ -377,6 +377,9 @@ POST /api/chat/ask  {session_id?, datasource_id, question, history_ids?[], optio
 > ① **步名清单以代码为准**：`retrieve → schema → prompt → generate → guard → execute → chart → conclude`
 > 八格（① 登录、⑩ 返回不是 pipeline 的步）。每格是**增量**耗时，合计写进 `latency_ms`；
 > `result_stats.elapsed_ms` 单独记 `execute` 那一步，两列分开才答得出"慢在模型还是慢在源库"。
+> **as-built(P5-037)**：`execute` 那一步从 037 起**含第二层那一次 `EXPLAIN` 往返**（实测净增与重复
+> 噪声同量级，safety §3.6）；被第二层**拒**时不落这一步，落 `dry_run` 那一步，所以这一列永远是
+> "钱真花掉的那一段"。
 > **逐步耗时目前只在 stdout**（`AskOutcome.steps` 是它的载体，库里没有这一格）——
 > 把它端给界面是 P8 的活，而 §6 那条 `done` 帧现在只写着 `latency_ms`，**没有逐步那一段**。
 > 所以这是一个"要不要扩这一帧"的待决项，不是"已经存了、只是没显示"。

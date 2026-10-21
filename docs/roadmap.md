@@ -753,6 +753,16 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    结果一字不变（正向断"没发"，不是断"结果为空"）。顺带一条归因更正：`SLEEP(20)` 走不到第二层，
    第一层的函数规则先命中；新增的 `cartesian_product` 同样在第一层命中，
    所以"第二层挡住笛卡尔积"这句**就算实现了也不成立**（口径见 nl2sql-safety §8.4）；
+   **as-built(P5-037 施工半边)**：上面那句"各层的反证要分开签"现在有实物了，签名的用例是这两族：
+   第二层独立 = `tests/integration/test_dry_run_mysql_live.py` 里那两条关掉那一发（**坏 SQL 一路走到真执行、
+   被引擎自己拒**：证明剩下的层还在；**好 SQL 关掉与开着结果一字不变**：证明它不是结果的一部分），
+   加 `tests/unit/test_dry_run_wiring.py::test_dry_run_关掉时源库一条_explain_都没收到而真_sql_照跑`
+   （正向断"没发"，用的是假连接的 `sent` 清单）；第三层独立 = `tests/integration/test_execute_live.py`
+   那一条 1792/1142，而这一族**整族把 `AIWEB_QUERY__DRY_RUN` 钉成 `false`**——它的靶自 011 起就是
+   "源库自己拒写"，第二层开着时那道 `EXPLAIN` 会先把写语句判成我们的 `SqlGuardError`，
+   那一格就变成"证了我们自己"。两边不许互相冒充，这正是"分开签"的字面形态。
+   顺带一句验收 3 的口径：`MAX_EXPLAIN_ROWS` 在本片第一次被真读，钉子是把阈值钉成 `100`
+   让**同一条 SQL** 从放行翻成 `too_costly`（闸内与真库各一发），不是断"它不等于默认值"。
 5. 用非只读账号连数据源时 `test_connection` 报 `readonly_capability_missing`（能力探测前置）。
 
 踩坑预警：① **`comments=False` 会把 hint 一起剥掉，造成"守卫看到的 ≠ 执行的"** → 检测到 hint 直接拒；
