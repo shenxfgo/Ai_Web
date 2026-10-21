@@ -774,6 +774,13 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
 验收：
 1. `pytest tests/guard -q` 全绿（含攻击语料全部）；
 2. `POST /api/chat/validate {"sql":"SELECT 1; DROP TABLE users"}` → 400 `{code:"sql_guard_rejected", rule_id:"multi_statement"}`；
+   **as-built(P5-039)**：这一行的 400 判定按实物是**两格**——`error.code == "sql_guard_rejected"`
+   且 `error.detail.rule_id == "multi_statement"`，顶层那对 `{code, rule_id}` 是简写不是第二种响应形状
+   （全仓只有 `errors.py` 那一个信封，理由与逐条订正见 safety §8.4 末的 as-built(P5-039)）。
+   这一格由用户于 2026-10-20 拍板（工单 039 格子 ①：不为验收字面新开扁平形状）。
+   本片的白名单来源是"该源全部已同步表"而不是检索召回的那 k 张，因此它比 ask 那一路**宽**——
+   把它收到 grant 粒度是 **§P6 验收 2** 那一行（member → `403 table_not_granted`）的活，不是本片顺手补的。
+   实测读数（真 HTTP 栈上的那一发回显与八档用例）随施工半边落 verification §1.11。
 3. 不带 `LIMIT` 的 `SELECT * FROM order_item` → 执行日志见 `LIMIT 1001`、返回 1000 行 + `truncated:true`；
 4. `SELECT SLEEP(20)` 被黑名单拒；**清空黑名单**后被 `SET SESSION MAX_EXECUTION_TIME=1000` 截断
    （错误来自驱动 timeout 而非守卫）→ 证明分层独立有效；

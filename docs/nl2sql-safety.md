@@ -1036,6 +1036,12 @@ SET LOCAL application_name = 'aiweb-nl2sql';
 - `allowed_tables` 的来源是 **检索结果 ∩ 该用户有权的表**，不是"全库"。执行前二次校验
   "SQL 引用的表 ⊆ 该用户可访问表"。
 - member 直接 `POST /chat/validate {"sql":"SELECT * FROM secret_table"}` → `403 table_not_granted`。
+  **as-built(P5-039)：这一行描述的是 grant 收紧之后的样子，今天不成立**。`datasource_grants` 至今没有
+  读取点（§5 开头那句"检索结果 ∩ 该用户有权的表"里的"∩ 有权表"归 **P6 验收 2**），而 039 落地的 validate
+  在这一格上给的是 **400 `table_not_allowed`**——因为它的白名单是"该源全部已同步表"（`meta_table` 里
+  `is_stale=false` 的那些，与 `kb_service.required_card_count_stmt()` 同一条尺子；`is_hidden` 不是过滤器），
+  里面**没有**"这张表点名给了谁"那一维。档位本身是有的：`datasource_service.get_authorized` 判的是
+  "这个源你能不能读"（read 权，无档 → 403、软删 → 404），源级之下今天就到此为止。
 - 跨用户会话不可见；`chat_message` 记录 `actor_id`。
 - "用户手改 SQL 后重跑"由 `AIWEB_QUERY__ALLOW_SQL_EDIT=admin|all|none` 控制。
   **开启时输入来源从"模型输出"扩到"人输入"**，守卫的 hint/comment 拒绝与 `table_not_allowed`
@@ -1226,9 +1232,32 @@ def test_allow(sql):
   被 `SET SESSION MAX_EXECUTION_TIME=1000` 截断（错误来自驱动 timeout 而非守卫），
   证明第二/第三层独立有效。
 - `POST /api/chat/validate {"sql":"SELECT 1; DROP TABLE users"}` →
-  400 `{code:"sql_guard_rejected", rule_id:"multi_statement"}`。
+  400 `{code:"sql_guard_rejected", rule_id:"multi_statement"}`
+  （**这一行是简写**，实物形状见本节末 as-built(P5-039) 第 ① 点：判定看 `error.code` 与
+  `error.detail.rule_id` 两格，不是顶层那两个键）。
 - 即使模型产出了 `DROP`，`/api/chat/ask` 的 dry-run 分支也要返回 400 `sql_guard_rejected`，
-  绝不落到执行层。
+  绝不落到执行层。（**这句的主语是 ask，不是 validate**，见 as-built(P5-039) 第 ③ 点。）
+
+> **as-built(P5-039)：本节那两行 400 的形状订正**（文档对着实物改，不是实物迁就文档字面——
+> 与 P4-032 抓 architecture §5.2 时同一条纪律）。三条：
+> ① **全仓只有一个错误信封**：`app/core/errors.py` 的 `error_body()` 配 `register_exception_handlers`
+> 里那条 `AppError` 处理器，回的是 `{"error": {"code", "message", "detail"}}`，HTTP 码取
+> `exc.status_code`。所以 `sql_guard_rejected` 的实物是
+> `400 {"error":{"code":"sql_guard_rejected","message":"…","detail":{"rule_id":"multi_statement",
+> "field":null,"message":"…"}}}`。本行原写的扁平 `{code, rule_id}` **不是第二种形状**，它是同一件事的简写；
+> 新开扁平形状等于给前端两条例外（roadmap §P7 验收 1 的 axios 拦截器按的就是 `code/message` 这一层）。
+> 这一格由用户于 2026-10-20 拍板（工单 039 格子 ①）。
+> ② **`detail` 的三格不是发明词**：守卫侧那枚 `Violation`（`sql_guard.py:128-133`）本来就是
+> `code / message / node` 三格，`SqlGuardError` 又把它们原样带上身（`:141-143`）。对外键名换成
+> `rule_id`/`field` 只做在一处映射：`rule_id ← Violation.code`（`rule_id` 是 roadmap 验收 2 的字面、
+> 也是 035 之后那枚封闭词表 `GuardRuleId` 的枚举值），`field ← node`。
+> ③ **最后那条 dry-run 的 400 讲的是 ask（P8）而不是本片**：`POST /api/chat/validate` **只跑第一层**，
+> 它一次都不连源库，因此永远不会产出 dry-run 那一档的拒绝。把它照抄进 validate 的契约就是张冠李戴——
+> 而且 037 之后第二层拒的是 `too_costly` / `dry_run_unreadable` / `dry_run_engine_rejected` 那三枚码
+> （§1.1 那枚共用词表），038 之后它们走的是回喂重试那一路（§3.5），不是"原样 400 回给用户"。
+> 顺带一条本节管不到的事实：请求体本身不合法（缺字段、多字段、类型不对）出的是 **422 `invalid_request`**
+> （`RequestValidationError` 处理器，`:235-247`），而"空语句 / 超长"出的是 **400 `sql_guard_rejected`**
+> （守卫 `_preprocess`：`empty_statement`、`too_large`）——同一个"你的 SQL 不行"，两个主人。
 
 > **as-built(P5-037)：上面第二条那句"证明第二/第三层独立有效"，在 037 之前是一句空头账**——
 > 当时第二层零实现（§3 开头那条事实账），那条用例证的从头到尾只有第三层。现在第二层有了实物，
