@@ -583,13 +583,22 @@ async def test_第二层拒绝时落早退而不是_500(
         assert outcome.guard_result["violations"][0]["code"] == "dry_run_engine_rejected"
         # 第一层放行过的那条 sql_final 是事实，不许被第二层的拒绝抹掉
         assert outcome.sql_final is not None
-        assert route.call_count == 1  # 结论那一次也不该发
-        # 步梯停在 `dry_run`：踩坑 ② 问"卡在哪一步"，答 guard 就是把第二层的往返算进第一层头上
+        # as-built(P5-038) 的一处口径变动：第二层拒了之后**要回喂一次**，所以这里的 `_draft_route`
+        # 被叫了两回（两次生成共用同一份 system 模板 → 同一份坏草稿 → 第二次照旧被拒）。
+        # 037 当年断的是 `== 1`，注释写的是"结论那一次也不该发"——那一半今天仍然成立：
+        # 两次全是生成，一次结论都不发。封顶那一格（不许第三次）由
+        # `test_pipeline_retry_pg.py` 的"坏→坏"那档断死，这里不重复钉。
+        assert route.call_count == 2
+        # 步梯停在 `dry_run`：踩坑 ② 问"卡在哪一步"，答 guard 就是把第二层的往返算进第一层头上。
+        # 038 起这一格出现两次——被丢弃的那一趟也带着自己的三段（safety §3.5 末那条"要变诚实"）。
         assert [name for name, _ in outcome.steps] == [
             "retrieve",
             "join_graph",
             "schema",
             "prompt",
+            "generate",
+            "guard",
+            "dry_run",
             "generate",
             "guard",
             "dry_run",

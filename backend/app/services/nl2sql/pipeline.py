@@ -13,7 +13,7 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Final, NoReturn
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +37,7 @@ from app.services.nl2sql.prompt_builder import (
     SchemaTable,
     build_conclusion_prompt,
     build_prompt,
+    build_retry_messages,
 )
 from app.services.nl2sql.retriever import Retriever, load_schema_tables
 from app.services.sql_guard import QualifiedTable, SqlGuardError
@@ -176,6 +177,12 @@ class _Stopwatch:
         return self.steps[-1][1] if self.steps else 0
 
 
+#: 第二层拒了之后**再问一次**的上限（roadmap §P5 要点 c 的原话"最多 1 次"）。
+#: 写成常量而不是 `AIWEB_*__MAX_RETRY`：配置面塞进 roadmap 没要的旋钮，就多一处要文档、要默认值、
+#: 要"运维把它调到 5 会怎样"的地方（与 P4 那条"没有真实需求就别开旋钮"同族）。
+_MAX_RETRIES: Final = 1
+
+
 async def ask(
     session: AsyncSession,
     *,
@@ -285,54 +292,92 @@ async def ask(
         )
         watch.lap("prompt")
 
-        raw = await llm.complete(messages)
-        out.model = msg.model = llm.model
-        watch.lap("generate")
-        try:
-            draft = parse_llm_draft(raw)
-        except LlmBadResponse as exc:
-            # 畸形返回是拍板 ④ 的三档之一：原文片段必须留痕，否则没人知道模型到底回了什么。
-            return _exit_early(msg, out, exc.code, f"{exc.message}（原文片段：{exc.detail}）")
-        out.sql_raw = msg.sql_raw = draft.sql
-        if draft.clarify:
-            # 追问不是故障：本轮的答案就是那句 `clarify`，落成 conclusion 而不是 error。
-            # 这里**不补 chart/conclude 两个 0ms 的假步**：耗时清单的用途是"卡在哪一步"（踩坑 ②），
-            # 把没跑的步报成 0ms 等于把"跑完了但没画图"当成事实端出来。步数少两格就是少两格。
-            out.clarify = draft.clarify
-            out.conclusion = draft.clarify
-            msg.conclusion = draft.clarify
-            return out
-
+        # ⑤→⑦ 这一圈最多两趟（工单 038 / safety §3.5）：只有**第二层**拒的那一支把原话回喂重来一次。
+        # 做成循环而不是"失败后再抄一遍代码"：第二次的产物必须走完全相同的那三格（重新生成、
+        # 重新守卫、重新 dry-run），抄一遍就有两处口径要对齐，而 §1.3 末那条"重跑绝不复用旧
+        # `sql_final`"靠的正是"只有一条路径"。
+        # 循环外只留**这次的输入**（白名单、源、`row_limit`）；上一次的**裁决**一样都不带进去。
+        retries: list[dict[str, Any]] = []
         allowed = frozenset(QualifiedTable.parse(name) for name in out.tables)
-        try:
-            guarded = sql_guard.check(
-                draft.sql or "",
-                allowed=allowed,
-                dialect=ds.kind,  # type: ignore[arg-type]
-                default_schema="",
-                max_rows=row_limit,
-            )
-        except SqlGuardError as exc:
-            return _rejected_by_guard(msg, out, watch, exc, step="guard")
-        watch.lap("guard")
-        out.sql_final = msg.sql_final = guarded.sql_final
-        msg.guard_result = out.guard_result = _guard_outcome(ok=True, violations=[])
+        while True:
+            raw = await llm.complete(messages)
+            out.model = msg.model = llm.model
+            watch.lap("generate")
+            try:
+                draft = parse_llm_draft(raw)
+            except LlmBadResponse as exc:
+                # 畸形返回是拍板 ④ 的三档之一：原文片段必须留痕，否则没人知道模型到底回了什么。
+                # 它**不**进回喂那一路：这一档连一句 SQL 都没有，可回喂的证据只剩"回了半截 JSON"，
+                # 而要点 (c) 要的是"dry-run 失败信息回喂"——入口只有一格（safety §3.5）。
+                return _exit_early(msg, out, exc.code, f"{exc.message}（原文片段：{exc.detail}）")
+            out.sql_raw = msg.sql_raw = draft.sql
+            if draft.clarify:
+                # 追问不是故障：本轮的答案就是那句 `clarify`，落成 conclusion 而不是 error。
+                # 这里**不补 chart/conclude 两个假步**：耗时清单的用途是"卡在哪一步"（踩坑 ②），
+                # 把没跑的步报成 0ms 等于把"跑完了但没画图"当成事实端出来。步数少两格就是少两格。
+                out.clarify = draft.clarify
+                out.conclusion = draft.clarify
+                msg.conclusion = draft.clarify
+                return out
 
-        try:
-            result = await execute_readonly(
-                ds,
-                password=decrypt_secret(ds.secret_enc),
-                sql_final=guarded.sql_final or "",
-                row_limit=row_limit,
-                max_cell_chars=settings.result.max_cell_chars,
-                result_dir=settings.result.dir,
+            try:
+                guarded = sql_guard.check(
+                    draft.sql or "",
+                    allowed=allowed,
+                    dialect=ds.kind,  # type: ignore[arg-type]
+                    default_schema="",
+                    max_rows=row_limit,
+                )
+            except SqlGuardError as exc:
+                # 第一层拒的**绝不进**回喂那一路（工单 038 验收 2 正向钉着这一条）：越权表、多语句、
+                # DML 重试一百次还是错的，而回喂它们等于把系统的白名单告诉模型再骗它绕一次。
+                return _rejected_by_guard(msg, out, watch, exc, step="guard", retries=retries)
+            watch.lap("guard")
+            out.sql_final = msg.sql_final = guarded.sql_final
+            msg.guard_result = out.guard_result = _guard_outcome(
+                ok=True, violations=[], retries=retries
             )
-        except SqlGuardError as exc:
-            # 第二层（dry-run）住在执行器里面，抬上来的还是同一枚 `SqlGuardError`——
-            # 而它**不是** `AppError` 的后代，外面那一支兜不住它。没有这一支的话，
-            # "这条 SQL 被拒"这一轮的答案对用户就是 500"我们坏了"（safety §3.5 明写不许这样），
-            # 对 038 则是那句可回喂的正文被提前掐断。
-            return _rejected_by_guard(msg, out, watch, exc, step="dry_run")
+
+            try:
+                result = await execute_readonly(
+                    ds,
+                    password=decrypt_secret(ds.secret_enc),
+                    sql_final=guarded.sql_final or "",
+                    row_limit=row_limit,
+                    max_cell_chars=settings.result.max_cell_chars,
+                    result_dir=settings.result.dir,
+                )
+            except SqlGuardError as exc:
+                # 第二层（dry-run）住在执行器里面，抬上来的还是同一枚 `SqlGuardError`——
+                # 而它**不是** `AppError` 的后代，外面那一支兜不住它。没有这一支的话，
+                # "这条 SQL 被拒"这一轮的答案对用户就是 500"我们坏了"（safety §3.5 明写不许这样），
+                # 对 038 则是那句可回喂的正文被提前掐断。
+                if len(retries) >= _MAX_RETRIES:
+                    # 封顶那一格：`len(retries)` 就是"已经白烧了几趟"，所以第三次进不到这里。
+                    return _rejected_by_guard(msg, out, watch, exc, step="dry_run", retries=retries)
+                # 被丢弃的那一次进留痕（§2.7 第 ⑦ 条），然后先把这一趟的往返成本记账——
+                # `dry_run` 这一格不记，那笔钱就会被算到第二次 `generate` 头上，于是
+                # "重试救回来了"在耗时面上变成"第二次生成慢了一截"（踩坑 ② 同一件事）。
+                retries.append(
+                    _retry_record(seq=len(retries) + 1, sql_final=guarded.sql_final, exc=exc)
+                )
+                # 一记账就把这一格补进快照：`retries` 键在不在 == "这轮有没有白烧过一趟"，
+                # 而它对**所有**后续出口都要成立——模型第二次回得更烂而走上 `llm_bad_response`
+                # 那一档时，那一行也得说得出"这里重试过一次"（§2.7 第 ⑦ 条）。
+                msg.guard_result = out.guard_result = _guard_outcome(
+                    ok=True, violations=[], retries=retries
+                )
+                watch.lap("dry_run")
+                # 回喂的只有**文本**：上一轮的原文、发给源库的那句、那句源库原话。
+                # 树的、`sql_final` 的、`allowed` 的一个都不传——措辞与拼装住 `prompt_builder`。
+                messages = build_retry_messages(
+                    messages,
+                    previous_draft=raw,
+                    sql_final=guarded.sql_final or "",
+                    error_message=_guard_sentence(exc),
+                )
+                continue
+            break
         watch.lap("execute")
         out.executed = msg.executed = True
         out.columns, out.rows = result.columns, result.rows
@@ -501,8 +546,11 @@ def _total_ms(watch: _Stopwatch) -> int:
     return sum(ms for _, ms in watch.steps)
 
 
-def _guard_outcome(*, ok: bool, violations: Sequence[Any]) -> dict[str, Any]:
-    """`chat_messages.guard_result` 的形状（§2.7）：`{ok, violations:[{code,field,message}]}`。
+def _guard_outcome(
+    *, ok: bool, violations: Sequence[Any], retries: Sequence[dict[str, Any]] = ()
+) -> dict[str, Any]:
+    """`chat_messages.guard_result` 的形状（§2.7）：`{ok, violations:[{code,field,message}]}`
+    加上 038 起的 `retries:[{seq,sql_final,rule_id,message}]`。
 
     放这里而不是 sql_guard 里，是因为 sql_guard 的 `GuardResult` 是**裁决原文**，
     而这一列是给人看的审计快照——两者字段名不同（`node`→`field`）是刻意的。
@@ -510,11 +558,40 @@ def _guard_outcome(*, ok: bool, violations: Sequence[Any]) -> dict[str, Any]:
     **拒绝那一支的快照只有第一条违规**：链路走的是 `sql_guard.check()`，它命中首条即抛
     （003 的口径），拿不到剩下的。要"一次看全所有违规"得改走 `guard()`，那是接口层的活
     （P8 的展示形态决定值不值这一趟），今天先按"报一条最要命的"落库。
+
+    `retries` **没重试就不写这个键**，而不是写一个 `[]`：既有那三条全等断言
+    （`guard_result == {"ok": True, "violations": []}`）护的就是"重试路径不跑时零开销"，
+    多一个键它们就该红；而"没重试"与"重试过但没有被丢弃的尝试"是两件事，后者不存在。
     """
-    return {
+    outcome: dict[str, Any] = {
         "ok": ok,
         "violations": [{"code": v.code, "field": v.node, "message": v.message} for v in violations],
     }
+    if retries:
+        outcome["retries"] = list(retries)
+    return outcome
+
+
+def _guard_sentence(exc: SqlGuardError) -> str:
+    """`[rule_id] 正文` 那一句——用户看到的、落 `error_message` 的、回喂给模型的**同一句**。
+
+    这一枚**不拼字符串**：那句格式的唯一定义处是 `SqlGuardError.__init__` 里
+    `super().__init__(f"[{rule_id}] {message}")`，`str(exc)` 拿到的就是它。
+    留着这枚函数是为了给契约一个名字——调用点写成裸的 `str(exc)`，"前缀是口径的一部分"
+    这件事就隐身了，而 safety §3.5 那条"逐字回喂"要的正是这个前缀。
+    """
+    return str(exc)
+
+
+def _retry_record(*, seq: int, sql_final: str | None, exc: SqlGuardError) -> dict[str, Any]:
+    """被丢弃的那一次尝试（§2.7 第 ⑦ 条的四格）。
+
+    记 `sql_final` 而不是 `sql_raw`：那次真正被端给源库、也真正被拒的是守卫重生成后的文本，
+    而回喂给模型的也正是这一句——三者同一句，"重试到底改了什么"才答得出来。
+    `message` 存的是**不带 `[rule_id]` 前缀**的那半句：前缀由 `rule_id` 那一格兑换，
+    存两遍就有两处能对齐、也有两处能错开。
+    """
+    return {"seq": seq, "sql_final": sql_final, "rule_id": exc.rule_id, "message": exc.message}
 
 
 def _exit_early(msg: ChatMessage, out: AskOutcome, code: str, message: str) -> AskOutcome:
@@ -526,7 +603,13 @@ def _exit_early(msg: ChatMessage, out: AskOutcome, code: str, message: str) -> A
 
 
 def _rejected_by_guard(
-    msg: ChatMessage, out: AskOutcome, watch: _Stopwatch, exc: SqlGuardError, *, step: str
+    msg: ChatMessage,
+    out: AskOutcome,
+    watch: _Stopwatch,
+    exc: SqlGuardError,
+    *,
+    step: str,
+    retries: Sequence[dict[str, Any]] = (),
 ) -> AskOutcome:
     """第一层与第二层**共用**的收场（safety §3.5 / §9.2 那条"早退形状不用新写一套"）。
 
@@ -538,8 +621,13 @@ def _rejected_by_guard(
     `step` 是步梯上留下的那一格名字（踩坑 ②："卡在哪一步"必须是事实）：第一层拒在 `guard`，
     第二层拒在 `dry_run`——**不是** `execute`。钱没花完就不能记在执行那一格上，
     而把第二层的往返算进 `guard` 会把"第一层跑得真快"这件好事说成假话。
+
+    `retries` 是收场前已经**白烧掉**的那几次（038）：坏→坏那一趟要能读出"重试过、第二次也错了"，
+    而终局的 `violations` 装的只是最后一次的裁决。第一层拒的时候这里恒为空——它压根没进过这一路。
     """
-    msg.guard_result = out.guard_result = _guard_outcome(ok=False, violations=[exc.violation])
-    early = _exit_early(msg, out, "sql_guard_rejected", f"[{exc.rule_id}] {exc.message}")
+    msg.guard_result = out.guard_result = _guard_outcome(
+        ok=False, violations=[exc.violation], retries=retries
+    )
+    early = _exit_early(msg, out, "sql_guard_rejected", _guard_sentence(exc))
     watch.lap(step)
     return early

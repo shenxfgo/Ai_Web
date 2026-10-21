@@ -225,6 +225,43 @@ def build_prompt(
     ]
 
 
+# ============================================================ ⑤.5 第二层拒绝后的回喂
+
+
+def build_retry_messages(
+    messages: Sequence[dict[str, Any]],
+    *,
+    previous_draft: str,
+    sql_final: str,
+    error_message: str,
+) -> list[dict[str, Any]]:
+    """第二层拒了一句 SQL 之后要端出去的那份 messages（工单 038，safety §3.5）。
+
+    形状是 `[*原 messages, {assistant: 上一轮原文}, {user: 回喂段}]`：把模型自己上一轮的回答作为
+    assistant 轮带回去，"只改被点名的那一处"这句才有指代物——否则它看到的是一句对它说过的话的转述。
+
+    三条口径决定了这里**没有**别的东西：
+    ① 回喂的只有**文本**。树、`allowed`、第一次的 `sql_final` 对象一个都不传（§3.5"第二次绝不复用
+       第一次的任何中间物"）——这里给的是"上次那句长什么样"的证据，不是可以接着用的中间状态。
+    ② `error_message` 逐字进、不加工。它就是 `_rejected_by_guard` 本来要说给用户的那一句
+       （`[rule_id] …` 含源库原话）；改写成"请检查列名是否正确"等于把证据洗成猜测（011 那条
+       "非超时错误绝不吞"的同族）。
+    ③ **封顶一次由调用方保证**，这里不数次数。这个函数不知道"第几次"，也不该知道——把轮次闸放在
+       措辞里，就会出现"改文案改出行为"的那种 bug。
+
+    输入不被修改：返回的是新列表，`messages` 里那两份字典原样复用（内容一模一样，没有需要改的格）。
+    """
+    fed_back = _ENV.get_template("nl2sql_retry.j2").render(
+        sql_final=sql_final,
+        error_message=error_message,
+    )
+    return [
+        *messages,
+        {"role": "assistant", "content": previous_draft},
+        {"role": "user", "content": fed_back},
+    ]
+
+
 # ============================================================ ⑨ 结论生成的素材
 
 
