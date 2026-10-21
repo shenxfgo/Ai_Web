@@ -600,7 +600,7 @@ aiweb.chat_messages :
   prompt_tokens / completion_tokens int
   sql_raw text NULL                             -- LLM 原文
   sql_final text NULL                           -- guard 重写后实际执行的（顶层 LIMIT 缺则补、超则钳，见 safety §1.2 ⑦）
-  guard_result jsonb NULL                       -- {ok,violations:[{code,field,message}]}
+  guard_result jsonb NULL                       -- {ok,violations:[{code,field,message}]} + P5-038 起 retries:[…]
   executed bool / error_code text / error_message text
   result_columns jsonb / result_stats jsonb     -- {row_count,truncated,elapsed_ms,dialect,结果文件引用}
   chart_spec jsonb NULL                         -- {type:'bar', x:'dt', series:[...], title}
@@ -655,6 +655,28 @@ aiweb.chat_feedback : id / message_id FK UNIQUE / user_id / verdict CHECK('up','
 > ⑥ `result_stats.elapsed_ms` 记的是 **`execute` 那一步**的耗时，不是整条链的合计（合计在
 > `latency_ms`）。两列分开才答得出"慢在模型还是慢在源库"。同键里还多一个 `run_id`——
 > 它是结果文件的身份，013 的下载侧只认这个引用，不认路径。
+>
+> **as-built(口径 P5-038)：⑦ `guard_result` 从这一片起多一个键 `retries`，形状在这里，语义与用例在
+> nl2sql-safety §3.5。** 逐个决定都说得出理由，否则下一片会把它当随手加字段：
+> ⑦.1 **它只装被丢弃的那几次尝试**。终局那一次的读法一字未变——`ok`/`violations` 与
+> `sql_raw`/`sql_final`/`error_code`/`error_message` 那四格说的还是"这一轮最后发生了什么"。
+> 老读者只读那两格不会读到假东西，这是"扩展一个键"而不是"换一块形状"的全部意义。
+> ⑦.2 **没回喂过的时候这个键根本不存在**，不是空列表。`[]` 会让读者问"重试了 0 次，还是记录被清了"——
+> 而"没重试"与"重试记录为空"本来就是同一件事，用**一个不存在的键**说它最便宜。
+> ⑦.3 每条四栏：`seq`（第几次尝试，**1 起算，指的是被丢弃那一次**，不是"重试第几次"）、
+> `sql_final`（那一次端出去的文本）、`rule_id`（拒绝词表里那枚的**值**，封闭的）、
+> `message`（`[rule_id] …` 那句，含源库原话）。
+> ⑦.4 **记 `sql_final` 不记 `sql_raw`**：这一栏的用途是"上一次我们试图执行什么、被谁拒了"，而
+> "我们试图执行的"按 §1.3 那条不变式永远是重生成的 `sql_final`，不是模型原文。模型原文在第二次生成时
+> 被覆盖（`pipeline` 里 `sql_raw` 只有这一格），今天没有第二格存它——要留 raw↔final 成对是 P8 的活
+> （SQL 面板要显示"改了什么"才需要它），为还不存在的读者加键就是把本片变成 P8 的预告。
+> ⑦.5 **没有 `layer`/`step` 一栏**：今天能进这一路的只有第二层，加一栏常量等于把"以后可能有"写成"现在有"；
+> 要分辨哪一层拒的，`rule_id` 已经够（第二层那三枚码只可能来自第二层）。
+> ⑦.6 **消费端**：039 的 `POST /api/chat/validate` **不回**这一栏（它报的是"当前这一次"，见工单 039
+> 已定口径），真正的读者是 P8 的 SQL 面板。这一列今天只有生产者没有消费者，所以现在改形状是最便宜的时刻——
+> 等 P8 接上再改就是破坏性变更。
+> ⑦.7 **这一格不落迁移**：它是那块 JSONB 里的一个键，`chat_messages` 的列定义一字未动，
+> P5 全程 `alembic current` = `0009 (head)`（零迁移片，verification §1.11 开头那个探针）。
 
 ### 2.8 `aiweb.sync_job_event`（as-built(P3 开工前拍板) 新增，迁移 `0007_sync_event`）
 
