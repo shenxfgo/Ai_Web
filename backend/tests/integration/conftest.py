@@ -32,6 +32,7 @@ from app.settings import get_settings
 
 BACKEND = Path(__file__).resolve().parents[2]
 CNF = BACKEND / ".setup" / "aiweb_ro.cnf"
+CNF_RW = BACKEND / ".setup" / "my_login.cnf"
 
 
 class DbAccount(NamedTuple):
@@ -65,6 +66,33 @@ def account() -> DbAccount:
         pytest.skip(f"缺少 {CNF}：要先跑工单 002 的建库脚本")
     cp = configparser.ConfigParser()
     cp.read(CNF, encoding="utf-8")
+    c = cp["client"]
+    return DbAccount(
+        c["user"], c["password"], c.get("host", "127.0.0.1"), int(c.get("port", "3306"))
+    )
+
+
+@pytest.fixture(scope="module")
+def rw_account() -> DbAccount:
+    """**非只读**那把账号，只服务工单 040 验收 5 的反半。
+
+    为什么非要第二把：`account` 那把是 `aiweb_ro`（只读），它只能证"探测说 OK"那一半。
+    "探测说不 OK"这一半必须真拿一把有写权限的账号去连——否则 `grants_verdict` 里
+    `readonly_capability_missing` 那一支今天只有单元测试喂字符串签过，`test_connection`
+    回 200 + 可 switch 的码那一句就没有实物对应（safety §4.1 的 as-built(P5-040 文档半边)
+    记的正是这件事）。
+    读的是 `.setup/my_login.cnf`：工单 040 格子 ② 用户 2026-10-20 点名授权的那把，
+    也是 `scripts/demo_db.ps1` 建库用的同一个文件。口令同样不进对话、不进 `.env`、不进打印。
+    用它之前先按工单字面核实过身份（只读 `show grants`，读数在
+    `.scratch/p5-sql-guard-hardening/evidence/grants_raw040.txt`）：回的是
+    `GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION` ⇒ 确为非只读。
+    这个文件只有 `user`/`password` 两格（建库脚本用默认 socket 连接），所以 host/port 走缺省。
+    缺文件就 skip——换台机器不该把整个闸口卡红。
+    """
+    if not CNF_RW.exists():
+        pytest.skip(f"缺少 {CNF_RW}：验收 5 的反半需要一把非只读账号")
+    cp = configparser.ConfigParser()
+    cp.read(CNF_RW, encoding="utf-8")
     c = cp["client"]
     return DbAccount(
         c["user"], c["password"], c.get("host", "127.0.0.1"), int(c.get("port", "3306"))

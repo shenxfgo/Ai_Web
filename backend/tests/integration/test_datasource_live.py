@@ -135,3 +135,43 @@ async def test_口令错时回结构化错误并点出是哪个字段(
     assert err["code"] == "source_unreachable"
     assert "connect_password" in err["message"]
     assert "Traceback" not in probe.text
+
+
+async def test_非只读账号探得出缺失能力_但登记那道闸门仍然打开(
+    client: AsyncClient, login: Login, rw_account: DbAccount
+) -> None:
+    """工单 040 验收 5 的**反半**：`grants_verdict` 说"这不是只读账号"那一支，第一次由真账号回答。
+
+    上面那一发（`test_测试连接报得出表数视图数和只读结论`）用的是只读账号 `aiweb_ro`，
+    它只能证 `read_only is True` / `code is None`。判决的**另一支**在本文件今天没有实物——
+    此前只有 `tests/unit/test_source_probe.py:96-163` 那族喂字符串的判决定签过，
+    而"safety §4.1 那句黄色警告真从端点回得出来"这件事写在文档上却没人跑过。
+    凭证是工单格子 ② 用户 2026-10-20 点名授权的那把（`my_login.cnf`），
+    用它之前先按工单字面跑了只读 `show grants` 核实身份，读数在
+    `.scratch/p5-sql-guard-hardening/evidence/grants_raw040.txt` + `grants_verdict040.txt`。
+
+    断三件事，少一件就不是这一格：
+    - **HTTP 仍是 200**：`test_connection` 不是错误通道（§7 的 docstring 明写"阻断留给 011"）。
+      做成 4xx 就变成"登记页面拒绝保存"，那是 P7/P9 的表单语义，工单"明确不做"第四条拦的就是它。
+    - **码可以 switch**：`grants.code == "readonly_capability_missing"`，与执行路那把
+      `ReadonlyCapabilityMissing` 同一枚码——但**两档不合并**，硬阻断仍由
+      `tests/unit/test_executor_grants.py:33` 签。
+    - **口令不出现在响应里**：这一发用的是本机建库账号，泄露代价比只读账号高一档。
+    """
+    ds_id, headers, password = await _register(
+        client, login, rw_account, name="demo-not-readonly", who="probe-rw-owner"
+    )
+
+    resp = await client.post(f"/api/datasources/{ds_id}/test", json={}, headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # "连得上"与"只读不只读"是两件事：非只读账号照样连得上，闸门在下一格
+    assert body["ok"] is True
+    assert body["grants"]["read_only"] is False
+    assert body["grants"]["code"] == "readonly_capability_missing", body["grants"]
+    assert body["grants"]["warnings"], "只给码不给原文行，用户就没法自己核对是不是真读错了账号"
+    # 不用 `assert password not in resp.text`：pytest 的重写会把左操作数的**字面值**倒进终端，
+    # 而这一发用的是本机建库账号（`my_login.cnf`）——一次红测就等于把口令贴进 CI 日志。
+    # 同一条理由见 conftest 的 `DbAccount.__repr__`；这一格只报"发生了"，不报"是什么"。
+    if password in resp.text:
+        pytest.fail("响应体里出现了连接口令（口令不外泄是 §6 的口径，这里不回显它）")
