@@ -1403,6 +1403,53 @@ P5 仍是零迁移片，真库版本沿用本节开头那个探针（`0009`）�
   （`.ai_web_demo.zz_no_such_table_039`、`..category`），与 `core/table_names` 那条"空的不占位"是相反的
   第二套渲染。三条都归 041，本片按"明确不做"没动 `sql_guard.py`。
 
+**040 文档半边实录（as-built(P5-040 文档半边)，2026-10-26）**：这一半**一条用例都没加**，交付物是
+"这一族今天的真实状态"写在纸上——工单 040 的提交纪律明写"把未跑的那几格先写在纸上再开工，
+这一片的价值就在记账诚实，不在用例数"。所以本节只记**探针**，不记闸（闸还没跑，用例还不存在）。
+
+- **开工探针**：`cd backend && .venv/Scripts/alembic.exe current` → `0009 (head)`、rc=0，
+  时间 2026-10-26 09:36:04；`ls alembic/versions/*.py | wc -l` = **9**（`__pycache__` 不数，
+  039 那次就是把它数成第 10 个迁移）。读数 `evidence/opening040.txt`。P5 零迁移由这一发与收尾那一发夹住。
+- **凭证核实（只读那一步）**：`show grants` 用 `backend/.setup/my_login.cnf`（工单 040 格子 ② 授权的那把），
+  rc=0、stdout 131 字节、stderr 0 字节，两行 grant 原文落 `evidence/grants_raw040.txt`；
+  原样喂 `grants_verdict` → `read_only=false` + `code="readonly_capability_missing"` + **两条** warnings
+  （第一行命中 `all` 与 `grant option`，第二行命中 `grant option`），落 `evidence/grants_verdict040.txt`。
+  口令不进对话、不回显、不入 artifact，本节所有引证只到 grant 行为止。
+- **踩坑 ④ 与验收 4 后半的实测（CLI 四发，不经过本仓库任何代码）**：`evidence/sleep_timeout_probe040.txt`。
+  MySQL `5.7.17-log`；① `set session max_execution_time=1000; select sleep(20)` → `1`、≈1.315s、rc=0；
+  ② 控制组 `select sleep(3)`（不设上限）→ `0`、≈3.318s；③ `select sleep(20), 'reached-tail'` 同一档 →
+  两个表达式都送达、rc=0；④ `set session max_execution_time=1000; select sleep(1) from ai_web_demo.order_item limit 5`
+  → **rc=1、`ERROR 3024 (HY000)`**。另有一发作废记录：第一次跑 ④ 没限定库名，回的是
+  `ERROR 1046 No database selected`——那是选库失败不是超时，所以文档里那两处裸表名（本节 §4.1 举例如
+  `order_item`）与用例字面（`ai_web_demo.order_item`）**不等价**，施工那发照用例的字面跑。
+  这四发把 §4.1 那句"单条 `SELECT SLEEP(n)` 也查不到"证成半对半错：**时钟查了（sleep 被叫停），
+  异常没有**。它同时证伪了验收 4 后半那句括号"错误来自驱动 timeout 而非守卫"——
+  换靶（改用 `sleep(1) from … limit 5` 去凑 3024）工单明令禁止，所以 ②③ 那一对的归因改成
+  "守卫拒 vs 源库把 20s 砍成 1s"，口径落 safety §4.1 与 §9 的新增行、roadmap 验收 4。
+- **`read_timeout` 那格是本轮第二次证伪继承账**：`grep -rn "read_timeout" backend/app backend/scripts
+  backend/tests` → **零命中**（040 事实账 2026-10-20 记过一次，本轮 10-26 再跑仍是零），全仓两处命中
+  都在文档里。驱动侧只有 `connect_timeout`（`services/source_manager.py:53-59`），管握手不管执行。
+  ⇒ safety §4.1 as-built(P2-011) 那句"1193 降级靠驱动侧 `read_timeout`"描述的是一个从没设过的兜底，
+  差额记在 §9.2 最后一行；踩坑 ④ 按"只有一个在挡"闭账。
+- **工单事实账里四处行号引证被推翻并改正**（036~039 四片动过这几份文件，坐标整体上移，判定与文案一字未变）：
+  `_SLEEP_FUNCTIONS` `sql_guard.py:63` → **`:112`**；出 `sleep_function` 的 `:304-305` → **`:363-366`**；
+  执行路硬阻断 `executor.py:282`/`:310` → 定义 `:181`（raise `:190`）、**唯一调用点 `:314`**；
+  live 截断用例 `test_execute_live.py:85` → **`:109`**；`test_executor_grants.py:37` → **`:33`**；
+  `test_source_probe.py:98-162` → **`:96-163`**。逐条核实为真、未变的也有：
+  `test_guard_api.py:41`、`corpus.py:107`、`test_datasource_live.py:80-81`、`conftest.py:34`、
+  `init_demo_mysql.sql:226/:258/:574/:585`、`session_statements` 仍是四条 SET 且顺序不变。
+  **这一族坑的成因值得记一句**：工单是 10-20 写的，之后的每一片都在往上推行号——
+  开工第一件事除了 `alembic current`，还要把工单里每条引证重新 grep 一遍，别照抄。
+- **验收 3 那一格的预清**：`order_item` 8.8 万行会不会被第二层 `too_costly` 拦住？
+  不会——`QueryGroup.max_explain_rows = 50_000_000`（`settings.py`），估行远不到门槛。
+  这一发测的是第一层钳位与第三层截断，与 dry-run 无关。
+- **施工半边还没有的东西**（本节留着，免得下一片以为已经做了）：闸内的
+  `tests/unit/test_layer_independence.py`、live 的 `tests/integration/test_layer_independence_live.py`
+  三发、验收 5 反半那一发（200 + `grants.code`）、验收 1 要的变异自证
+  （删 `session_statements` 里 `MAX_EXECUTION_TIME` 那一行必须有用例红）。
+  **本节的闸口读数（净增数、耗时、`ruff format --check`、`mypy`）随施工半边补在这里**，
+  文档半边不带任何"跑过了"的说法。
+
 
 ---
 

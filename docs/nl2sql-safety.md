@@ -871,6 +871,19 @@ SET SESSION autocommit = 1;
   代价与取舍：结论**不缓存进元数据库**（缓存分不清"当时只读"和"后来被提权"），所以每条问数
   多一次 `SHOW GRANTS` 往返（源库内网 ≈1ms，可接受）；`data_sources.readonly_enforced` 是用户在
   表单里勾的自报家门列，**不作为阻断依据**，只作 UI 提示。
+
+  > **as-built(P5-040 文档半边)：本节的"两档"里，非只读那一边的证据今天只有一档半**。
+  > 执行路（硬阻断）两档都有实物：`tests/unit/test_executor_grants.py::test_非只读账号硬阻断`
+  > （`:33`，断 `exc.value.code == "readonly_capability_missing"`）+ `executor.py:314` 那个唯一调用点。
+  > 登记路（200 + 可 switch 的码）只有**正半**真跑过：`tests/integration/test_datasource_live.py:80-81`
+  > 用只读账号 `aiweb_ro` 断 `read_only is True` 且 `code is None`。**反半（拿非只读账号真连一次
+  > `test_connection` → 200 且 `grants.code == "readonly_capability_missing"`）今天没有真跑记录**，
+  > 单元判决用例不算它（那是纯函数，不证明 HTTP 那一档回 200 而不是 4xx）。
+  > 凭证不再是障碍：用户 2026-10-20 授权用 `backend/.setup/my_login.cnf` 那把，本轮已按工单纪律
+  > 先跑**只读** `show grants` 核实它确实是非只读那把（两行 grant、命中告警词 `all` 与 `grant option`、
+  > `grants_verdict` 回 `read_only=false` + `code="readonly_capability_missing"`；
+  > 读数 `evidence/grants_raw040.txt` 与 `evidence/grants_verdict040.txt`，口令一个字不入账），
+  > 反半那一发由本片施工半边落。这一格在跑出来之前**不许写成"验收 5 已过"**。
 - 取数：无缓冲 cursor + 逐 1000 行 `fetchmany`，累计到 `max_rows+1` 立即 `cursor.close()`。
   **不做 `KILL <connection_id>`**——`KILL` 是写操作，只读账号本来就无权限，依赖
   `MAX_EXECUTION_TIME` 自杀 + 连接归还前 `ROLLBACK`。这是 MVP 的诚实取舍，写进 known limitation。
@@ -891,10 +904,40 @@ SET SESSION autocommit = 1;
   单条 `SELECT SLEEP(n)` 同样只有一行，也查不到；两者都不会触发超时中断。演示库要测这个必须让
   **每一行都慢**（011 的 live 用例用 `select sleep(1) from order_item limit 5`，第一行结束即命中阈值）。
 
+  > **as-built(P5-040)：本句的前半"只在行边界检查"是对的，后半对 `SELECT SLEEP(n)` 的推断实测半对半错**
+  > （读数：`.scratch/p5-sql-guard-hardening/evidence/sleep_timeout_probe040.txt`，MySQL 5.7.17，
+  > 只读账号 `aiweb_ro`，纯 CLI 四发，不经过本仓库任何代码）。
+  > ① **不触发超时"错误"这一半成立**：`set session max_execution_time=1000; select sleep(20);`
+  > 回 `rc=0`、一行、**没有 3024**；再加一列 `select sleep(20), 'reached-tail'` 两个表达式都求值并送达，
+  > 所以不是"错误被客户端吞了"，是服务端在单行语句上真的没中止它。
+  > ② **"中间从不看时钟"这一半不成立**：那一行回的是 **`1`** 而整体耗时 **≈1.315 s**（不是 20 s）。
+  > 控制组不设上限跑 `select sleep(3)` 回 `0`、耗时 ≈3.318 s ⇒ `SLEEP()` 的返回值语义是
+  > "睡眠有没有被叫醒"（0 睡满 / 1 被中断），所以 `MAX_EXECUTION_TIME` **叫停了计时的流逝**，
+  > 只是没有把它表达成异常。原句"也查不到"要读成"查了，但单行语句没有可报错的行边界"。
+  > ③ 结论落在归因上：**"清空第一层黑名单后由驱动 timeout 拦下"这件事，在 `SELECT SLEEP(20)` 这一条上
+  > 既不是 `SqlGuardError` 也不是 `QueryTimeout`，而是一次成功的查询**（值 1、耗时 ~1s）。
+  > 3024 那一档仍然有实物，但它的靶是"每一行都慢"那一族（011 的既有用例已在签），
+  > **不许为了证明分层独立而把 SLEEP 换成那个形状**——换了就不是同一条 SQL 的两种归宿，
+  > 而是两条不同 SQL 各自的归宿。工单 040 的"已定口径"正是为这一格写的。
+  > ④ 本句举例里的 `order_item` 是**裸表名**，CLI 上要先限定库（第一次尝试因此回
+  > `ERROR 1046 No database selected`，rc=1 但那是选库失败不是超时）；既有用例写的是
+  > `ai_web_demo.order_item`。文档字面与用例字面在这一格上不等价，施工那发照用例的字面跑。
+
   > **as-built(P2-011)：源库不支持 `MAX_EXECUTION_TIME`（MySQL < 5.7.4，errno 1193 unknown sysvar）时
   > 降级靠驱动侧 `read_timeout`**：分类器 `_is_unsupported_max_execution_time` 命中 1193 后 warning +
   > `continue`，其余 SET 语句照旧执行、执行本身不阻断。演示库 5.7 支持该变量，这条**live 不测**——
   > 降级分支只在单测的 `session_statements` 顺序里存在，触发路径要真·5.7.3 才能演，P2 不设这个环境。
+  >
+  > **as-built(P5-040)：上面那句"降级靠驱动侧 `read_timeout`"里的 `read_timeout` 全仓一个都没设过。**
+  > 实测（2026-10-26，本轮再 grep 一遍仍是这个结果）：`grep -rn "read_timeout" backend/app backend/scripts
+  > backend/tests` → **零命中**，两处命中全在文档里（本节与 roadmap §P5 踩坑 ④）。
+  > 驱动侧今天只有 `connect_timeout` 一格：`source_connect_args`（`services/source_manager.py:53-59`）
+  > 把 `timeout_ms` 折算成**秒**落到 `connect_timeout` 上，`create_source_engine`（`:62-74`）的 docstring
+  > 亲口写的就是这件事。而 `connect_timeout` 管的是**握手**，语句跑起来以后它不再在场。
+  > 所以 1193 那一支的真实后果是：**降级之后没有任何东西在挡执行时长**，不是"靠 read_timeout 兜住"。
+  > 这条不是 P5 漏做——设 `read_timeout` 属于新增能力（要定档位、还要定它是否覆盖 `connect_timeout`
+  > 的现有语义），工单 040 格子 ① 由用户 2026-10-20 拍板**本轮不设**，要设另开工单。
+  > 差额记在 §9.2 那一行，roadmap 踩坑 ④ 的答案按这个实测落。
 
 - 错误码分档 as-built(P2-011)：3024（MySQL `MAX_EXECUTION_TIME` 自杀）与 PG `"57014"` 翻成 `QueryTimeout`；
   1792（会话 READ ONLY 挡写）/ 1142（账号无写权限）走原始 `DBAPIError` **不翻译**，是"引擎拒 ≠ 应用拒"
@@ -1226,6 +1269,26 @@ def test_allow(sql):
 
 ### 8.4 三层独立性的验证方式
 
+> **as-built(P5-040 文档半边)：本节这四条自 2026-09 起就是"手工操作说明"，本节先把它们各自的
+> 真实档位写在纸上，再开工补证据**。三档的含义：**闸内** = 默认整轮闸真跑、不连源库；
+> **live** = 挂在 `*_live.py` 上要真 MySQL 在场；**未证** = 文档字面到今天没有任何实物指着它。
+> 措辞纪律：这一族的标题写的是"**三层**独立性"，而第二层的实物是 037 才有的（见本节末
+> as-built(P5-037) 那条），所以任何一条在 037 之前签的字，签的都只有两层。
+>
+> | 本节条目 | 机制 | 文档字面那一发 | 档位在 040 开工前 |
+> |---|---|---|---|
+> | ① 不带 `LIMIT` → `LIMIT 1001` + 1000 行 + `truncated:true` | 在场（钳位 `tests/guard/test_guard_api.py:41` 一族、截断 `executor.py:154` `split_truncated` + `tests/unit/test_executor_truncation.py` 四条） | `order_item` + `row_limit=1000` **没跑过**；live 那发在 `tests/integration/test_execute_live.py:109`，用的是 `order_main` + **`row_limit=5`** | **机制已证、字面未跑**（闸内 + live 各一档，缺一格都不算这条签字） |
+> | ② 前半：`SELECT SLEEP(20)` 被黑名单拒 | 在场（`sql_guard.py:112` `_SLEEP_FUNCTIONS`、`:363-366` 出 `sleep_function`） | 必拒语料 `tests/guard/corpus.py:107` 是 `SELECT SLEEP(30)`（**参数不同，同一条规则**） | **闸内已证** |
+> | ② 后半：清空黑名单后被 `MAX_EXECUTION_TIME=1000` 截断，"错误来自驱动 timeout 而非守卫" | 在场（`executor.py:40-55` 第二条 SET、`:232` `classify_source_error`） | **实测这句话不成立**：见 §4.1 的 as-built(P5-040)，CLI 四发回的是"成功返回一行、值 1、~1.3s"，既不是 `SqlGuardError` 也不是 `QueryTimeout` | **未证，且字面待订正**（归因那一半由 040 施工那发在执行器上复现；换靶 = 洗证据） |
+> | ③ validate 的 400 形状 | — | 已按实物订正，见本节末 as-built(P5-039) ①②④ | **闸内已证**（039 交付 13 条用例 + 七发真 HTTP） |
+> | ④ ask 的 dry-run 分支返回 400 | 主语错位，实为 P8 | 见 as-built(P5-039) ③ | **本片不适用**（不属于 040 的证据族） |
+
+三条"分层"这个词的**永久**证据（不靠人记得去手工点一遍）由 040 落在两处：闸内的
+`tests/unit/test_layer_independence.py`（同一件 `sql_final` 分别喂三层、三层互不共享状态，
+关键反证是清空第一层黑名单后 `session_statements` 那四条 SET 一个字不变）与
+`tests/integration/test_layer_independence_live.py`（上面①的字面那一发 + ②那一对同一条 SQL 的两种归宿）。
+**这一节原四条的下面就是它们的原文**，逐条保留不改——留着才看得出档位是从哪一句话改起的。
+
 - 手工提交一条不带 `LIMIT` 的 `SELECT * FROM order_item` → 实际执行 SQL 日志里看到 `LIMIT 1001`
   且返回 1000 行 + `truncated:true`（第一层的强制 LIMIT 生效）。
 - 在 MySQL 5.7 上提交 `SELECT SLEEP(20)` → 被黑名单拒；**把黑名单临时清空** →
@@ -1299,6 +1362,7 @@ def test_allow(sql):
 | 项 | 现状 |
 |---|---|
 | 服务端查询无法主动 `KILL` | 只读账号没有 `KILL` 权限；依赖 `MAX_EXECUTION_TIME` 自杀 + 归还前 `ROLLBACK` |
+| **`SLEEP()` 这一类在"清空第一层"之后不产生超时错误**（as-built(P5-040 文档半边)） | roadmap §P5 验收 4 后半的原话是"清空黑名单后被 `SET SESSION MAX_EXECUTION_TIME=1000` **截断（错误来自驱动 timeout 而非守卫）**"。实测（`evidence/sleep_timeout_probe040.txt`，MySQL 5.7.17，CLI 四发）**后半个括号不成立**：`select sleep(20)` 在那一档上限下回 `rc=0`、一行 `1`、耗时 ≈1.3s——计时被叫停了（控制组不设上限跑 `sleep(3)` 回 `0`、耗时 ≈3.3s），但**没有异常可归因**，既不是 `SqlGuardError` 也不是 `QueryTimeout`。所以"**同一条 SQL 的两种归宿**"这一族反证，在 `SLEEP` 上能签的是"第一层在场→拒；第一层清空→**源库自己把它的 20s 砍成 1s**"，签不了"由驱动报错拦下"。3024 那一档只在**每一行都慢**的形状上出现（既有用例 `test_execute_live.py:177` 已在签那一族）。**不许**为了验收 4 变绿把这一条换成那个形状（工单 040 已定口径：换了就是把证据洗成结论）。执行器那一发的归因由 040 施工半边真跑后落在这里，跑出来之前本节只承诺"文档字面这句话要订正"，不承诺"第三层在这一类上独立有效" |
 | 笛卡尔积检测 | **as-built(P5-037)：这一行整行重写**。原话"只对'无 join 条件的逗号连接'硬拒，其余放行（误报率高）"有两处与实物不符：① 落点不在第二层，第一层就能看见（`_join_violations`，§1.2 ⑥.1）；② 拒的**比原话宽**——`FROM a JOIN b`（不写 `ON`）与逗号连接在 AST 与重生成文本两侧都逐字同形，AST 分不开。今天真正挡住的是"某个 scope 里 `on`/`using`/`side`/`kind`/`method` 五格全空 **且该 scope 没有 `WHERE`**"；真正**仍放行**的是 `CROSS JOIN`、`STRAIGHT_JOIN`，以及"无条件笛卡尔积 + 一个无关 `WHERE`"（`FROM a, b WHERE a.x > 1`，实测与合法老式写法同构，再往下判要把连接图重建一遍）。交付记录里不许写"笛卡尔积已全面挡住" |
 | 第二层估行是**引擎估算**不是真行数 | `EXPLAIN` 的 `rows` 来自统计信息。`ANALYZE` 没跑过、或统计过期时，阈值会按一个错的数裁（可能误拒也可能漏放）。这一层是**代价闸门**不是**正确性闸门**：它不改变第一层与第三层的任何判定，关掉它防御仍成立（§3.3） |
 | 每条问数在源库上多一次往返 | `AIWEB_QUERY__DRY_RUN` 默认 `true`（2026-10-20 拍板），代价就是这一次 `EXPLAIN`。它和真 SQL 用同一条连接、同一个只读会话，所以不是"多建一次连接"；prod 被 `check_env` 锁死不能关，dev 想省这一次要自己改键（§3.3） |
@@ -1347,3 +1411,4 @@ def test_allow(sql):
 | ⑤ `AIWEB_GUARD__DANGLING_EXTRA_RULES` 追加黑名单 | 未实现。"拒绝一切 Anonymous" 已经是超集，追加黑名单只在"想放开某个函数"时才有意义，而那不在 v1 计划里 |
 | ⑦ `HARD_LIMIT` 收敛模型自写的 `LIMIT 999999` | **已收敛（2026-09-29 拍板并落地）**：`guard()` 的 LIMIT 分支从"缺了才补"改成"钳位 + 探针"，见 §1.2 ⑦。`HARD_LIMIT` 那个键**仍不建**——注入值就是 `resolve_row_limit(ds) + 1`，不需要第二个数 |
 | ⑧ `truncated` 与内存上限在真链路上双双落空（**已闭环**） | 两个后果同源：守卫当时只补不钳。① prompt 模板要求模型写 `LIMIT {{ row_limit }}`（`nl2sql_user.j2:29`），模型一写守卫就不补 `+1` 探针，`split_truncated` 因此**恒报未截断**——"这 1000 行只是前 1000 行"这句话说不出来；② 模型写 `LIMIT 5000` 时那句**原样放行**，011 的"缓冲取回的内存上限由守卫注入的 `row_limit+1` 钉住"这个前提对它不成立。**拍板口径**：`n` 是确定的非负整数且小于 `max_rows` 时尊重模型自己按问题意图选的量，其余（缺 LIMIT、`n >= max_rows`、不可证如 `LIMIT ALL`/`LIMIT 1 + 1`/`LIMIT 1e3`/`LIMIT -1`）一律钳成 `max_rows+1`——"证不了它小"与"没有 LIMIT"同一档，不给它多一条出路。**闭环范围要说清**：`n < max_rows` 那一支仍然没有探针、`truncated` 恒假，这是有意的（上限没碰到就谈不上截断），别当残留的洞去修。钉子随之从"钉住现状"翻成"钉住钳位"：`tests/guard/test_guard_api.py` 五条（超限钳、上限之下保留、只动 count 不动 offset、不可证四形状、`<= max_rows+1` 不变式）+ `tests/integration/test_pipeline_orchestration.py`（编排侧那支现在断 `sql_raw != sql_final` 且结尾是探针） |
+| §4.1 那句"1193 降级时**靠驱动侧 `read_timeout`** 兜住"（as-built(P2-011) 写的）＋ roadmap §P5 踩坑 ④"asyncmy 的 `read_timeout` 与 `MAX_EXECUTION_TIME` **谁先触发**要实测" | **as-built(P5-040 文档半边)：这个问题今天不是一个二选一，它是一个"只有一个在挡"**。实测 `grep -rn "read_timeout" backend/app backend/scripts backend/tests` → **零命中**（全仓两处命中都在文档里：本节 §4.1 与 roadmap 踩坑 ④）。驱动侧唯一被设过的一格是 `connect_timeout`：`source_connect_args`（`services/source_manager.py:53-59`）把 `timeout_ms` 折成秒落给它，`create_source_engine`（`:62-74`）的 docstring 明写这是为了"握手卡住别挂着请求"——**它管连接建立，不管语句执行**。所以：① 踩坑 ④ 的实测答案是"没有第二个竞争者，`MAX_EXECUTION_TIME` 是唯一在挡执行时长的那一格"；② 更要紧的是 1193（源库不支持该变量，MySQL < 5.7.4）那条降级支上**当前一个都不挡**——文档原句把不存在的兜底写成了存在的。设 `read_timeout` = 新增能力（要定档位、要定它与 `connect_timeout` 的关系），用户 2026-10-20 在工单 040 格子 ① 拍板**本轮不设**，要设另开工单。这一行留着就是那张开工单的门口 |

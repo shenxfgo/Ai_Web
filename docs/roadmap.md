@@ -785,8 +785,40 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    记着 13 条用例对八档的映射、七发真 HTTP 回显（`evidence/out_real_http039_take2.txt`，锚 shipped 字节）、
    四轮变异电池与带 md5 自证壳的那轮整轮闸。这里不重述读数，只把"待落"那半句销掉。
 3. 不带 `LIMIT` 的 `SELECT * FROM order_item` → 执行日志见 `LIMIT 1001`、返回 1000 行 + `truncated:true`；
+   **as-built(P5-040 文档半边)：这一格今天的确切状态是"机制已证、字面未跑"，两半都要分开签**。
+   机制两半都在场且都在闸内/闸外真跑：钳位由 `tests/guard/test_guard_api.py:41` 那条
+   `sql_final == "SELECT id FROM customer LIMIT 1001"` 与同文件 `:51-103` 一整族不变式钉住
+   （含 `LIMIT 4990, 5000` → `LIMIT 1001 OFFSET 4990`、"顶层 LIMIT 恒不超过 `max_rows+1`"）；
+   截断由 `executor.py:154` `split_truncated`（取到 `row_limit+1` 即判"还有更多"、丢探针行）+
+   `tests/unit/test_executor_truncation.py` **四条**钉住。
+   **但真跑那一发的数字不是本节这组**：`tests/integration/test_execute_live.py:109`
+   `test_行数超上限_truncated_true_且_csv_是完整上限行` 用的是 `order_main` + **`row_limit=5`**
+   （断 `truncated is True`、`row_count == 5`、csv 6 行含表头）。
+   本节字面那组（`order_item` + 1000 行）**真能跑**——`scripts/init_demo_mysql.sql:226` 注释明写
+   order_item 8.8 万行、`:574`/`:585` 有行数自检——只是到今天没人跑过。
+   **拿 `row_limit=5` 那一发冒充 1000 那一发就是记账不实**（P4-033 被审出的那一族），所以这一格
+   由工单 040 的 live ① 补：同一发要同时给 `sql_final` 原文、`row_count`、`truncated`、csv 行数四件事。
+   顺带一格闸内预清：`order_item` 8.8 万行会不会先被第二层拦住？不会——
+   `settings.py` 的 `QueryGroup.max_explain_rows = 50_000_000`，估行远不到门槛，
+   这一发测的是第一层钳位与第三层截断，与 dry-run 无关。
 4. `SELECT SLEEP(20)` 被黑名单拒；**清空黑名单**后被 `SET SESSION MAX_EXECUTION_TIME=1000` 截断
    （错误来自驱动 timeout 而非守卫）→ 证明分层独立有效；
+   **as-built(P5-040 文档半边)：前半在场、后半那句括号按实测要订正**。
+   前半：`sql_guard.py:112` `_SLEEP_FUNCTIONS = frozenset({"sleep"})`、`:363-366` 出 `sleep_function`
+   （消息字面"禁止时间函数 {name}()，它让语句超时形同虚设"），必拒语料住在
+   `tests/guard/corpus.py:107`（`("SELECT SLEEP(30)", "sleep_function")`，参数与本节字面差 10 秒、
+   同一条规则，不计为偏差）。
+   后半**CLI 实测四发的结果是这句话在 `SELECT SLEEP(20)` 上不成立**（读数
+   `.scratch/p5-sql-guard-hardening/evidence/sleep_timeout_probe040.txt`，MySQL 5.7.17）：
+   那一发回 `rc=0`、一行 `1`、耗时 ≈1.315s，**没有 3024、也没有 `SqlGuardError`**——
+   控制组不设上限跑 `sleep(3)` 回 `0` 且 ≈3.318s，所以 `SLEEP()` 的返回值是"睡没睡满"的标志，
+   `MAX_EXECUTION_TIME` 确实叫停了计时，只是**没有把它表达成异常**。
+   于是"错误来自驱动 timeout 而非守卫"这一半在 SLEEP 这一族**签不了**；能签的是更强的那一半：
+   第一层在场 → 守卫拒；第一层清空 → **源库自己把 20s 砍成 1s**（同一条 SQL 的两种归宿，
+   归因互斥且可区分）。3024 那一档只在"每一行都慢"的形状上出现，
+   既有用例 `test_execute_live.py:177`（`select sleep(1) from ai_web_demo.order_item limit 5`）
+   已在签那一族——**严禁**为了让本条变绿把靶换成它（工单 040 已定口径，换了就不是同一条 SQL 的两种归宿）。
+   完整口径与实测细节住 safety §4.1 的 as-built(P5-040) 与 §9 那一条新增行。
    **as-built(P5-037)**：这条验收在第二层落地之前只能给**一层**签字（当时第二层零实现），
    "证明分层独立有效"里的"第二层"那半句是空头账。现在第二层有实物了，各层的反证要分开签：
    这一条继续签**第三层独立**（清空第一层的函数规则后由驱动 timeout 拦下）；
@@ -805,6 +837,22 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    顺带一句验收 3 的口径：`MAX_EXPLAIN_ROWS` 在本片第一次被真读，钉子是把阈值钉成 `100`
    让**同一条 SQL** 从放行翻成 `too_costly`（闸内与真库各一发），不是断"它不等于默认值"。
 5. 用非只读账号连数据源时 `test_connection` 报 `readonly_capability_missing`（能力探测前置）。
+   **as-built(P5-040 文档半边)：这一条只有正半真跑过，反半今天没有记录**。在场的是：
+   判决纯函数 `grants_verdict`（`datasource_service.py:192-217`，非只读时 `code` 就是那一枚）、
+   `test_connection`（`:301`，`:368` 把 verdict 塞进 `grants` 字段）回 **200 + 可 switch 的码**
+   （黄色警告不阻断，admin 可确认；契约 `schemas/datasource.py:88-89`/`:107`）、
+   执行路的硬阻断 `errors.py:100-111` `ReadonlyCapabilityMissing` + `executor.py:314`
+   那个唯一调用点（建只读会话**之前**先 `show grants`，判定不缓存）。
+   用例：`tests/unit/test_source_probe.py:96-163`（判决纯函数一族，含 `GRANT ALL PRIVILEGES ON *.*` 那两条）、
+   `tests/unit/test_executor_grants.py:33` `test_非只读账号硬阻断`、
+   `tests/integration/test_datasource_live.py:80-81`——**那两条 live 用的是只读账号 `aiweb_ro`**，
+   断的是 `read_only is True` 且 `code is None`，也就是"非只读"那一边的 HTTP 形状
+   （200 而不是 4xx）到今天**一次都没在真栈上验过**。
+   凭证已不再是障碍：用户 2026-10-20 授权用 `backend/.setup/my_login.cnf` 那把，本轮已按工单纪律
+   先跑**只读** `show grants` 核实它确为非只读（两行 grant、命中告警词 `all` 与 `grant option`、
+   `grants_verdict` 回 `read_only=false` + 那一枚码；`evidence/{grants_raw040,grants_verdict040}.txt`，
+   口令一个字不入账）。反半那一发由 040 施工半边落，**跑出来之前本条不许写成已过**。
+   **这一格与执行路那把刀是两档，本片不合并它们**（合成就变成"登记页面拒绝保存"，那是 P7/P9 的表单语义）。
 
 踩坑预警：① **`comments=False` 会把 hint 一起剥掉，造成"守卫看到的 ≠ 执行的"** → 检测到 hint 直接拒；
    **as-built(P5-036)**：结论（拒）不动，**这句因果对 MySQL 是错的**——MySQL 的 `/*+ … */` 在 sqlglot 的树上
@@ -819,6 +867,17 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
 ② `PROCEDURE ANALYSE()`、`INTO @var`、`FOR UPDATE` 都要单独规则，sqlglot 宽容 parser 可能不识别子结构 →
 必须有正则级兜底；③ `SET SESSION TRANSACTION READ ONLY` 前不能在已有事务里；
 ④ asyncmy 的 `read_timeout` 与 `MAX_EXECUTION_TIME` 谁先触发要实测。
+   **as-built(P5-040 文档半边)：实测答案是"这两个没有谁先触发——今天只有一个在挡"**。
+   `grep -rn "read_timeout" backend/app backend/scripts backend/tests` → **零命中**（本轮 2026-10-26 再跑
+   仍是零；全仓两处命中都在文档里：本行与 safety §4.1）。驱动侧唯一设过的一格是 `connect_timeout`
+   （`source_connect_args`，`services/source_manager.py:53-59` 把 `timeout_ms` 折成秒落上去；
+   `create_source_engine` 的 docstring 亲口写着它是为了"握手别挂着请求"），
+   而它管**连接建立**、语句跑起来以后不在场。所以挡执行时长的只有 `MAX_EXECUTION_TIME` 一格，
+   且它这一格在 1193（MySQL < 5.7.4 不支持该变量）那条降级支上**也不在场**——
+   safety §4.1 as-built(P2-011) 那句"降级靠驱动侧 `read_timeout`"描述的是一个从没被设过的兜底。
+   设不设 `read_timeout` 是新增能力（档位、与 `connect_timeout` 的关系都要先定），
+   用户 2026-10-20 在本片工单格子 ① 拍板**本轮不设**、要设另开工单；
+   差额账记在 safety §9.2 最后一行。踩坑 ④ 到这是**闭账**（按实测落成"只有一个在挡"），不是残留。
 
 ### P6｜多用户与数据源级权限贯通（3 人日）
 
