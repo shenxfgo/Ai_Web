@@ -859,8 +859,8 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    让**同一条 SQL** 从放行翻成 `too_costly`（闸内与真库各一发），不是断"它不等于默认值"。
 5. 用非只读账号连数据源时 `test_connection` 报 `readonly_capability_missing`（能力探测前置）。
    **as-built(P5-040 文档半边)：这一条当时只有正半真跑过，反半没有记录**。在场的是：
-   判决纯函数 `grants_verdict`（`datasource_service.py:192-217`，非只读时 `code` 就是那一枚）、
-   `test_connection`（`:301`，`:368` 把 verdict 塞进 `grants` 字段）回 **200 + 可 switch 的码**
+   判决纯函数 `grants_verdict`（`datasource_service.py:192-222`，非只读时 `code` 就是那一枚）、
+   `test_connection`（`:305`，`:372` 把 verdict 塞进 `grants` 字段）回 **200 + 可 switch 的码**
    （黄色警告不阻断，admin 可确认；契约 `schemas/datasource.py:88-89`/`:107`）、
    执行路的硬阻断 `errors.py:100-111` `ReadonlyCapabilityMissing` + `executor.py:314`
    那个唯一调用点（建只读会话**之前**先 `show grants`，判定不缓存）。
@@ -926,11 +926,31 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
 **`0009 (head)`**、`alembic/versions/*.py` 计数 **9**；同一份文件还夹住开口时的 HEAD=`645a7f3`、工作树未提交
 文件数 0、`origin/main=e578805 · ahead=7` 三格。035~041 七张工单没有一张落迁移、没有一张动 ORM 列定义
 （038 那个 `retries` 是 `guard_result` 那块 JSONB 里扩出的形状，不是列，见 metadata-model §2.7 第 ⑦ 条）。
-收尾那一发（再读一次 `alembic current`）归收口半边那一笔提交——**本节此刻只签开口这一发**。
+收尾那一发**已落**：`evidence/closing041.txt`（2026-10-26 14:44，rc=0）回的是同一枚 `0009 (head)` 与同一枚
+versions 计数。**但这一发夹不住 `app/` 那一处增量**——它取在文档半边提交之后、收口半边那一笔尚未提交之时
+（同一份文件自己明写 HEAD=`c251f0e` 且工作树有 1 个未提交文件）。两发之间真正落进历史的只有**文档半边那一笔**
+（六份 docs、零迁移零列）。夹住 `app/` 增量的第二端由 `evidence/closing041_post_commit.txt` 补上（收口半边
+提交之后再读一次 `alembic current`）；"P5 期间元数据库结构未变"这句签的是 opening 与 post-commit 这一对。
+
+**整轮闸（收口半边到补账）**：`evidence/gate041_final.txt` 与 `evidence/gate041_postfix.txt`——
+`scripts/dev.ps1 check` 全序列（`ruff check` 四目录 + `npm run typecheck` + 整轮 pytest）。
+两跑的分工写在面上：前一份跑的是 docstring 那一处修正**之前**的 `app/` 字节（同一份末尾另有两条自我订正——
+第一遍把 `rc=` 取成了管道尾巴的返回值、第二遍把 ruff 的路径写坏成"命令未找到"——保留不删，这轮要防的正是
+"取数的手自己出错"），后一份跑的是**修正之后**的那一枚 = 收口半边提交 e0be252 的字节；`ruff format --check`
+与 `python -m mypy app` 在同一批字节上各补一发，追加在后一份里。汇总行**与 040 那两份补账的基线是同一个数**——
+收口半边与补账都零新用例，出现第二个数就说明有东西被塞了进来（读数只住那两份文件，本节不抄）。
+**两份锚的 docs 字节都不是本节定稿之后的那一枚**（补账又改了 roadmap 与 verification.md），所以 docs
+那一半边另由 `evidence/doc_input_rerun041.txt` 的最后一轮按同一把尺单独签。
+**docs 那一半边为什么由 doc-input 那一发单独签就够了**：本轮改过的两份 docs 里只有 `docs/verification.md`
+是 pytest 的 `read_text` 输入（`tests/unit/test_demo_mysql_script.py:52` 与 `test_demo_pg_script.py:46`，
+读的都是各自文件里 `VERIFICATION_DOC` 那个常量），roadmap.md 在全仓没有读取点。**但 docs-input 这一族比
+"两族 demo 用例"宽**：`grep -rn read_text backend/tests` 亲验还有 `tests/integration/test_sync_force_pg.py:281`
+（读 `docs/metadata-model.md`）与 `tests/unit/test_kb_card_golden.py:260`（读 `docs/kb-workflow.md`）——
+那两枚文件本轮一字未动，所以本轮不需要它们的补测。
 
 | 验收 | 状态（四档之一） | 独立真相源（evidence 文件 + 用例名，读数在文件里） |
 |---|---|---|
-| 1 `pytest tests/guard -q` 全绿（含攻击语料全部） | **已证**（041 本轮真跑，不是继承 037 那一跑） | `evidence/guard041.txt`：`234 passed, 2 skipped in 1.02s` · rc=0，起跑前后 `sql_guard.py`/`dry_run.py`/`corpus.py` 三枚 md5 逐字相同（同一命令**不带第二个 `-q`**：`backend/pyproject.toml:65` 的 addopts 里已有一个，再加会把 `N passed` 那行本身压掉）。**净增链逐文件点名**（下面记的是**逐文件收集数**，与语料条数是两把尺，差额见本节末）：186（P5 开工前 = `test_reject_corpus` 54 + `test_allow_corpus` 20 + `test_corpus_mutation` 90 + `test_guard_api` 8 + `test_postgres_dialect` 14）→ 035 **+8**（新文件 `test_rule_id_closed_set.py`）= 194 → 036 **+19**（`test_regeneration_invariant.py` 18 条 + rule_id 一族 8→9）= **213**（`collect036.txt`）→ 037 **+23**（`test_cartesian_product.py` 14 条 + `corpus.py` 带动：reject 一族 54→57、allow 一族 20→21、变异 90→95）= **236** → **038/039/040 在 `tests/guard/` 净增 0**（本轮 `git log --name-only` 亲验：这三张一笔都没落进该目录，新用例全在 `tests/unit/` 与 `tests/integration/`）。本轮逐文件收集：allow 21 / cartesian 14 / mutation 95 / guard_api 8 / pg_dialect 14 / regen_invariant 18 / reject 57 / rule_id 9 = 236 = 234+2（这一列的全行住在 `guard041.txt` 末尾那段"041-C 补测"，锚的是同一批三枚 md5、前后逐字相同）。那两条 skip 是 `tests/guard/test_corpus_mutation.py:61` 那对既有靶子缺失（"没有 表名换成系统表 的靶子"与"没有 改成 INTO OUTFILE 的靶子"），035 之前就在、P5 一条未新增。**收集数与语料条数是两把尺**：`test_allow_corpus.py` 收 21 = 19 条参数化 + 该文件两条非参数化用例（`:32`、`:43`），所以 037 那格的"allow 20→21"是文件那一头，语料那一头是 **18→19**；reject 那一头两把尺刚好重合（57=57）。**"攻击语料全部"的核法**：语料条目本轮实测 `REJECT_CASES` **57** / `ALLOW_CASES` **19**（定义处按 artifact 逐字：`ALLOW_CASES` 在 `corpus.py:31`、`REJECT_CASES` 在 `:69`；两个数是同一命令量的）。safety §8.1 那张表列的是 34 条编号（个别编号含两支 SQL）、§8.2 列 10 条，标题各自写的是下限（"≥15"/"≥6"）——**清单比语料短不是矛盾**：语料里多出来的那些条是**同形状的变体**（跨库前缀的三支、变量/参数那一族的四支、`ALTER`/`GRANT` 两支、037 的三条笛卡尔积、以及 §8.1 表外那两条非 SQL 文本用例的形状），逐枚期望值分布住在 §1.1.1 那把尺子里（"57 条期望值逐条相加正好 57"、有语料的枚举手 18 枚），本节不重抄也不新造第四把尺。工单 041"事实账"那句"文档 34 vs 实物 54"量的就是这两把尺、且 54 是 037 之前的语料数（`corpus.py` 的条目只在 037 动过——036 那一笔改的是归因注释，条目一字未动，见其施工半边提交说明），本节把它的口径写成上面这一句 |
+| 1 `pytest tests/guard -q` 全绿（含攻击语料全部） | **已证**（041 本轮真跑，不是继承 037 那一跑） | `evidence/guard041.txt`：`234 passed, 2 skipped in 1.02s` · rc=0，起跑前后 `sql_guard.py`/`dry_run.py`/`corpus.py` 三枚 md5 逐字相同（同一命令**不带第二个 `-q`**：`backend/pyproject.toml:65` 的 addopts 里已有一个，再加会把 `N passed` 那行本身压掉）。**净增链逐文件点名**（下面记的是**逐文件收集数**，与语料条数是两把尺，差额见本节末）：186（P5 开工前 = `test_reject_corpus` 54 + `test_allow_corpus` 20 + `test_corpus_mutation` 90 + `test_guard_api` 8 + `test_postgres_dialect` 14——**这一组分位的出处是工单 041"事实账"2026-10-20 那一跑，本轮没有 artifact 复测它**：链上其余每一格都有（194 见 verification §1.11，`collect036.txt:24` 拿它对过账；213 见 `collect036.txt`；236 见 `guard041.txt`），起点这一格只是链的锚，不许当本轮读数用）→ 035 **+8**（新文件 `test_rule_id_closed_set.py`）= 194 → 036 **+19**（`test_regeneration_invariant.py` 18 条 + rule_id 一族 8→9）= **213**（`collect036.txt`）→ 037 **+23**（`test_cartesian_product.py` 14 条 + `corpus.py` 带动：reject 一族 54→57、allow 一族 20→21、变异 90→95）= **236** → **038/039/040 在 `tests/guard/` 净增 0**（本轮 `git log --name-only` 亲验：这三张一笔都没落进该目录，新用例全在 `tests/unit/` 与 `tests/integration/`）。本轮逐文件收集：allow 21 / cartesian 14 / mutation 95 / guard_api 8 / pg_dialect 14 / regen_invariant 18 / reject 57 / rule_id 9 = 236 = 234+2（这一列的全行住在 `guard041.txt` 末尾那段"041-C 补测"，锚的是同一批三枚 md5、前后逐字相同）。那两条 skip 是 `tests/guard/test_corpus_mutation.py:61` 那对既有靶子缺失（"没有 表名换成系统表 的靶子"与"没有 改成 INTO OUTFILE 的靶子"），035 之前就在、P5 一条未新增。**收集数与语料条数是两把尺**：`test_allow_corpus.py` 收 21 = 19 条参数化 + 该文件两条非参数化用例（`:32`、`:43`），所以 037 那格的"allow 20→21"是文件那一头，语料那一头是 **18→19**；reject 那一头两把尺刚好重合（57=57）。**"攻击语料全部"的核法**：语料条目本轮实测 `REJECT_CASES` **57** / `ALLOW_CASES` **19**（定义处按 artifact 逐字：`ALLOW_CASES` 在 `corpus.py:31`、`REJECT_CASES` 在 `:69`；两个数是同一命令量的）。safety §8.1 那张表列的是 34 条编号（个别编号含两支 SQL）、§8.2 列 10 条，标题各自写的是下限（"≥15"/"≥6"）——**清单比语料短不是矛盾**：语料里多出来的那些条是**同形状的变体**（跨库前缀的三支、变量/参数那一族的四支、`ALTER`/`GRANT` 两支、037 的三条笛卡尔积、以及 §8.1 表外那两条非 SQL 文本用例的形状），逐枚期望值分布住在 §1.1.1 那把尺子里（"57 条期望值逐条相加正好 57"、有语料的枚举手 18 枚），本节不重抄也不新造第四把尺。工单 041"事实账"那句"文档 34 vs 实物 54"量的就是这两把尺、且 54 是 037 之前的语料数（`corpus.py` 的条目只在 037 动过——036 那一笔改的是归因注释，条目一字未动，见其施工半边提交说明），本节把它的口径写成上面这一句 |
 | 2 `POST /api/chat/validate {"sql":"SELECT 1; DROP TABLE users"}` → 400 `code` + `rule_id` | **已证**（039 交付，041 收口在同一套 shipped 字节上再跑一遍） | 用例：`tests/integration/test_chat_validate_pg.py`（收集 **13** 条）里 `:88 test_多语句被拒时守卫那一档从HTTP那一头看得见`。实录：`evidence/out_real_http041.txt`（本轮真 uvicorn 进程 + 真 socket 的 R1~R7 七发）与 `evidence/out_real_http039_take2.txt`（039 shipped 字节那一版）——两份的**脚本自写那一段**（041 那一份在脚本自写段之后还接了本半边的叙述，那一段不参与比对；段界与逐行读数住在 artifact 里，本节不抄数）滤掉 `pid=` 那一行后 `diff` 为空——命令、段界与 rc 记在 `out_real_http041.txt` 末段——所以七发读数只住 041 那一份。**400 按实物是两格**：`error.code == "sql_guard_rejected"` **且** `error.detail.rule_id == "multi_statement"`，本节顶层那对 `{code, rule_id}` 是简写、不是第二种响应形状（用户 2026-10-20 在工单 039 格子 ① 拍板不为验收字面新开扁平形状；全仓只有 `errors.py` 一个信封，见 safety §8.4 末的 as-built(P5-039)）。**一处引证本轮按实物改指**：`real_http039.py:204` 的输出路径是硬编码的，041 这一发于 2026-10-26 11:47 把同名旧抄件覆盖销毁（现存那份 `out_real_http039.txt` 只有一行说明），safety §9.2 与 verification §1.11 两处指向本名的引证已改指 take2 / 041 两份 |
 | 3 不带 `LIMIT` 的 `SELECT * FROM order_item` → 日志见 `LIMIT 1001`、返回 1000 行 + `truncated:true` | **已证**（机制与真跑两半都在场；本节 10-26 上午那格"字面未跑"已由 040 施工半边销掉） | 真跑：`evidence/probe_live040.txt` 段 ① + `evidence/live040.txt`（三次 pytest 各绿 + 字节锚），一次给齐四件事——`sql_final` 原文、`row_count`、`truncated`、csv 行数。用例：`tests/integration/test_layer_independence_live.py:100 test_不带_limit_的宽表查询_加_one_由第一层做_丢探针由第三层做`；那个 `+1` 作为**跨层唯一契约**由 `tests/unit/test_layer_independence.py:211 test_钳位在第一层_丢探针行与_truncated_判定在第三层` 钉。既有 `tests/integration/test_execute_live.py:109`（`order_main` + `row_limit=5`）签的是**另一档数字**、一字未动，本节不拿它冒充 1000 那一发。钳位一族的钉子仍在 `tests/guard/test_guard_api.py:41` 与 `:51-103`（含 `LIMIT 4990, 5000` → `LIMIT 1001 OFFSET 4990`、"顶层 LIMIT 恒不超过 `max_rows+1`"） |
 | 4 `SELECT SLEEP(20)` 被黑名单拒；清空黑名单后被 `MAX_EXECUTION_TIME` 叫停 → 证明分层独立有效 | **前半已证；后半按订正过的归因才签了字**（原话那句括号**没有实物、没人签过**，见下一格） | `evidence/sleep_timeout_probe040.txt`（CLI 四发实测，MySQL 5.7.17）+ `evidence/probe_live040.txt` 段 ②③ + `evidence/live040.txt` + `evidence/mutation040.txt`。用例：`:131 test_同一条_sleep_默认被第一层拒_归因是_sleep_function`（②）与 `:144 test_摘掉第一层整条函数规则之后_同一条_sleep_由计时器叫停而不是由错误中断`（③）。**两句要写在面上**：(a) 括号那句"错误来自驱动 timeout 而非守卫"在 `SELECT SLEEP(20)` 上签不了——③ 断的是"语句成功、`rows[0]==[1]`、耗时 ≈1s、两类异常一个都不抬"，3024 那一族继续由 011 既有的 `test_execute_live.py:164`（`test_慢查询被超时真中断_错误点名配置来源`，docstring 里"必须每行都慢"那一句就是它绕过 `sleep(2)` 单行形状的理由）签，040 未换靶（换了就不是同一条 SQL 的两种归宿）；(b) "清空黑名单"那把刀**字面写错**：清空 `_SLEEP_FUNCTIONS` 只把 `sleep` 从 `sleep_function` 挪进 `danger_function`（只换归因不换放行，闸内由 `tests/unit/test_layer_independence.py:102` 钉着），真刀是摘掉整条 `_function_violations`。**第二层独立**另由 037 那两族签（见上面要点段 as-built(P5-037 施工半边)），三层共用的词表反证由 `:247 test_三层的判定共用同一枚词表但互不覆盖成员` 钉 |
@@ -1014,20 +1034,36 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
 **命中数不进正文**：这一族句子本身住在 docs 里，所以任何抄进本节的数字都会在下一跑被本节自己改掉——
 040 那条"往文档里写轮数，本身就多要一轮"是同一件事。artifact 里的分布只对它自己那次测量有效
 （`threelayer041.txt` 明写了它是"041-C 已落之后"量的，并留了 041-A 盘点那一刻作对照）。
-判定看的是下面那三处原文，不随计数变，收口这一笔（含 `backend/app` 那一处 docstring）落完会再跑一发尺子：
+判定看的是下面那三处原文，不随计数变；收口这一笔（含 `backend/app` 那一处 docstring）**本轮已写完，尺子也已
+在那一笔提交之后再跑一发**（同一份 artifact 的最新追加轮：HEAD=收口半边那一笔，量的是提交之后的工作树字节。
+更早那一轮的 HEAD 还是文档半边那一笔，所以 `app/` 那处增量在它里面是 [已变]——那一笔提交在尺子之后；
+最新一轮的 `[已变]` 则是脚本两侧锚点相差四行造成的窗口错位，不是差异，判读与 `git diff` 核对都写在那份
+artifact 的末尾）：
 
 1. **矛盾一处，本轮已订正**：§4 env 清单**分组 8** 里 `AIWEB_QUERY__DRY_RUN=true` 那一行的行尾注释原写
    "关掉即失去**第三层**防御"（按内容认字、不写行号：本节就在同一枚文件里，行号当场漂），而这一格管的是
    **第二层**（`settings.py:202` → `executor.py:332` → `dry_run.py`），第三层那四条 SET 与它一字无关。
    现在按实物改成"关掉即失去**第二层**代价闸门（第三层那四条 SET 一字不动）"。
-2. **待判→拍板就地订正一处，归施工半边**：`app/services/datasource_service.py:197-198` 的 docstring 把三层
+2. **拍板就地订正那一处已落**：`app/services/datasource_service.py:197-198` 的 docstring 把三层
    并列、六行内无方言限定，而 PG 的第二层今天只交文本、零真库证据（见上面无主账 8）。
-   用户 2026-10-26 选定"就地订正、加一句限定"；它动的是 `app/` 字节，按"文档与代码分开提交"落**收口半边**那一笔。
+   用户 2026-10-26 选定"就地订正、加一句限定"，本轮已在同一段 docstring 里补上那句限定（按符号名点名
+   `_connect_and_describe` 与 `nl2sql/executor.py` 的 `execute_readonly` 两处 `kind` 分支上的
+   `NotImplementedSource`——**这里一度写过 `:319`/`:302` 两枚行号，被标准轴当场抓住**：那四行一插进同一枚
+   文件，`:319` 就变成空行，正是上面第 1 条自己立的"认字不认行号"要防的失败模式，已换成符号名）；它动的是
+   `app/` 字节，按"文档与代码分开提交"落**收口半边**那一笔。before/after 的逐字对照与本轮"三层"命中分布住
+   `evidence/threelayer041.txt` 的追加轮，命中数与成因判读都在那一份里，本节不抄。
+   **同一笔插入还把自己脚下的行号顶掉了**：那四行落在 `grants_verdict` 的 docstring 里，于是同一枚文件下方
+   的一切引用整体 +4。本节 §P5 要点 5 的 as-built(P5-040) 那三条引用就是这么变旧的——补账按实物改回
+   `192-222`（函数体）/`:305`（`test_connection`）/`:372`（verdict 进 `grants` 字段那一格），
+   核对方式是 `grep -n` 对着工作树逐枚取号，不凭记忆；未受影响的两条（`:192` 的函数定义行、上面那句里的
+   `:197-198`）保持原样。**040 那条 as-built 的日期与读数一个字没动**，动的只是坐标。
 3. **顺带一处，本轮已订正**：根 `README.md:69`（不含"三层"字面、同一判据）那句"SQL 先过白名单守卫再
    `EXPLAIN` 试算"同样无 PG 限定，本轮加一句限定。
 4. **其余命中判 OK**：三层各自独立有效是本片标题的立论，文档里绝大多数命中就是这个论断的叙述；
-   ADR-0002 的补记一/二/三与 safety §8.4、§9 那些行都带着"哪一层在哪一档没证据"的限定语，
-   没有留下"文档说三层、实物两层"未标注的一格——**唯一的例外就是上面第 1 条，它已改**。
+   "哪一层在哪一档没证据"那把限定语住在 safety §0/§8.4/§9 与本节上面第 2 条那处 docstring 里——
+   **不在 ADR-0002**：它的补记一/二/三各自限定的是机制（hint 的归因、② 的位置与尺子、回喂的编排权），
+   通篇没有一个 `postgres` 字面，本轮 grep 亲验。所以本节的说法是"未标注的一格已清零"，不是"每份文档
+   都自带限定"——**唯一曾未标注的一格就是上面第 1 条，它已改**。
 
 ### P6｜多用户与数据源级权限贯通（3 人日）
 

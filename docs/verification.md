@@ -1596,6 +1596,40 @@ shipped 逐字相同，本片没有动生产代码。用例分配：**新增 15 
   追加模式写，不覆盖上一轮）。工作树整份 CRLF 这一格也照旧：本轮新增行按字节归一成 CRLF
   （判据是 `crlf` 与 `lf` 两个计数相同 = 整份一致，不是"看着差不多"），因为 pytest 读的是工作树那一份。
 
+**041 收口半边与补账实录（as-built(P5-041 收口半边)，2026-10-26）**：
+
+- **收口半边只有一处 `app/` 增量**，且是纯 docstring：`grants_verdict` 那段补上"那句'三层'今天只对 MySQL
+  签得着字"的方言限定（按符号名点名两处 `kind` 分支的 `NotImplementedSource`）。零新用例、零行为变化 ⇒
+  整轮闸的汇总行**就该与 040 的基线是同一个数**，出现第二个数即有人塞了东西。
+- **整轮闸取了两跑，各锚一枚 `app/` 字节**：`evidence/gate041_final.txt`（docstring 修正**之前**）与
+  `evidence/gate041_postfix.txt`（修正之后 = 收口半边提交那一枚；`dev.ps1 check` 全序列、跑前跑后逐枚 md5
+  相同、`exit=0`，`ruff format --check` 与 `mypy app` 各补一发也在同一份里）。汇总行只住这两份文件。
+  **同一份里还留着我自己的两处订正**：第一遍把 `rc=` 取成了
+  管道尾巴的 rc、第二遍把 ruff 的路径写坏成 127（命令未找到，不是检查失败），第三遍直取才是真值——
+  写进 artifact 而不是删掉，因为这轮的教训就是"取数的手也会错"。
+- **这两跑锚的 docs 字节都不是本节定稿之后的那一枚**（补账又改了 roadmap §P5 与本节），所以 docs 那一半边
+  另由 `evidence/doc_input_rerun041.txt` 的**最后一轮**按同一把尺单独签。**为什么这一发就够**：本轮动过的
+  两份 docs 里只有本文件是 pytest 的 `read_text` 输入（`tests/unit/test_demo_mysql_script.py:52` 与
+  `tests/unit/test_demo_pg_script.py:46`，两者都读 `:21`/`:25` 定义的那个路径），roadmap.md 全仓没有读取点。
+  **docs-input 这一族比"两族 demo 用例"更宽，写在面上**：本轮 `grep -rn read_text backend/tests` 亲验还有
+  `tests/integration/test_sync_force_pg.py:281`（读 `docs/metadata-model.md`）与
+  `tests/unit/test_kb_card_golden.py:260`（读 `docs/kb-workflow.md`）两处——那两枚文件本轮**一字未动**，
+  所以不需要它们的补测；将来谁改那两份，同一把尺要连着那两族一起补。这一格沿用的是 040/041 文档半边已立的
+  规矩，不是本轮新发明的省事说法。
+- **双轴各抓住了实物，写在面上**（不在测试名里）：标准轴抓住那两枚写死的行号——那四行一插进同一枚文件，
+  `:319` 当场漂成空行，正是本节立的"认字不认行号"的下一个受害者；规格轴另抓住 roadmap 那句
+  "两发之间落进去的只有收口半边那一处 `app/` 增量"与它所指的 `closing041.txt` 自相矛盾（那一发取在代码
+  提交**之前**）、净增链起点那一格没有 artifact、以及对 ADR-0002 的一句夸口。四处都按实物改了。
+- **零迁移的第二端**：`evidence/closing041_post_commit.txt`——代码那一笔提交之后再读一次 `alembic current`，
+  它与 `opening041.txt` 才是夹住 `app/` 增量的那一对（`closing041.txt` 只夹住了文档半边）。
+- **收尾之后又抓住一处同类缺陷：那四行把自己脚下的行号顶掉了**。docstring 一插进 `grants_verdict`，同一枚
+  文件 198 行以下的一切引用整体 +4，roadmap §P5 要点 5 的 as-built(P5-040) 里那三条坐标（函数体跨度、
+  `test_connection`、verdict 进 `grants` 字段那一格）就是这么在**提交之后**变旧的——按实物改回，核对方式是
+  `grep -n` 对工作树逐枚取号（`git show` 对着 c251f0e 与 e0be252 两枚 rev 各取一次，确认漂移量恰好 4）。
+  **040 那条 as-built 的日期与读数一个字没动，动的只是坐标**；未受影响的两条（函数定义行、docstring 里
+  三层并列那两行）保持原样。这一处的教训与上面第 3 条同一条：只要往 docs 里写行号，就有义务在每次动过
+  那枚文件之后重新取号——而"认字不认行号"那条规矩本来就是为这个立的。
+
 ---
 
 ## 2. 测试分层
