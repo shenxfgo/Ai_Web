@@ -781,6 +781,9 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    本片的白名单来源是"该源全部已同步表"而不是检索召回的那 k 张，因此它比 ask 那一路**宽**——
    把它收到 grant 粒度是 **§P6 验收 2** 那一行（member → `403 table_not_granted`）的活，不是本片顺手补的。
    实测读数（真 HTTP 栈上的那一发回显与八档用例）随施工半边落 verification §1.11。
+   **as-built(P5-039 施工半边)：那句"随施工半边落"已经落了**——verification §1.11 那条"039 施工半边实录"
+   记着 13 条用例对八档的映射、七发真 HTTP 回显（`evidence/out_real_http039_take2.txt`，锚 shipped 字节）、
+   四轮变异电池与带 md5 自证壳的那轮整轮闸。这里不重述读数，只把"待落"那半句销掉。
 3. 不带 `LIMIT` 的 `SELECT * FROM order_item` → 执行日志见 `LIMIT 1001`、返回 1000 行 + `truncated:true`；
 4. `SELECT SLEEP(20)` 被黑名单拒；**清空黑名单**后被 `SET SESSION MAX_EXECUTION_TIME=1000` 截断
    （错误来自驱动 timeout 而非守卫）→ 证明分层独立有效；

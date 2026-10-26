@@ -1239,7 +1239,7 @@ def test_allow(sql):
   绝不落到执行层。（**这句的主语是 ask，不是 validate**，见 as-built(P5-039) 第 ③ 点。）
 
 > **as-built(P5-039)：本节那两行 400 的形状订正**（文档对着实物改，不是实物迁就文档字面——
-> 与 P4-032 抓 architecture §5.2 时同一条纪律）。三条：
+> 与 P4-032 抓 architecture §5.2 时同一条纪律）。五条：
 > ① **全仓只有一个错误信封**：`app/core/errors.py` 的 `error_body()` 配 `register_exception_handlers`
 > 里那条 `AppError` 处理器，回的是 `{"error": {"code", "message", "detail"}}`，HTTP 码取
 > `exc.status_code`。所以 `sql_guard_rejected` 的实物是
@@ -1248,13 +1248,36 @@ def test_allow(sql):
 > 新开扁平形状等于给前端两条例外（roadmap §P7 验收 1 的 axios 拦截器按的就是 `code/message` 这一层）。
 > 这一格由用户于 2026-10-20 拍板（工单 039 格子 ①）。
 > ② **`detail` 的三格不是发明词**：守卫侧那枚 `Violation`（`sql_guard.py:128-133`）本来就是
-> `code / message / node` 三格，`SqlGuardError` 又把它们原样带上身（`:141-143`）。对外键名换成
-> `rule_id`/`field` 只做在一处映射：`rule_id ← Violation.code`（`rule_id` 是 roadmap 验收 2 的字面、
-> 也是 035 之后那枚封闭词表 `GuardRuleId` 的枚举值），`field ← node`。
+> `code / message / node` 三格，`SqlGuardError` 又把它们原样带上身（`:141-143`）。对外的名是
+> `rule_id ← Violation.code`（`rule_id` 是 roadmap 验收 2 的字面、也是 035 之后那枚封闭词表
+> `GuardRuleId` 的枚举值），`field ← node`。
+> **这一行原来还带着"只做在一处映射"半句，039 双轴审查时按实物删掉了**——那半句两点都不实：
+> (a) 那次换名住在 `services/nl2sql/validate.py`，是**服务层**不是 API 层（`core/errors.py` 不 import
+> services，所以映射放不进信封那一侧）；(b) 同一件事实今天有**三个**对外键名，不是一对一：走 HTTP 时叫
+> `error.detail.rule_id`（039 新），落进 `chat_messages.guard_result.violations[]` 时叫 `code`
+> （012 定的形状，`pipeline._guard_outcome`），落进同一格的 `retries[]` 时又叫 `rule_id`
+> （038 在 pipeline 那一侧另起的）。三个名字、两处主人是**既有契约**，不是本片造成的；收拢它要动
+> 012/038 的面，账记在工单 041。本节因此不许被读成"换名已经收拢过"——留着这种句子，下一片就会拿它
+> 当凭据。
 > ③ **最后那条 dry-run 的 400 讲的是 ask（P8）而不是本片**：`POST /api/chat/validate` **只跑第一层**，
 > 它一次都不连源库，因此永远不会产出 dry-run 那一档的拒绝。把它照抄进 validate 的契约就是张冠李戴——
 > 而且 037 之后第二层拒的是 `too_costly` / `dry_run_unreadable` / `dry_run_engine_rejected` 那三枚码
 > （§1.1 那枚共用词表），038 之后它们走的是回喂重试那一路（§3.5），不是"原样 400 回给用户"。
+> ④ **`detail.field` 是一枚"有主人的可空槽"，不是"定位到具体字段"**：`Violation.node` 的默认值是
+> `None`（`sql_guard.py:133`），全仓写入点实测只有三族——`variable_access`（`:397`，`"、".join(sorted(hits))`）、
+> `cartesian_product`（`:460`，那枚表名）、`regeneration_drift`（`:511-557`，036 那四格自校验）。
+> 而 validate 最常拒的那四枚（`multi_statement` / `table_not_allowed` / `empty_statement` / `too_large`）
+> 回的正是 `null`，真 HTTP 回显逐字可查（`.scratch/p5-sql-guard-hardening/evidence/out_real_http039.txt`
+> 的 R1/R3/R4/R6）。所以这一格既不许写成"永远为空"（三族非空），也不许写成"能定位到具体字段"
+> （今天只有三族有内容）。
+> ⑤ **`default_schema=""` ⇒ 谁在 `check()` 外面调用守卫，谁就必须自带全名**：补全出来的是
+> `QualifiedTable("", "", "order_main")`，白名单里是 `("", "ai_web_demo", "order_main")`，两枚三元组
+> 不相等，所以 `SELECT id FROM order_main` 这类短表名**在 validate 与 ask 两条路上都拒**——同一条口径，
+> 不是分叉。今天两个调用方传的都是空串（`validate.py:89`、`pipeline.py:328`），短表名在这条链路上
+> **永不发生补全**。这不是 bug 是契约，钉子是
+> `tests/integration/test_chat_validate_pg.py::test_短表名一律拒因为default_schema是空串`（电池的 B 格：
+> 把空串换成库名 → 精确红这一条）。§9.2 那句"短表名由 `default_schema` 补全"描述的是**能力**，
+> 不是今天的调用面，差额已记在那一行。
 > 顺带一条本节管不到的事实：请求体本身不合法（缺字段、多字段、类型不对）出的是 **422 `invalid_request`**
 > （`RequestValidationError` 处理器，`:235-247`），而"空语句 / 超长"出的是 **400 `sql_guard_rejected`**
 > （守卫 `_preprocess`：`empty_statement`、`too_large`）——同一个"你的 SQL 不行"，两个主人。
@@ -1310,7 +1333,7 @@ def test_allow(sql):
 |---|---|
 | ① "每条拒绝都带**枚举化**的 `rule_id`" | **as-built(P5-035)**：这半句在 035 之前一直是"文档有字、实物无枚举"——§1.1 的注解写的就是 `code: str`，17 枚码由 **20 处"首参是裸字符串"的调用点**（12 处 `SqlGuardError` ＋ 8 处 `Violation`）外加 `_scan_raw_text` 的 `(pattern, code, hint)` 三元组表里那 3 枚维持一致，没有任何一处能穷举出值域。035 落 `GuardRuleId(StrEnum)`（不是 `(str, Enum)`：后者的 `__str__` 出 `'GuardRuleId.multi_statement'`，而 `SqlGuardError` 的正文拼的是 `f"[{rule_id}] {message}"`，那是用户可见文案；`StrEnum` 的 `__str__` 就是值，ruff 的 `UP042` 也只认这一种写法）＋ 一条表驱动的封闭集合用例。**对外值一字未改**：54 条必拒语料改动前后逐条同码，对照表在 `.scratch/p5-sql-guard-hardening/evidence/ruleid_{before,after}035.txt`。工单 035 记的"22 个拒绝点"是它的计数口径（14 个 `SqlGuardError` 调用点 + 8 处 `Violation` 字面构造）；本轮 AST 实测调用点总数 **23**（14 处 `SqlGuardError` ＋ 9 处 `Violation`）、其中首参是裸串字面量的 **20** 处（12 raise ＋ 8 构造，另加 `_scan_raw_text` 三元组表那 3 枚字面量）。两个数说的是同一批点位，换算写在这里免得下人再数一遍：工单那 14 处 raise 含 `:223`（传变量 `code`）与 `check()`（把 `Violation` 翻成 raise）两处非字面量，22 减这两处就是本轮的 20；23 比 22 多的那一处是 `SqlGuardError.violation` 属性内部那次 `Violation(...)` 构造——不是拒绝点而是适配器 |
 | ① 的**封闭集合判据**（035 落在 `test_rule_id_closed_set.py`）与 §8.1/§8.2 的**语料条数** | **as-built(P5-036)：两处各放宽了一格，按本节开头那条规矩先改本文再改实现**。① 判据从"每枚码都要出现在 54 条必拒语料的期望值里"放宽成"**语料期望值 ∪ `tests/guard/` 里以 `GuardRuleId.<成员>` 形式点名的 AST 扫描**"，因为 036 带来了第一枚**不可能有语料**的码 `regeneration_drift`（它防的是守卫自己的代码，实测 18 条必放行语料一条都触发不了它）。**代价要说清**：属性引用只证明"有用例点了这枚码的名"，不证明那条分支真被走过，所以这一档的码必须**另配一条失败路径用例**才算钉住（036 的那发是 `test_regeneration_invariant.py` 里手工造漂移那一支）；语料那一档保持 035 的原强度，期望值仍由 `test_reject_corpus` 逐条断言。② 工单 036 验收 4 的 (B) 支字面要求"补必拒语料"，实物**只补了规则与用例、没动 `corpus.py` 那 54/18 两条计数**——它自己的"已定口径"写着"语料的期望值不许动，本片只往新增文件里加用例"，两句话冲突时按工单自己那条口径走，hint 的三支形状钉子落在 `tests/guard/test_regeneration_invariant.py::test_hint_三种形状两条接缝同码`。 |
-| `allowed_schemas` 单独入参 | 折进 `allowed`（表白名单里已带 `db`，短表名由 `default_schema` 补全）→ 效果等价且更严 |
+| `allowed_schemas` 单独入参 | 折进 `allowed`（表白名单里已带 `db`，短表名由 `default_schema` 补全）→ 效果等价且更严。**as-built(P5-039)：括号里那半句是能力，不是今天的调用面**——两个调用方（`validate.py:89`、`pipeline.py:328`）传的 `default_schema` 实测都是空串，于是短表名在两条路上**一律拒**、那个"补全"分支在整条链路上一次都没被走到（契约与钉子见 §8.4 as-built ⑤）。这一行原话留着不改，因为接口差额说的是"`allowed_schemas` 这个入参要不要立"，它的答案仍是"不立"；补的这一句只是别让下一片把"能补全"读成"会补全" |
 | `forbid_files: bool = True` | 恒为真，不给关 |
 | §0 表把第二层的位置写成"`sql_guard` 末尾"、拒因写成大写 `TOO_COSTLY` / `CARTESIAN_PRODUCT` | **as-built(P5-037)：两处都被实测改掉了**。① 位置：`guard()` 不碰库，第二层要在真源库连接上发 `EXPLAIN`，物理上住不进纯 AST 模块——落成 `app/services/nl2sql/dry_run.py`，由 `executor.py` 在第三层那条只读会话建好之后、取行之前调用。与第三层**分家成两个模块**也是刻意的（"分层独立有效"要求第二层能被单独关掉、单独反证）。② 字面：`TOO_COSTLY` 订正成小写 `too_costly`（落库那一侧为准）；`CARTESIAN_PRODUCT` **根本不住第二层**——逗号连接在 sqlglot 的 AST 上可见（§3.4），归第一层新枚 `cartesian_product`，第二层拿 SQL 文本再判一次是拿字符串重做 AST 已经做过的事 |
 | §1.1 那句"`GuardRuleId` 是第一层的拒绝码枚举" | **as-built(P5-037)：这枚枚举现在是三层共用的拒绝词表**（18 → 22 枚）。名字保留、不重命名成 `RejectionCode` 之类：它的值已是对外契约（JSONB `chat_messages.guard_result`、语料期望值、roadmap §P5 验收 2 的字面），而"重命名"这件事本身会撞上 §1.1.1 那条 `value == name` 的机械断言——契约变了才算改，内部称呼不算。依赖方向单向：`dry_run.py → sql_guard.py`（第二层复用同一枚枚举与同一个 `SqlGuardError`，管线的 `guard_result` 与早退形状因此不用新写一套），**不是** `sql_guard` 认识 `dry_run` |

@@ -1339,6 +1339,70 @@ P5 仍是零迁移片，真库版本沿用本节开头那个探针（`0009`）�
 变成 `== 2`、10 段。判据一字未动（"第二层拒了要早退、不许 500"），改的是"拒了以后现在会再试一次"
 这个新事实的读数；若不写这一句，下一片会把它读成"为了变绿松了手"。
 
+**039 施工半边实录（as-built(P5-039 施工半边)，2026-10-26）**：形状与那五条口径订正住在 safety §8.4
+的 as-built 那五格，交付面、八档→13 条的映射与"多出来的那五格是哪来的"住在工单
+`.scratch/p5-sql-guard-hardening/tickets/039-chat_validate端点.md`，本节只放"跑过什么、量出多少"。
+
+- **用例分配**：`tests/unit/test_table_full_name.py` 6 条（三列拼法的收拢 + 那条机械 grep 闸）+
+  `tests/integration/test_chat_validate_pg.py` 13 条 = 19。收集数 **1330 → 1349**（+19 全在本片，
+  **一条既有用例都没改**；`pytest --collect-only` 实机读数 2026-10-26 09:25，与下面那轮闸同一套字节）。
+  两枚新靶都先红在实现之前（`evidence/red_table_full_name039.txt`、`red_chat_validate039.txt`）。
+- **变异电池四轮**（第四轮是权威那份：`evidence/mutation_validate039.txt`，`_round1` / `_round2` /
+  `_round4` 留档）：套件 19 条，pristine 与 restore 各一遍 `failed=0`。A 精确 1 红（白名单不收 `is_stale`
+  → 陈旧表那条）/ B 精确 1（`default_schema=""` 给成库名 → 短表名那条）/ C 精确 1（钳位改用 1000 →
+  `sql_final` 那条）/ D 精确 1（给 validate 偷渡一次源库连接 → "不连源库"那条反证）/ E 精确 2（判权换成裸
+  `session.get` → 403 + 404，owner 反证那半照旧绿，正是它该绿）/ F 精确 6（`sql_guard_rejected` 的档
+  400→422 → 所有断 400 的六档）。**无绿格、无多红**。**第一轮整格作废**：F 格判"锚点命中 0 次"，
+  成因不是锚点选错了位置，而是 `app/core/errors.py` 在盘上是**整文件 CRLF**（287 枚 `\r\n` 对 287 枚 `\n`）
+  而电池的锚点字面按惯例写的 LF——它拿 LF 去找 CRLF 文件里那两行。改成"按文件探测换行、再按探测到的
+  换行写回变异体"（报告首部逐文件报行尾）后第二轮 F 格红 6 条与声明逐格相同。**纪律**：锚点是**字节**的
+  断言，行尾是字节的一部分；本轮新写的 `validate.py` 是纯 LF，两枚混在同一格电池里才把这个坑暴露出来——
+  以前几片的电池文件恰好都是 LF。**第二轮与第四轮是同一套红格在两组字节上**（第四轮锚审查后的 shipped
+  字节）：剥掉 md5 与时间行之后两份 artifact `diff` **逐字相同**，这一笔是实测对照。反过来，round1 那份
+  现在只是**抄件**（首部标明"非落盘原件"），它唯一能证的是"F 格从锚点命中 0 次变成红 6 条"那一步；
+  "A~E 五格两轮相同"是按 `_as_eol` 对纯 LF 靶文件是恒等变换**推定**的——两种证法在工单 039-E 分开写着，
+  不许把推定写成实测。
+- **验收 1 的真 HTTP 取证（超出工单字面的一格）**：工单把"真 HTTP 栈"定义为 `httpx.AsyncClient` 打真 app，
+  13 条用例就是这么打的；本轮**另外**跑了一次真进程——`evidence/real_http039.py` 自己起
+  `python -m uvicorn app.main:app --host 127.0.0.1 --port 8124` 子进程，登录后打七发（R1 是 roadmap
+  验收 2 的字面、R2 全名单句、R3 短表名、R4 库里没有的表、R5 缺 `datasource_id`、R6 空语句、R7 不带令牌），
+  回显两份：`out_real_http039.txt` 与审查后重跑的 `out_real_http039_take2.txt`，**两份逐字相同**（`diff`
+  实测）。**权威那份是 take2**，它首部七枚 md5 对的就是 shipped 字节；"审查只改了注释措辞、七发回显不受
+  影响"这句话由那两份字节相同来证，不由我声明。脚本对元数据库只发 `SELECT`（拿 `datasource_id` 与一张真
+  表名），对源库一条都不发，`data_sources`/`chat_*` 一行未动；`authorization` 在 artifact 里写成
+  `<Bearer 长度 171，逐字不进本文件>`，凭证运行时从 gitignored 的 `backend/.setup/local_admin.txt` 读；
+  七发的输入由首部那七枚 md5 自证（起进程前取、收尾再取，逐字相同）。读数三件留在账上：R2 的 `sql_final`
+  是 `SELECT * FROM ai_web_demo.category LIMIT 1001`（真库 `row_limit` 走默认 1000，钳位 +1 的形状与
+  roadmap 验收 3 同源）、R1 的 `detail` 是 `{"field": null, "message": "一次只允许一条语句",
+  "rule_id": "multi_statement"}`、R5 出的是 422 `invalid_request` 而不是"跳过表白名单"。
+- **闸**：整轮 **`1347 passed, 2 skipped, 1 warning in 542.46s (0:09:02)` · exit 0**
+  （`evidence/gate039_shipped.txt`，起跑 17:48:42）。**这一跑的输入自证由闸外面那层壳负责**：
+  `gate_with_md5_039.sh` 在 `dev.ps1 check` 前后各取一次六枚 md5，两侧逐字相同。为什么要有这层壳：
+  036 立过"长闸跑着时改过的输入不算数"，038 又踩了一次"后台任务报完成 ≠ 真完成"——本轮**同样收到一次
+  假完成通知**（报完成时进度才 26%、`python` 进程仍活着），改前台 `Wait-Process` 真等之后才落这份。
+  基线是 038 那轮的 `1328 / 2`，+19 全在本片。**两份被作废的读数留档不采信**：`gate039_raw.txt`
+  （16:56，550.65s）与 `gate039_final.txt`（17:43，559.38s）跑的都是审查**前**的字节，而审查动了
+  `errors.py`／`table_names.py`／`validate.py` 三枚 app 字节——三跑计数相同这件事只说明"改的是注释文字"，
+  **不能替代重跑**。
+- **快闸**（`evidence/fastgate039.txt`，锚 shipped 字节，2026-10-26 09:26 补跑）：`ruff check` 那发已在
+  整轮闸 artifact 里（`All checks passed!`）；这里补的是工单口径要求的另两发——`ruff format --check
+  app scripts tests alembic` **209 files** already formatted、`.venv/Scripts/python.exe -m mypy app`
+  **62 files** 零问题，两发各 `rc=0`，前后六枚 md5 逐字相同（artifact 首部就是那六枚）。
+- **零迁移三发探针夹住**：`alembic current` 在开工（10-21 16:00:49）、闸中（17:37:42）、收尾
+  （10-26 09:23:11）三次都回 `0009 (head)`，`alembic/versions/*.py` 仍是 **9** 枚，本片没碰
+  `alembic/versions/`、没碰任何 ORM 列定义（新增全是 HTTP 层与只读 SELECT）。**"闸中"那一发改名
+  `_midgate`，不冒充收尾**。收尾那份 artifact 的第一版把同目录里的 `__pycache__/` 数成了第 10 枚迁移，
+  订正注与正确的尺子都留在文件里——记录里带错数的读数比没有读数更糟。
+- **双轴审查改的四枚 app 字节全是注释/docstring**（`errors.py` 与 `validate.py` 里同一句"只做在一处映射"
+  的虚言、`table_names.py` 那句"只 import `typing`"、还有它对可达域的说反）：按 035 立的规矩"动的若是
+  app 字节就整条证据链重跑"，电池第四轮 + 真 HTTP take2 + 带壳整轮闸各来了一遍，不在账上解释"只改了写法"。
+  文档半边 `a47ff11` 的 safety §8.4 ② 带着与代码同源的那半句虚言，随本轮补账一起订——本节就是那次补账。
+- **残留账的指针**（内容在工单 039-E 与 `tickets/041-P5收口.md`，这里只留路标）：`is_stale` 那把尺今天
+  有三份实物、只有 validate↔retriever 那一对被用例钉住；守卫那句后缀只看 `default_schema` 真值、不看那枚
+  引用短不短（R4 已是全名也带"短表名无法补全"）；同一条 message 的渲染让空的那几格**占位**
+  （`.ai_web_demo.zz_no_such_table_039`、`..category`），与 `core/table_names` 那条"空的不占位"是相反的
+  第二套渲染。三条都归 041，本片按"明确不做"没动 `sql_guard.py`。
+
 
 ---
 
