@@ -33,6 +33,7 @@ from app.core.errors import (
     ReindexMatchesActive,
     VectorColumnMissing,
 )
+from app.core.table_names import table_full_name
 from app.core.vector_columns import ALL_VECTOR_COLUMNS, vector_column_for
 from app.models.datasource import DataSource
 from app.models.kb import KbCard, KbIndexProfile
@@ -816,15 +817,6 @@ async def activate_profile(session: AsyncSession, *, profile_id: int) -> Activat
 # 前者是漏了列，后者是注释优先级搞反。
 
 
-def _full_name(catalog_name: str, schema_name: str, table_name: str) -> str:
-    """`§1 的规范化列` → §5 的 `full_name`：MySQL 的 catalog 恒空串，不能打头。
-
-    拼成 `.ai_web_demo.order_main` 的话，模型会把带点开头的名字抄进 SQL，
-    而那条表名在它自己的库里根本不存在。
-    """
-    return ".".join(part for part in (catalog_name, schema_name, table_name) if part)
-
-
 def _server_major(server_version: str) -> str:
     """`5.7.44-log` → `5.7`。§5 的方言条件比的是两段式主版本。"""
     parts = server_version.split(".")
@@ -866,7 +858,7 @@ def table_meta_from_rows(
         )
 
     return TableMeta(
-        full_name=_full_name(
+        full_name=table_full_name(
             str(table["catalog_name"]), str(table["schema_name"]), str(table["table_name"])
         ),
         table_type=str(table["table_type"]),
@@ -896,7 +888,7 @@ def table_meta_from_rows(
         relations=tuple(
             RelationMeta(
                 from_column=str(r["from_column_name"]),
-                to_table_full=_full_name(
+                to_table_full=table_full_name(
                     str(r["to_catalog_name"]), str(r["to_schema_name"]), str(r["to_table_name"])
                 ),
                 to_column=str(r["to_column_name"]),
@@ -1114,7 +1106,7 @@ async def sync_cards(
     cards = 0
     failures: list[CardBuildFailure] = []
     for table in tables:
-        full_name = _full_name(
+        full_name = table_full_name(
             str(table["catalog_name"]), str(table["schema_name"]), str(table["table_name"])
         )
         try:
@@ -1284,7 +1276,7 @@ async def embed_batches(
             (
                 int(row["id"]),
                 str(row["text_md"]),
-                _full_name(
+                table_full_name(
                     str(row["catalog_name"]), str(row["schema_name"]), str(row["table_name"])
                 ),
             )

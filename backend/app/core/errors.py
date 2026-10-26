@@ -208,6 +208,33 @@ class VectorColumnMissing(AppError):
     status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
 
 
+class SqlGuardRejected(AppError):
+    """`POST /api/chat/validate` 拒下这句话时的那一档（工单 039，roadmap §P5 验收 2）。
+
+    400 而不是 422：与 `SourceUnreachable` 同一条措辞——请求体格式没问题（pydantic 已经放行），
+    是这句话过不了守卫。422 归请求体格式这一档今天由 `RequestValidationError` 处理器占着，
+    把守卫的拒写成 422 等于让前端用同一个分支处理"你少填一格"和"你这句话是注入"。
+    也不是 403：403 的主语是权限（`Forbidden`），这句话可能引用的全是你有权的表。
+
+    **只有 HTTP 这一路用它**：`pipeline.ask()` 被守卫拒时走的是 `_exit_early`，把
+    `sql_guard_rejected` 那枚字符串落进 `chat_messages.error_code`（012 的形状），因为那次问数
+    本身要留痕、要回喂、要在会话里显示——它不是在"回答一个校验请求"。两个出口共用的是
+    **同一具守卫与同一枚 rule_id 词表**（035），不共用异常类型；这里不抛出去、pipeline 也不 catch，
+    免得把"落库留痕"那一路改成"抛 HTTP"。
+
+    `detail` 那三格是 `sql_guard.Violation` 的 `code/message/node` **换名**，不是新发明的词：
+    对外叫 `rule_id` 是 roadmap 验收 2 的字面，对内的主人是 `Violation.code`（035 的封闭词表）。
+    这一枚**面向 HTTP 的**换名只做在 `services/nl2sql/validate.py` 一处（core 不 import services，
+    所以映射不能住在这里）。但它不是"这句话在全仓只有一个对外名字"：同一批 `Violation` 落进
+    `chat_messages.guard_result` 时那一格叫 `code`（那是 `pipeline._guard_outcome` 的形状，
+    012 定的）；落进 `retries[]` 时又叫 `rule_id`（038）。同一件事实两个对外键名是**既有契约**，
+    不是本片造成的，收拢它要动 012/038 的面，归 041 的账——这里不谎称"只有一处"。
+    """
+
+    code = "sql_guard_rejected"
+    status_code = status.HTTP_400_BAD_REQUEST
+
+
 # §6 的三条出路。放在错误类旁边而不是抛出点：编排层（sync_service）与测试桩都要引用同一份，
 # 于是"编排层把 detail 换成别的词"会当场红，而不是前端拿到任意三句话照样绿。
 # 第三条是 §6 原文（工单 021 换回：P2 那句"admin 改配置"是开关未落地时的替代话，不许撒谎）。

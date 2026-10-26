@@ -29,6 +29,7 @@ import networkx as nx
 from sqlalchemy import Select, Table, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.table_names import table_full_name
 from app.models.meta import MetaRelation, MetaTable
 
 # §5.3 的边权重。inferred 一档不在这里，它是 1/confidence（confidence 只有 0.85/1.00 两值，
@@ -374,14 +375,6 @@ _META_TABLE = cast("Table", MetaTable.__table__)
 _META_RELATION = cast("Table", MetaRelation.__table__)
 
 
-def _full_name(catalog: object, schema: object, table: object) -> str:
-    """MySQL 的 catalog 恒为空串，不能打头（`retriever.load_schema_tables` 内联的同一条规则）。
-
-    写成 `.` 打头的话，模型会把带点开头的名字抄进 SQL，而那条表名在源库里根本不存在。
-    """
-    return ".".join(str(part) for part in (catalog, schema, table) if part)
-
-
 def _relations_statement(datasource_id: int, database_id: int) -> Select:
     """一个库的边全集，两端都钉在同一个 `database_id` 上。
 
@@ -439,9 +432,9 @@ async def load_relations(
 
     门槛（inferred ≥0.8、自环）一律留给 `build_graph`：策略只在一处，改门槛不用碰 SQL。
 
-    表全名在这里拼出来（`kb_service._full_name` 的同一规则：MySQL 的 catalog 恒空串，
-    不能打头），因为渲染路径时要它，而**桥表没有卡片**——它是图自己长出来的中间节点，
-    检索没召回它，pipeline 补查的也只是它的卡片段，不是它的名字。
+    表全名在这里拼出来（唯一的拼法住在 `app/core/table_names.table_full_name`：
+    MySQL 的 catalog 恒空串，不能打头），因为渲染路径时要它，而**桥表没有卡片**——
+    它是图自己长出来的中间节点，检索没召回它，pipeline 补查的也只是它的卡片段，不是它的名字。
     """
     rows = (
         (await session.execute(_relations_statement(datasource_id, database_id))).mappings().all()
@@ -452,8 +445,8 @@ async def load_relations(
             from_column=str(row["from_column_name"]),
             to_uid=str(row["to_uid"]),
             to_column=str(row["to_column_name"]),
-            from_name=_full_name(row["from_catalog"], row["from_schema"], row["from_table"]),
-            to_name=_full_name(row["to_catalog"], row["to_schema"], row["to_table"]),
+            from_name=table_full_name(row["from_catalog"], row["from_schema"], row["from_table"]),
+            to_name=table_full_name(row["to_catalog"], row["to_schema"], row["to_table"]),
             source_kind=str(row["source_kind"]),
             confidence=None if row["confidence"] is None else float(row["confidence"]),
         )

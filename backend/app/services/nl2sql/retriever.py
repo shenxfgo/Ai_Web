@@ -41,6 +41,7 @@ from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import TextClause
 
+from app.core.table_names import table_full_name
 from app.models.kb import KbCard, KbIndexProfile
 from app.models.meta import MetaColumn, MetaTable
 from app.models.user import User
@@ -1049,8 +1050,10 @@ async def load_schema_tables(
             continue
         table_id = int(table[0])
         await datasource_service.get_authorized(session, actor, int(table[1]))
-        # catalog 在 MySQL 恒为空串，不能打头（kb_service._full_name 同一条规则）。
-        full_name = ".".join(part for part in table[2:5] if part)
+        # catalog 在 MySQL 恒为空串，不能打头——拼法本身不住这里，主人是
+        # `app/core/table_names.table_full_name`（工单 039：validate 与 ask 必须共用一份，
+        # 两份拼法会给出两个白名单，同一件 SQL 在两条路上一个放行一个拒）。
+        full_name = table_full_name(table[2], table[3], table[4])
 
         segments = tuple(
             str(row)
