@@ -197,6 +197,10 @@ def grants_verdict(grant_lines: list[str]) -> dict[str, Any]:
     **登记阶段的前置校验**，不在三层防御之内（第一层 AST 白名单、第二层 EXPLAIN dry-run、
     第三层会话级只读）——§6 也要求"数据源表单提示请建只读账号"。
 
+    那句"三层"今天只对 MySQL 签得着字：连接探测（本文件的 `_connect_and_describe`）与只读
+    执行（`nl2sql/executor.py` 的 `execute_readonly`）都在 `kind` 分支上对非 mysql 直接抬
+    `NotImplementedSource`，037 交给 PG 的第二层只是 SQL 形状、一次都没在源库上跑过。
+
     `code` 是 §4.1 点名要 test_connection 报的那个机读标记
     （`readonly_capability_missing`），但它**不是** HTTP 错误：同一条 §4.1 写着
     "黄色警告不阻断，admin 可确认"。所以这里回 200 + 一个可 switch 的码，
