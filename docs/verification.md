@@ -1443,12 +1443,93 @@ P5 仍是零迁移片，真库版本沿用本节开头那个探针（`0009`）�
 - **验收 3 那一格的预清**：`order_item` 8.8 万行会不会被第二层 `too_costly` 拦住？
   不会——`QueryGroup.max_explain_rows = 50_000_000`（`settings.py`），估行远不到门槛。
   这一发测的是第一层钳位与第三层截断，与 dry-run 无关。
-- **施工半边还没有的东西**（本节留着，免得下一片以为已经做了）：闸内的
-  `tests/unit/test_layer_independence.py`、live 的 `tests/integration/test_layer_independence_live.py`
-  三发、验收 5 反半那一发（200 + `grants.code`）、验收 1 要的变异自证
-  （删 `session_statements` 里 `MAX_EXECUTION_TIME` 那一行必须有用例红）。
-  **本节的闸口读数（净增数、耗时、`ruff format --check`、`mypy`）随施工半边补在这里**，
-  文档半边不带任何"跑过了"的说法。
+- **施工半边那四样已经落了**（上一版这一格列的是"还没有的东西"，本轮按实物填实，出处见下面那一整段）：
+  闸内的 `tests/unit/test_layer_independence.py`、live 的
+  `tests/integration/test_layer_independence_live.py` 三发、验收 5 反半那一发（200 + `grants.code`）、
+  验收 1 要的变异自证（删 `session_statements` 里 `MAX_EXECUTION_TIME` 那一行必须有用例红）。
+
+**040 施工半边实录（as-built(P5-040 施工半边)，2026-10-26，字节半边 `c9149f3`）**：改动**全在测试层**——
+三枚 app 字节（`executor.py 7c06f099…` / `sql_guard.py ff21d141…` / `dry_run.py 8e1567c3…`）与 037
+shipped 逐字相同，本片没有动生产代码。用例分配：**新增 15 发**（闸内 **11** + live **3** + 验收 5 反半
+**1**）；既有文件跟着动的只有 `conftest.py`（新 `rw_account` 夹具）与 `test_datasource_live.py`
+（补那一发），**一条既有用例的判定都没改**，所以整轮闸从 039 那轮的 `1347 / 2` 走到**收集 1364**。
+
+- **闸内那 11 发签的是"双向"**（工单验收 1 的字面只要求一个方向）：正向摘掉第一层整条函数规则
+  （`monkeypatch` 掉 `_function_violations`）之后 `session_statements` 那四条一个字不变；反向把第三层
+  那条 `MAX_EXECUTION_TIME` 用桩摘掉之后 `guard()` 与 `explain_statements()` 的产物一字不变。只签一个
+  方向的话，"第三层的字面里藏着对第一层的补偿"这类写法抓不住。**这里有一条同义反复要记**：反向那一发
+  第一版断的是**桩自己的输出**（把摘掉之后的三条字面写死再断言），那种写法对"删掉那一行"这个变异
+  永远绿；双轴审查把它改成断桩的**输入契约**（先断真函数那一侧确实有那条超时 SET，再换桩）。
+  钳位与丢探针那一格钉的是同一个 `+1` 在两个主人之间的契约（错开一档就是把探针行当真数据、
+  `truncated` 恒假，正是 §9.2 ⑧ 闭掉那个洞的反面），发名里承诺的"第一层钳位"这一版本才真有那一半
+  （`LIMIT 1001` 字面）。
+- **live 三发的读数**（`evidence/probe_live040.txt` 原文、`evidence/live040.txt` 那三次 pytest 各绿）：
+  ① 验收 3 的字面那一发补齐四件事——`sql_final` = `SELECT * FROM ai_web_demo.order_item LIMIT 1001`、
+  `row_count=1000`、`truncated=True`、csv **1001 行**（1 表头 + 1000 数据），取回 0.10s；既有的
+  `test_execute_live.py` 那一发用的是 `order_main` + `row_limit=5`，**两者不等价**，所以这一格是补的
+  不是冒充的。② 同一条 `SELECT SLEEP(20)` 在第一层在场时被守卫拒（`rule_id = sleep_function`）。
+  ③ 第一层整条函数规则摘掉后由**源库自己把 20s 砍成 ≈1s**（`rows[0] == [1]`、耗时 <10s、不抬异常），
+  归因按文档半边改过的那半句签，**没有换成"每一行都慢"那一发**（3024 继续由 `test_execute_live.py`
+  签，工单已定口径）。第二层由 autouse 夹具关着——那份 `second_layer_off` 与 `test_execute_live.py:40`
+  逐字相同，**没收拢进 conftest**（上提要动 011 那张底的文件，越界），重复这一事实写在文件 docstring 里，
+  账归 041。
+- **验收 5 的反半第一次由真账号回答**：`test_非只读账号探得出缺失能力_但登记那道闸门仍然打开`
+  用 `.setup/my_login.cnf` 那把（工单格子 ② 用户 2026-10-20 点名授权、用前按只读 `show grants` 核实过
+  身份）真连一次 `POST /api/datasources/{id}/test` → **200** + `ok:true` + `grants.read_only:false` +
+  `grants.code="readonly_capability_missing"` + `grants.warnings` 非空。执行路那把硬阻断仍由
+  `tests/unit/test_executor_grants.py:33` 签，**两档不合并**。口令那一格**不能用
+  `assert password not in resp.text`**——pytest 的断言重写会把左操作数的**字面值**倒进终端，而这一发
+  用的是本机建库那把（root），一次红测等于把口令贴进 CI 日志；改成 `pytest.fail` 只报"发生了"、
+  不报"是什么"（同 `DbAccount.__repr__` 的掩码是同一条口径）。
+- **变异自证（验收 1 要求的这一格）**：`evidence/mutation040.txt`，删掉 `session_statements` 里
+  `MAX_EXECUTION_TIME` 那一**整行** → 本文件 **7 红 4 绿**、`tests/unit + tests/guard` 全跑
+  **8 红 1025 绿**（多那一枚是既有的 `test_executor_session.py::test_mysql_顺序_with_值`，
+  爆炸半径就到这一枚）；锚点命中 **1**、恢复后字节一致、restore **11 绿**。电池脚本自己修了一处坑：
+  `backend/pyproject.toml:65` 的 addopts 已带 `-q`，脚本再补一个 `-q` 把 quiet_level 抬到 2，
+  **最后那行"N passed in Xs"整个不打**（第一版产物因此没有计数行，读数作废重跑）。
+- **闸**：整轮 **`1 failed / 1361 passed / 2 skipped · 486.69s (0:08:06)`**，落盘
+  `evidence/gate040_raw.txt`（10:41:32）。唯一那枚红是
+  `test_extract_pg_live.py::test_验收5_last_analyze_at_按两列取较晚者_视图与未分析过的表留空`
+  末段那句 `assert analyzed` → `assert []`，它断的是**源库的统计信息**而不是本仓代码，本片用例
+  一字未动过那份文件。**成因这次按两枚只读数分得开**（`evidence/stats_probe040.txt`，凭证只从
+  gitignored 的 `.setup/demo_pg_ro.env` 读、口令一个字不打印）：`pg_postmaster_start_time()` =
+  **2026-10-26 09:04:53**（早于本轮闸的起跑），本库 `pg_stat_database.stats_reset` = **NULL**
+  （没人跑过 `pg_stat_reset()`），全场 **0/11** 张表带 analyze 印记且 `n_mod_since_analyze` 全 0、
+  `customer` 那一行 `vacuum_count=autovacuum_count=0`。这一组读数是"统计视图在那一次重启后没被填回来"
+  的形状，不是"表被重建"也不是"有人手工清空统计"。**闭法与 037、P4-034 同一把**：由**源库属主**
+  （role `postgres`）在 `ai_web_demo_pg` 上跑一次 `ANALYZE;`——`demo_pg_ro` 不是那 10 张表的属主，
+  PG 的 `ANALYZE` 要表属主或超级用户，这一发我们这边跑不了。零失败那一跑在 ANALYZE 落下后补，
+  所以**本片的闸此刻是"一发已知环境性红"，不写成通过**。
+- **快闸与零迁移**（`evidence/fastgate040.txt`，10:54 落盘，锚 shipped 字节）：`ruff check app scripts
+  tests alembic` All checks passed、`ruff format --check` **211 files** already formatted、
+  `.venv/Scripts/python.exe -m mypy app` **62 files** 零问题，三发各 `rc=0`；artifact 首尾各取一次
+  那六枚 md5（四枚测试 + `executor.py` + `sql_guard.py`）**逐字相同**，两列行尾账见下面那条
+  （三份新字节都在 `ruff format` 之后才跑的用例）。收尾探针
+  `evidence/alembic_current040_close.txt`（10:44:20）回 `0009 (head)`、`versions/*.py` 仍是 **9** 枚，
+  与开工那份 `opening040.txt`（09:36:04）夹住 P5 零迁移这一条。
+- **md5 这一格按行尾重写了一次**（039 踩过同一个坑，本轮提前摊开）：`core.autocrlf=true`，而
+  `conftest.py` 与 `test_datasource_live.py` 在**提交之前**的工作树里本就是 CRLF（461/461、177/177 对
+  CRLF/LF 计数），git 收进去时归一成 LF ⇒ 同一份内容有两个 md5。`evidence/live040.txt` 因此把凭据
+  排成两列：**pytest 读的是工作树那一列**（`bf77dbc7…` / `a8f34078…`），**"跑的就是提交那份"要拿
+  `git show :<路径> | md5sum` 那一列**（`a0e256ec…` / `1222fe9f…`）；新建那两枚文件工作树就是 LF，
+  两列一致（`e843c6d5…` / `cd967ea…`）。差别只有行尾，Python 编译与用例判定都不受影响——这句话写在
+  账上，不由声明。
+- **双轴审查（标准轴）改掉五处，一处都不改判定**：`as_str` 挪到首次使用之前；删掉被同文件另一条完全
+  包含的断言；桩的同义反复改成输入契约（上面那条）；`timeout_ms` 参数化从 5 档收到 3 档（1000 与 15000
+  已由 `test_executor_session.py` 逐字签，重复档位只把红数吹大）；`_guard` 里那句 `sql_final is not None`
+  就地断言而不是把 `None` 往下传。**改掉的两个真风险**：口令回显（上面那条）与"用例名替两层签字"。
+  改完在**新字节**上重跑了变异电池（红数由 8 变 7、绿格由 5 变 4）与三次 pytest，`live040.txt` 旧版
+  那份 13 发的读数**作废留档并注明原因**。
+- **文档读者那一发**：`docs/verification.md` 是 `tests/unit/test_demo_mysql_script.py:52` 与
+  `tests/unit/test_demo_pg_script.py:46` 这两族的 `read_text` 输入，而本节的编辑落在整轮闸**之后**，
+  所以"闸跑过"对这一发不作数——补跑了那两族：**34 passed / rc=0**，两份文件都不连库
+  （`evidence/doc_input_rerun040.txt`：10:57 第一轮、10:58 第二轮、10:59 第三轮锚最终字节）。
+  **为什么要跑三轮**：每一轮都把"上一轮的读数"写进了 verification.md 自己，那份 md5 当场被下一次编辑
+  作废 ⇒ 只有**最后一轮**算数，前两轮留档不采信（与 039 那两份 `out_real_http039*.txt` 同一形状）。
+  行尾那一格同上面那条一个坑：verification.md 工作树整份是 CRLF（1798/1798）而 git 收进去归一成 LF
+  ⇒ 同一份内容两个 md5，**pytest 读的是工作树那一列**（那三对逐字相同的串只住 artifact，本节一个字都不
+  抄——抄进来就会当场改掉被读的那份字节）；提交里那一列由 `git show HEAD:<路径> | md5sum` 在**提交之后**
+  取、回记进同一份 artifact。roadmap/safety 两份是纯 LF，行尾不参与这一格。
 
 
 ---

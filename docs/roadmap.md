@@ -785,7 +785,7 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    记着 13 条用例对八档的映射、七发真 HTTP 回显（`evidence/out_real_http039_take2.txt`，锚 shipped 字节）、
    四轮变异电池与带 md5 自证壳的那轮整轮闸。这里不重述读数，只把"待落"那半句销掉。
 3. 不带 `LIMIT` 的 `SELECT * FROM order_item` → 执行日志见 `LIMIT 1001`、返回 1000 行 + `truncated:true`；
-   **as-built(P5-040 文档半边)：这一格今天的确切状态是"机制已证、字面未跑"，两半都要分开签**。
+   **as-built(P5-040 文档半边)：这一格当时（10-26 上午）的确切状态是"机制已证、字面未跑"，两半都要分开签**。
    机制两半都在场且都在闸内/闸外真跑：钳位由 `tests/guard/test_guard_api.py:41` 那条
    `sql_final == "SELECT id FROM customer LIMIT 1001"` 与同文件 `:51-103` 一整族不变式钉住
    （含 `LIMIT 4990, 5000` → `LIMIT 1001 OFFSET 4990`、"顶层 LIMIT 恒不超过 `max_rows+1`"）；
@@ -795,12 +795,21 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    `test_行数超上限_truncated_true_且_csv_是完整上限行` 用的是 `order_main` + **`row_limit=5`**
    （断 `truncated is True`、`row_count == 5`、csv 6 行含表头）。
    本节字面那组（`order_item` + 1000 行）**真能跑**——`scripts/init_demo_mysql.sql:226` 注释明写
-   order_item 8.8 万行、`:574`/`:585` 有行数自检——只是到今天没人跑过。
+   order_item 8.8 万行、`:574`/`:585` 有行数自检——那时无人在真栈上跑过（本轮 10-26 下午由 040 的 live ① 补上，见下面那格施工半边）。
    **拿 `row_limit=5` 那一发冒充 1000 那一发就是记账不实**（P4-033 被审出的那一族），所以这一格
    由工单 040 的 live ① 补：同一发要同时给 `sql_final` 原文、`row_count`、`truncated`、csv 行数四件事。
    顺带一格闸内预清：`order_item` 8.8 万行会不会先被第二层拦住？不会——
    `settings.py` 的 `QueryGroup.max_explain_rows = 50_000_000`，估行远不到门槛，
    这一发测的是第一层钳位与第三层截断，与 dry-run 无关。
+   **as-built(P5-040 施工半边)：上面那句"字面未跑"已经不作数了，本条两半现在都有实物**。
+   live ① 那一发真连演示库（第二层按夹具关）跑 `SELECT * FROM order_item` + `row_limit=1000`，
+   一次给齐四件事：`sql_final` 原文 `SELECT * FROM ai_web_demo.order_item LIMIT 1001`、
+   `row_count=1000`、`truncated=True`、csv **1001 行**（1 表头 + 1000 数据）；
+   读数 `evidence/probe_live040.txt`，三次 pytest 的绿与字节锚 `evidence/live040.txt`。
+   闸内另有 `tests/unit/test_layer_independence.py::test_钳位在第一层_丢探针行与_truncated_判定在第三层`
+   钉那个 `+1` 是**两个主人之间唯一的契约**（把两处的数错开就是把探针行当真数据——§9.2 ⑧ 那个洞的形状）。
+   既有的 `test_execute_live.py:109` 那一发（`order_main` + `row_limit=5`）**一字未动**：
+   它签的是另一档数字，本条不拿它冒充 1000 那一发。
 4. `SELECT SLEEP(20)` 被黑名单拒；**清空黑名单**后被 `SET SESSION MAX_EXECUTION_TIME=1000` 截断
    （错误来自驱动 timeout 而非守卫）→ 证明分层独立有效；
    **as-built(P5-040 文档半边)：前半在场、后半那句括号按实测要订正**。
@@ -819,6 +828,18 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    既有用例 `test_execute_live.py:177`（`select sleep(1) from ai_web_demo.order_item limit 5`）
    已在签那一族——**严禁**为了让本条变绿把靶换成它（工单 040 已定口径，换了就不是同一条 SQL 的两种归宿）。
    完整口径与实测细节住 safety §4.1 的 as-built(P5-040) 与 §9 那一条新增行。
+   **as-built(P5-040 施工半边)：这一条的后半现在按改过的归因签了字，两半各一发（同一条 SQL）**。
+   live ② = 第一层在场 → 守卫拒，`rule_id = sleep_function`；live ③ = 第一层**整条函数规则**摘掉
+   （`monkeypatch` 掉 `_function_violations`，不是清空 `_SLEEP_FUNCTIONS`——后者只把那枚函数从
+   `sleep_function` 挪进 `danger_function`，那条 SQL 照样被拒，**只换归因不换放行**）之后
+   同一条 `SELECT SLEEP(20)` 由**源库自己把 20s 砍成 ≈1s**：正常返回、`rows[0] == [1]`、耗时 <10s、
+   `SqlGuardError` 与 `QueryTimeout` 两类异常一个都不抬。**"错误来自驱动 timeout"这一半没人签过，
+   因为它在这条 SQL 上没有实物**；3024 那一族继续由 `test_execute_live.py` 那条"每一行都慢"签，
+   本片没有把它拉来冒充（工单已定口径）。闸内反向还有一发：第三层那条超时 SET 摘掉之后
+   `guard()` 与 `explain_statements()` 的产物一字不变——独立性是**双向**的。
+   变异自证（验收 1 要的那格）：删掉 `MAX_EXECUTION_TIME` 那一整行 → 新族 7 红、
+   `tests/unit + tests/guard` 全跑 8 红（多那一枚是既有的 `test_executor_session.py::test_mysql_顺序_with_值`），
+   `evidence/mutation040.txt`。
    **as-built(P5-037)**：这条验收在第二层落地之前只能给**一层**签字（当时第二层零实现），
    "证明分层独立有效"里的"第二层"那半句是空头账。现在第二层有实物了，各层的反证要分开签：
    这一条继续签**第三层独立**（清空第一层的函数规则后由驱动 timeout 拦下）；
@@ -837,7 +858,7 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    顺带一句验收 3 的口径：`MAX_EXPLAIN_ROWS` 在本片第一次被真读，钉子是把阈值钉成 `100`
    让**同一条 SQL** 从放行翻成 `too_costly`（闸内与真库各一发），不是断"它不等于默认值"。
 5. 用非只读账号连数据源时 `test_connection` 报 `readonly_capability_missing`（能力探测前置）。
-   **as-built(P5-040 文档半边)：这一条只有正半真跑过，反半今天没有记录**。在场的是：
+   **as-built(P5-040 文档半边)：这一条当时只有正半真跑过，反半没有记录**。在场的是：
    判决纯函数 `grants_verdict`（`datasource_service.py:192-217`，非只读时 `code` 就是那一枚）、
    `test_connection`（`:301`，`:368` 把 verdict 塞进 `grants` 字段）回 **200 + 可 switch 的码**
    （黄色警告不阻断，admin 可确认；契约 `schemas/datasource.py:88-89`/`:107`）、
@@ -851,7 +872,15 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    凭证已不再是障碍：用户 2026-10-20 授权用 `backend/.setup/my_login.cnf` 那把，本轮已按工单纪律
    先跑**只读** `show grants` 核实它确为非只读（两行 grant、命中告警词 `all` 与 `grant option`、
    `grants_verdict` 回 `read_only=false` + 那一枚码；`evidence/{grants_raw040,grants_verdict040}.txt`，
-   口令一个字不入账）。反半那一发由 040 施工半边落，**跑出来之前本条不许写成已过**。
+   口令一个字不入账）。
+   **as-built(P5-040 施工半边)：反半那一发已经真跑过，本条现在两半都有实物**。
+   `tests/integration/test_datasource_live.py::test_非只读账号探得出缺失能力_但登记那道闸门仍然打开`
+   真连那把非只读账号一次，断的是四格：HTTP **200**（登记那道闸门不关）、`ok:true`（连得上与只读不只读
+   是两件事）、`grants.read_only:false` + `grants.code == "readonly_capability_missing"`、
+   以及 `grants.warnings` **非空**（只给码不给原文行，用户没法自己核对是不是真读错了账号）。
+   执行路那把硬阻断仍由 `tests/unit/test_executor_grants.py:33` 签，**两档不合并**——合成就变成
+   "登记页面拒绝保存"，那是 P7/P9 的表单语义，工单"明确不做"第四条拦的正是它。
+   夹具是 `conftest.py` 新增的 `rw_account`（缺 `my_login.cnf` 就 skip，不把别人的机器卡红）。
    **这一格与执行路那把刀是两档，本片不合并它们**（合成就变成"登记页面拒绝保存"，那是 P7/P9 的表单语义）。
 
 踩坑预警：① **`comments=False` 会把 hint 一起剥掉，造成"守卫看到的 ≠ 执行的"** → 检测到 hint 直接拒；

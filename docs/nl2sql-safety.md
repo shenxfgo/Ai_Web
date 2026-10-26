@@ -872,18 +872,26 @@ SET SESSION autocommit = 1;
   多一次 `SHOW GRANTS` 往返（源库内网 ≈1ms，可接受）；`data_sources.readonly_enforced` 是用户在
   表单里勾的自报家门列，**不作为阻断依据**，只作 UI 提示。
 
-  > **as-built(P5-040 文档半边)：本节的"两档"里，非只读那一边的证据今天只有一档半**。
+  > **as-built(P5-040)：本节的"两档"里，非只读那一边的证据现在两档都有实物**（上一版这一条的标题
+  > 写的是"只有一档半"，那是 040 文档半边的账，本轮按实物改口，原话留在下面一句里不抹）。
   > 执行路（硬阻断）两档都有实物：`tests/unit/test_executor_grants.py::test_非只读账号硬阻断`
   > （`:33`，断 `exc.value.code == "readonly_capability_missing"`）+ `executor.py:314` 那个唯一调用点。
-  > 登记路（200 + 可 switch 的码）只有**正半**真跑过：`tests/integration/test_datasource_live.py:80-81`
-  > 用只读账号 `aiweb_ro` 断 `read_only is True` 且 `code is None`。**反半（拿非只读账号真连一次
-  > `test_connection` → 200 且 `grants.code == "readonly_capability_missing"`）今天没有真跑记录**，
-  > 单元判决用例不算它（那是纯函数，不证明 HTTP 那一档回 200 而不是 4xx）。
+  > 登记路的**正半**由 `tests/integration/test_datasource_live.py:80-81` 签（只读账号 `aiweb_ro`，
+  > 断 `read_only is True` 且 `code is None`）；**反半**（拿非只读账号真连一次 `test_connection` →
+  > 200 且 `grants.code == "readonly_capability_missing"`）由 040 施工半边落
+  > （`test_非只读账号探得出缺失能力_但登记那道闸门仍然打开`，断 200 + `ok:true` +
+  > `read_only:false` + 那一枚码 + `warnings` 非空）。单元判决用例**不算**这一格——它是纯函数，
+  > 不证明 HTTP 那一档回 200 而不是 4xx，这一句在反半落地后仍然成立，留着防的是"拿纯函数用例
+  > 冒充端点真跑"。
   > 凭证不再是障碍：用户 2026-10-20 授权用 `backend/.setup/my_login.cnf` 那把，本轮已按工单纪律
   > 先跑**只读** `show grants` 核实它确实是非只读那把（两行 grant、命中告警词 `all` 与 `grant option`、
   > `grants_verdict` 回 `read_only=false` + `code="readonly_capability_missing"`；
   > 读数 `evidence/grants_raw040.txt` 与 `evidence/grants_verdict040.txt`，口令一个字不入账），
-  > 反半那一发由本片施工半边落。这一格在跑出来之前**不许写成"验收 5 已过"**。
+  > 反半那一发已随施工半边真跑（用例自己再核实一次身份，夹具缺文件就 skip）。
+  > **这一发带一条写法纪律**：口令不外泄那一格不能用 `assert password not in resp.text`——
+  > pytest 的断言重写会把左操作数的**字面值**倒进终端，而这一发用的是本机建库那把（root），
+  > 一次红测就等于把口令贴进 CI 日志；实物是 `if password in resp.text: pytest.fail("…")`，
+  > 只报"发生了"不报"是什么"（与 `conftest.py` 里 `DbAccount.__repr__` 的掩码同一条口径）。
 - 取数：无缓冲 cursor + 逐 1000 行 `fetchmany`，累计到 `max_rows+1` 立即 `cursor.close()`。
   **不做 `KILL <connection_id>`**——`KILL` 是写操作，只读账号本来就无权限，依赖
   `MAX_EXECUTION_TIME` 自杀 + 连接归还前 `ROLLBACK`。这是 MVP 的诚实取舍，写进 known limitation。
@@ -1275,18 +1283,29 @@ def test_allow(sql):
 > 措辞纪律：这一族的标题写的是"**三层**独立性"，而第二层的实物是 037 才有的（见本节末
 > as-built(P5-037) 那条），所以任何一条在 037 之前签的字，签的都只有两层。
 >
-> | 本节条目 | 机制 | 文档字面那一发 | 档位在 040 开工前 |
+> | 本节条目 | 机制 | 文档字面那一发 | 档位在 040 开工前 → **040 施工半边之后** |
 > |---|---|---|---|
-> | ① 不带 `LIMIT` → `LIMIT 1001` + 1000 行 + `truncated:true` | 在场（钳位 `tests/guard/test_guard_api.py:41` 一族、截断 `executor.py:154` `split_truncated` + `tests/unit/test_executor_truncation.py` 四条） | `order_item` + `row_limit=1000` **没跑过**；live 那发在 `tests/integration/test_execute_live.py:109`，用的是 `order_main` + **`row_limit=5`** | **机制已证、字面未跑**（闸内 + live 各一档，缺一格都不算这条签字） |
-> | ② 前半：`SELECT SLEEP(20)` 被黑名单拒 | 在场（`sql_guard.py:112` `_SLEEP_FUNCTIONS`、`:363-366` 出 `sleep_function`） | 必拒语料 `tests/guard/corpus.py:107` 是 `SELECT SLEEP(30)`（**参数不同，同一条规则**） | **闸内已证** |
-> | ② 后半：清空黑名单后被 `MAX_EXECUTION_TIME=1000` 截断，"错误来自驱动 timeout 而非守卫" | 在场（`executor.py:40-55` 第二条 SET、`:232` `classify_source_error`） | **实测这句话不成立**：见 §4.1 的 as-built(P5-040)，CLI 四发回的是"成功返回一行、值 1、~1.3s"，既不是 `SqlGuardError` 也不是 `QueryTimeout` | **未证，且字面待订正**（归因那一半由 040 施工那发在执行器上复现；换靶 = 洗证据） |
+> | ① 不带 `LIMIT` → `LIMIT 1001` + 1000 行 + `truncated:true` | 在场（钳位 `tests/guard/test_guard_api.py:41` 一族、截断 `executor.py:154` `split_truncated` + `tests/unit/test_executor_truncation.py` 四条） | `order_item` + `row_limit=1000` 由 **040 live ① 补齐**（`sql_final` 原文、`row_count`、`truncated`、csv 行数四件事，读数 `evidence/probe_live040.txt`）；既有的 `test_execute_live.py:109` 那一发仍是 `order_main` + **`row_limit=5`**，两者不等价、也不互相冒充 | **闸内 + live 两档各落一格**（040 施工半边；闸内另有 `test_layer_independence.py` 那条"钳位在第一层、丢探针在第三层"的同源契约钉子） |
+> | ② 前半：`SELECT SLEEP(20)` 被黑名单拒 | 在场（`sql_guard.py:112` `_SLEEP_FUNCTIONS`、`:363-366` 出 `sleep_function`） | 必拒语料 `tests/guard/corpus.py:107` 是 `SELECT SLEEP(30)`（**参数不同，同一条规则**）；040 live ② 用的是本节字面那一条 | **闸内已证**（040 另加 live 一发） |
+> | ② 后半：清空黑名单后被 `MAX_EXECUTION_TIME=1000` 截断，"错误来自驱动 timeout 而非守卫" | 在场（`executor.py:40-55` 第二条 SET、`:232` `classify_source_error`） | **实测这句话不成立**：见 §4.1 的 as-built(P5-040)，CLI 四发回的是"成功返回一行、值 1、~1.3s"，既不是 `SqlGuardError` 也不是 `QueryTimeout` | **字面已按实测订正、归因已落闸**（040 live ③ 签的是"第一层摘掉 → 源库自己把 20s 砍成 ≈1s"；**没有换靶**去凑 3024 = 没有把证据洗成结论） |
 > | ③ validate 的 400 形状 | — | 已按实物订正，见本节末 as-built(P5-039) ①②④ | **闸内已证**（039 交付 13 条用例 + 七发真 HTTP） |
 > | ④ ask 的 dry-run 分支返回 400 | 主语错位，实为 P8 | 见 as-built(P5-039) ③ | **本片不适用**（不属于 040 的证据族） |
 
 三条"分层"这个词的**永久**证据（不靠人记得去手工点一遍）由 040 落在两处：闸内的
-`tests/unit/test_layer_independence.py`（同一件 `sql_final` 分别喂三层、三层互不共享状态，
-关键反证是清空第一层黑名单后 `session_statements` 那四条 SET 一个字不变）与
+`tests/unit/test_layer_independence.py`（同一件 `sql_final` 分别喂三层、三层互不共享状态）与
 `tests/integration/test_layer_independence_live.py`（上面①的字面那一发 + ②那一对同一条 SQL 的两种归宿）。
+
+> **as-built(P5-040 施工半边)：上面那句"关键反证是清空第一层**黑名单**后……"按实物换了刀，
+> 这一处是本节自己写错的地方**。实测（§9 那一条 + 工单 040 事实账）：清空
+> `_SLEEP_FUNCTIONS` 只是把那枚 `sleep` 从 `sleep_function` **挪进** `danger_function`——
+> `_function_violations` 的 else 分支拒绝一切 `exp.Anonymous`，所以那条 SQL 照样被拒，
+> **只换归因、不换放行**。闸内那一把真正的刀是**摘掉整条 `_function_violations`**
+> （用例内 `monkeypatch`，`executor.py` 主分支一字未动），live ③ 用的是同一个构造。
+> 独立性还加了**反方向**那一发：把第三层那条 `MAX_EXECUTION_TIME` 换成桩摘掉之后
+> `guard()` 与 `explain_statements()` 的产物一字不变——只签一个方向的话，
+> "第三层的字面里藏着对第一层的补偿"这类写法抓不住。计数与读数（闸内 11 发 / live 3 发 /
+> 变异自证 7 红·全跑 8 红）落 verification §1.11 的"040 施工半边实录"，本节不重述。
+
 **这一节原四条的下面就是它们的原文**，逐条保留不改——留着才看得出档位是从哪一句话改起的。
 
 - 手工提交一条不带 `LIMIT` 的 `SELECT * FROM order_item` → 实际执行 SQL 日志里看到 `LIMIT 1001`
@@ -1348,7 +1367,11 @@ def test_allow(sql):
 > **as-built(P5-037)：上面第二条那句"证明第二/第三层独立有效"，在 037 之前是一句空头账**——
 > 当时第二层零实现（§3 开头那条事实账），那条用例证的从头到尾只有第三层。现在第二层有了实物，
 > 但要分清各层的反证长什么样，别让一条用例替两层签字：
-> ① 第三层的独立反证仍是上面那一条（清空黑名单 → 驱动 timeout 拦下，错误正文来自源库而非守卫）；
+> ① 第三层的独立反证仍是上面那一条，但**字面按 as-built(P5-040 施工半边) 改了**：原来写的是
+> "清空黑名单 → 驱动 timeout 拦下，错误正文来自源库而非守卫"，实测那句话两格都不实
+> （清空 `_SLEEP_FUNCTIONS` 只换归因；`SELECT SLEEP(20)` 在 `MAX_EXECUTION_TIME` 下不产生任何异常）。
+> 现在签的是"**摘掉第一层整条函数规则 → 源库自己把那 20s 砍成 ≈1s**，异常一格都没有"（live ③），
+> 反向再加一发（第三层那条超时 SET 换成桩摘掉 → 上面两层产物一字不变，闸内）；
 > ② **第二层的独立反证是 `dry_run=False` 那一发**（§3.3）：断的是"源库一条 `EXPLAIN` 都没收到"
 > 且真 SQL 照跑、结果一字不变——正向断"没发"，不是断"结果为空"。
 > ③ 一条顺带的归因更正：`SELECT SLEEP(20)` 走不到第二层，第一层的函数规则先命中；
@@ -1362,7 +1385,7 @@ def test_allow(sql):
 | 项 | 现状 |
 |---|---|
 | 服务端查询无法主动 `KILL` | 只读账号没有 `KILL` 权限；依赖 `MAX_EXECUTION_TIME` 自杀 + 归还前 `ROLLBACK` |
-| **`SLEEP()` 这一类在"清空第一层"之后不产生超时错误**（as-built(P5-040 文档半边)） | roadmap §P5 验收 4 后半的原话是"清空黑名单后被 `SET SESSION MAX_EXECUTION_TIME=1000` **截断（错误来自驱动 timeout 而非守卫）**"。实测（`evidence/sleep_timeout_probe040.txt`，MySQL 5.7.17，CLI 四发）**后半个括号不成立**：`select sleep(20)` 在那一档上限下回 `rc=0`、一行 `1`、耗时 ≈1.3s——计时被叫停了（控制组不设上限跑 `sleep(3)` 回 `0`、耗时 ≈3.3s），但**没有异常可归因**，既不是 `SqlGuardError` 也不是 `QueryTimeout`。所以"**同一条 SQL 的两种归宿**"这一族反证，在 `SLEEP` 上能签的是"第一层在场→拒；第一层清空→**源库自己把它的 20s 砍成 1s**"，签不了"由驱动报错拦下"。3024 那一档只在**每一行都慢**的形状上出现（既有用例 `test_execute_live.py:177` 已在签那一族）。**不许**为了验收 4 变绿把这一条换成那个形状（工单 040 已定口径：换了就是把证据洗成结论）。执行器那一发的归因由 040 施工半边真跑后落在这里，跑出来之前本节只承诺"文档字面这句话要订正"，不承诺"第三层在这一类上独立有效" |
+| **`SLEEP()` 这一类在"清空第一层"之后不产生超时错误**（as-built(P5-040 文档半边)） | roadmap §P5 验收 4 后半的原话是"清空黑名单后被 `SET SESSION MAX_EXECUTION_TIME=1000` **截断（错误来自驱动 timeout 而非守卫）**"。实测（`evidence/sleep_timeout_probe040.txt`，MySQL 5.7.17，CLI 四发）**后半个括号不成立**：`select sleep(20)` 在那一档上限下回 `rc=0`、一行 `1`、耗时 ≈1.3s——计时被叫停了（控制组不设上限跑 `sleep(3)` 回 `0`、耗时 ≈3.3s），但**没有异常可归因**，既不是 `SqlGuardError` 也不是 `QueryTimeout`。所以"**同一条 SQL 的两种归宿**"这一族反证，在 `SLEEP` 上能签的是"第一层在场→拒；第一层清空→**源库自己把它的 20s 砍成 1s**"，签不了"由驱动报错拦下"。3024 那一档只在**每一行都慢**的形状上出现（既有用例 `test_execute_live.py:177` 已在签那一族）。**不许**为了验收 4 变绿把这一条换成那个形状（工单 040 已定口径：换了就是把证据洗成结论）。执行器那一发的归因**已由 040 施工半边真跑并落在这里**（live ③：`SELECT SLEEP(20) LIMIT 1001` 在第一层整条函数规则摘掉之后正常返回、`rows[0] == [1]`、耗时 <10s、两类异常都不抬；读数 `evidence/probe_live040.txt`），所以本节能签的是"**第三层在这一类上把 20s 砍到 1s**"，**签不了**"第三层在这一类上产生可归因的错误"——后一句实物不存在，谁要写它就得先造一个真会超时的形状。闸内另有一发钉反方向（第三层那条超时 SET 摘掉 → 第一层与第二层的产物一字不变），它钉的是"独立性是双向的"，不改本行这一条的归因 |
 | 笛卡尔积检测 | **as-built(P5-037)：这一行整行重写**。原话"只对'无 join 条件的逗号连接'硬拒，其余放行（误报率高）"有两处与实物不符：① 落点不在第二层，第一层就能看见（`_join_violations`，§1.2 ⑥.1）；② 拒的**比原话宽**——`FROM a JOIN b`（不写 `ON`）与逗号连接在 AST 与重生成文本两侧都逐字同形，AST 分不开。今天真正挡住的是"某个 scope 里 `on`/`using`/`side`/`kind`/`method` 五格全空 **且该 scope 没有 `WHERE`**"；真正**仍放行**的是 `CROSS JOIN`、`STRAIGHT_JOIN`，以及"无条件笛卡尔积 + 一个无关 `WHERE`"（`FROM a, b WHERE a.x > 1`，实测与合法老式写法同构，再往下判要把连接图重建一遍）。交付记录里不许写"笛卡尔积已全面挡住" |
 | 第二层估行是**引擎估算**不是真行数 | `EXPLAIN` 的 `rows` 来自统计信息。`ANALYZE` 没跑过、或统计过期时，阈值会按一个错的数裁（可能误拒也可能漏放）。这一层是**代价闸门**不是**正确性闸门**：它不改变第一层与第三层的任何判定，关掉它防御仍成立（§3.3） |
 | 每条问数在源库上多一次往返 | `AIWEB_QUERY__DRY_RUN` 默认 `true`（2026-10-20 拍板），代价就是这一次 `EXPLAIN`。它和真 SQL 用同一条连接、同一个只读会话，所以不是"多建一次连接"；prod 被 `check_env` 锁死不能关，dev 想省这一次要自己改键（§3.3） |
