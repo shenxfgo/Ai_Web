@@ -67,7 +67,8 @@ Windows 上没有 `make` 时，把上面的 `make X` 换成 `powershell -File sc
 ## 两条硬约束
 
 1. **源库只读**：连接用只读账号，会话级 `READ ONLY` + 语句超时 + 行数上限，SQL 先过白名单守卫再 `EXPLAIN` 试算。
-   规则与被拒语料见 [docs/nl2sql-safety.md](docs/nl2sql-safety.md)。
+   规则与被拒语料见 [docs/nl2sql-safety.md](docs/nl2sql-safety.md)；其中 `EXPLAIN` 那一层的行为证据今天只对
+   **MySQL** 签过字——PG 那一支只交 SQL 形状、执行路直接 501（同一文档 §3.1）。
 2. **业务数据不进元数据库**：元数据库只存"关于表的知识"；查询结果写 `data/results/` 下的 CSV 供下载。
 
 ## 依赖版本的理由

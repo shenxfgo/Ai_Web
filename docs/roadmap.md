@@ -908,6 +908,127 @@ roadmap 的六条验收与 spec `docs/specs/2026-10-02-p4-hybrid-retrieval.md` �
    用户 2026-10-20 在本片工单格子 ① 拍板**本轮不设**、要设另开工单；
    差额账记在 safety §9.2 最后一行。踩坑 ④ 到这是**闭账**（按实测落成"只有一个在挡"），不是残留。
 
+### P5 验收收口（as-built(P5 交付)，工单 041）
+
+**读法先钉三处**：
+
+- ① **编号**：本节五条按 **roadmap §P5** 的验收 1~5，与每张工单自己的"验收标准 1~N"是**两套编号**，
+  既有实录里混用过（`evidence/probe_live040.txt` 第 3 行那句"验收 2"说的是工单 040 的验收 2 = 本节第 3 行）。
+  带日期的记录冻结在那一刻、**不改写**；本节起新写的格子一律按 §P5，要引用工单编号时显式写"工单 0NN 验收 K"。
+- ② **"已证"的门槛是两格同时在场**：一份 `.scratch/p5-sql-guard-hardening/evidence/` 下的文件路径
+  **加**一个 `grep "def test_"` 找得到的用例名。缺任一格就按"字面未跑 / live-only / 未跑且缺什么"写——
+  P4-034 的 §1.10 那族（把"应当如此"写成"已经跑过"）就是这么被抓的。
+- ③ **实物主体在工单 041 的"041-A 事实盘点表"**（`.scratch/p5-sql-guard-hardening/tickets/041-P5收口.md`；
+  `.scratch/` 由 `.gitignore:244` 排除、不进提交面，所以本节是它的**誊写**而不是它的指针）。
+  读数只住 evidence 文件，本节不重抄——040 那条"往文档里写轮数，本身就多要一轮"的教训仍成立。
+
+**零迁移**（"P5 是零迁移片"那句的实物）：`evidence/opening041.txt`（2026-10-26 11:43:12，rc=0）回
+**`0009 (head)`**、`alembic/versions/*.py` 计数 **9**；同一份文件还夹住开口时的 HEAD=`645a7f3`、工作树未提交
+文件数 0、`origin/main=e578805 · ahead=7` 三格。035~041 七张工单没有一张落迁移、没有一张动 ORM 列定义
+（038 那个 `retries` 是 `guard_result` 那块 JSONB 里扩出的形状，不是列，见 metadata-model §2.7 第 ⑦ 条）。
+收尾那一发（再读一次 `alembic current`）归收口半边那一笔提交——**本节此刻只签开口这一发**。
+
+| 验收 | 状态（四档之一） | 独立真相源（evidence 文件 + 用例名，读数在文件里） |
+|---|---|---|
+| 1 `pytest tests/guard -q` 全绿（含攻击语料全部） | **已证**（041 本轮真跑，不是继承 037 那一跑） | `evidence/guard041.txt`：`234 passed, 2 skipped in 1.02s` · rc=0，起跑前后 `sql_guard.py`/`dry_run.py`/`corpus.py` 三枚 md5 逐字相同（同一命令**不带第二个 `-q`**：`backend/pyproject.toml:65` 的 addopts 里已有一个，再加会把 `N passed` 那行本身压掉）。**净增链逐文件点名**（下面记的是**逐文件收集数**，与语料条数是两把尺，差额见本节末）：186（P5 开工前 = `test_reject_corpus` 54 + `test_allow_corpus` 20 + `test_corpus_mutation` 90 + `test_guard_api` 8 + `test_postgres_dialect` 14）→ 035 **+8**（新文件 `test_rule_id_closed_set.py`）= 194 → 036 **+19**（`test_regeneration_invariant.py` 18 条 + rule_id 一族 8→9）= **213**（`collect036.txt`）→ 037 **+23**（`test_cartesian_product.py` 14 条 + `corpus.py` 带动：reject 一族 54→57、allow 一族 20→21、变异 90→95）= **236** → **038/039/040 在 `tests/guard/` 净增 0**（本轮 `git log --name-only` 亲验：这三张一笔都没落进该目录，新用例全在 `tests/unit/` 与 `tests/integration/`）。本轮逐文件收集：allow 21 / cartesian 14 / mutation 95 / guard_api 8 / pg_dialect 14 / regen_invariant 18 / reject 57 / rule_id 9 = 236 = 234+2（这一列的全行住在 `guard041.txt` 末尾那段"041-C 补测"，锚的是同一批三枚 md5、前后逐字相同）。那两条 skip 是 `tests/guard/test_corpus_mutation.py:61` 那对既有靶子缺失（"没有 表名换成系统表 的靶子"与"没有 改成 INTO OUTFILE 的靶子"），035 之前就在、P5 一条未新增。**收集数与语料条数是两把尺**：`test_allow_corpus.py` 收 21 = 19 条参数化 + 该文件两条非参数化用例（`:32`、`:43`），所以 037 那格的"allow 20→21"是文件那一头，语料那一头是 **18→19**；reject 那一头两把尺刚好重合（57=57）。**"攻击语料全部"的核法**：语料条目本轮实测 `REJECT_CASES` **57** / `ALLOW_CASES` **19**（定义处按 artifact 逐字：`ALLOW_CASES` 在 `corpus.py:31`、`REJECT_CASES` 在 `:69`；两个数是同一命令量的）。safety §8.1 那张表列的是 34 条编号（个别编号含两支 SQL）、§8.2 列 10 条，标题各自写的是下限（"≥15"/"≥6"）——**清单比语料短不是矛盾**：语料里多出来的那些条是**同形状的变体**（跨库前缀的三支、变量/参数那一族的四支、`ALTER`/`GRANT` 两支、037 的三条笛卡尔积、以及 §8.1 表外那两条非 SQL 文本用例的形状），逐枚期望值分布住在 §1.1.1 那把尺子里（"57 条期望值逐条相加正好 57"、有语料的枚举手 18 枚），本节不重抄也不新造第四把尺。工单 041"事实账"那句"文档 34 vs 实物 54"量的就是这两把尺、且 54 是 037 之前的语料数（`corpus.py` 的条目只在 037 动过——036 那一笔改的是归因注释，条目一字未动，见其施工半边提交说明），本节把它的口径写成上面这一句 |
+| 2 `POST /api/chat/validate {"sql":"SELECT 1; DROP TABLE users"}` → 400 `code` + `rule_id` | **已证**（039 交付，041 收口在同一套 shipped 字节上再跑一遍） | 用例：`tests/integration/test_chat_validate_pg.py`（收集 **13** 条）里 `:88 test_多语句被拒时守卫那一档从HTTP那一头看得见`。实录：`evidence/out_real_http041.txt`（本轮真 uvicorn 进程 + 真 socket 的 R1~R7 七发）与 `evidence/out_real_http039_take2.txt`（039 shipped 字节那一版）——两份的**脚本自写那一段**（041 那一份在脚本自写段之后还接了本半边的叙述，那一段不参与比对；段界与逐行读数住在 artifact 里，本节不抄数）滤掉 `pid=` 那一行后 `diff` 为空——命令、段界与 rc 记在 `out_real_http041.txt` 末段——所以七发读数只住 041 那一份。**400 按实物是两格**：`error.code == "sql_guard_rejected"` **且** `error.detail.rule_id == "multi_statement"`，本节顶层那对 `{code, rule_id}` 是简写、不是第二种响应形状（用户 2026-10-20 在工单 039 格子 ① 拍板不为验收字面新开扁平形状；全仓只有 `errors.py` 一个信封，见 safety §8.4 末的 as-built(P5-039)）。**一处引证本轮按实物改指**：`real_http039.py:204` 的输出路径是硬编码的，041 这一发于 2026-10-26 11:47 把同名旧抄件覆盖销毁（现存那份 `out_real_http039.txt` 只有一行说明），safety §9.2 与 verification §1.11 两处指向本名的引证已改指 take2 / 041 两份 |
+| 3 不带 `LIMIT` 的 `SELECT * FROM order_item` → 日志见 `LIMIT 1001`、返回 1000 行 + `truncated:true` | **已证**（机制与真跑两半都在场；本节 10-26 上午那格"字面未跑"已由 040 施工半边销掉） | 真跑：`evidence/probe_live040.txt` 段 ① + `evidence/live040.txt`（三次 pytest 各绿 + 字节锚），一次给齐四件事——`sql_final` 原文、`row_count`、`truncated`、csv 行数。用例：`tests/integration/test_layer_independence_live.py:100 test_不带_limit_的宽表查询_加_one_由第一层做_丢探针由第三层做`；那个 `+1` 作为**跨层唯一契约**由 `tests/unit/test_layer_independence.py:211 test_钳位在第一层_丢探针行与_truncated_判定在第三层` 钉。既有 `tests/integration/test_execute_live.py:109`（`order_main` + `row_limit=5`）签的是**另一档数字**、一字未动，本节不拿它冒充 1000 那一发。钳位一族的钉子仍在 `tests/guard/test_guard_api.py:41` 与 `:51-103`（含 `LIMIT 4990, 5000` → `LIMIT 1001 OFFSET 4990`、"顶层 LIMIT 恒不超过 `max_rows+1`"） |
+| 4 `SELECT SLEEP(20)` 被黑名单拒；清空黑名单后被 `MAX_EXECUTION_TIME` 叫停 → 证明分层独立有效 | **前半已证；后半按订正过的归因才签了字**（原话那句括号**没有实物、没人签过**，见下一格） | `evidence/sleep_timeout_probe040.txt`（CLI 四发实测，MySQL 5.7.17）+ `evidence/probe_live040.txt` 段 ②③ + `evidence/live040.txt` + `evidence/mutation040.txt`。用例：`:131 test_同一条_sleep_默认被第一层拒_归因是_sleep_function`（②）与 `:144 test_摘掉第一层整条函数规则之后_同一条_sleep_由计时器叫停而不是由错误中断`（③）。**两句要写在面上**：(a) 括号那句"错误来自驱动 timeout 而非守卫"在 `SELECT SLEEP(20)` 上签不了——③ 断的是"语句成功、`rows[0]==[1]`、耗时 ≈1s、两类异常一个都不抬"，3024 那一族继续由 011 既有的 `test_execute_live.py:164`（`test_慢查询被超时真中断_错误点名配置来源`，docstring 里"必须每行都慢"那一句就是它绕过 `sleep(2)` 单行形状的理由）签，040 未换靶（换了就不是同一条 SQL 的两种归宿）；(b) "清空黑名单"那把刀**字面写错**：清空 `_SLEEP_FUNCTIONS` 只把 `sleep` 从 `sleep_function` 挪进 `danger_function`（只换归因不换放行，闸内由 `tests/unit/test_layer_independence.py:102` 钉着），真刀是摘掉整条 `_function_violations`。**第二层独立**另由 037 那两族签（见上面要点段 as-built(P5-037 施工半边)），三层共用的词表反证由 `:247 test_三层的判定共用同一枚词表但互不覆盖成员` 钉 |
+| 5 用非只读账号连数据源时 `test_connection` 报 `readonly_capability_missing` | **已证**（正半 011 起在场；反半 040 第一次由真账号回答） | `evidence/grants_raw040.txt` + `evidence/grants_verdict040.txt`（先按工单纪律只读 `show grants` 核实那把账号确为非只读：两行 grant、命中告警词 `all` 与 `grant option`；`grants_err040.txt` 为 0 字节，口令一个字不入账）+ `evidence/live040.txt`。用例：反半 `tests/integration/test_datasource_live.py:140 test_非只读账号探得出缺失能力_但登记那道闸门仍然打开`（断四格：HTTP **200**、`ok:true`、`grants.read_only:false` + `grants.code`、`grants.warnings` **非空**）；执行路硬阻断 `tests/unit/test_executor_grants.py:33`；判决纯函数一族 `tests/unit/test_source_probe.py:96-163`。**两档不合并**（合成就变成"登记页面拒绝保存"，那是 P7/P9 的表单语义）。夹具 `rw_account` 缺 `my_login.cnf` 就 skip，不把别人的机器卡红 |
+
+**五格之外，收口时必须一起写的账**（工单 041 涉及层·账）——**都不许因为"P5 收口了"就当成已闭**：
+
+1. **覆盖面按真实写**：白名单这把尺今天有**三份实物、只两两对上**。有用例钉的是
+   **validate ↔ 检索那一路**（`tests/integration/test_chat_validate_pg.py:396 test_validate构造的白名单与检索那一路逐枚相等`）；
+   **validate ↔ `kb_service.required_card_count_stmt()`（`app/services/kb_service.py:626`，读取点 `:690`）的集合相等没有用例**——
+   本轮 grep：这个符号在 `backend/tests/` 下只出现在 `test_chat_validate_pg.py:191` 的 **docstring** 里，零调用点。
+   所以收口口径只能是"检索 ↔ 校验已对齐、卡片数口径未对表"，**不许写成"三口径已对齐"**。归 **P6**
+   （grants 落地时那把尺本来就要重定）。这条是 039 交下来的三条之一，041 的处置 = **认领为 P6 的契约账**。
+2. **守卫 `table_not_allowed` 的 message 两处文本缺陷：按拍板不动实物**（用户 2026-10-26 选定"记成 P6/P7 的
+   契约账"）。缺陷内容与为什么不动（改它 = 动 `sql_guard.py` 字节，现下锚着这枚 md5 的证据逐份点名、
+   以它为变异靶的电池三枚的名字，都住 safety §9 那一行与 `evidence/guard041.txt` 的"041-D 段"；
+   **本节不抄那个数**——收口半边每多一份证据，数就变一次）住
+   safety §9 那一条新增行，本节不重述。P5 因此对 `sql_guard.py` 的 message 文本**零改动**。
+3. **`executor.py:320-322` 那句告警文案说不存在的兜底**（"降级靠驱动侧连接超时"——`connect_timeout` 管握手、
+   语句跑起来以后不在场，见上面踩坑 ④ 的实测）。同一笔 P6/P7 契约账，与 1193 那条降级支一起收；
+   动它 = 动 `app/` 字节，本片没动。
+4. **"同一事实三个对外键名"这笔账 039 已经订正文本、041 只补归口**：safety §8.4 ② 那句"只做在一处映射"
+   由 039 施工半边删掉并已写明三个键名（`error.detail.rule_id` / `guard_result.violations[].code` /
+   `guard_result.retries[].rule_id`），并留了"账记在工单 041"那句。041 的处置 = **把它落成 P6/P7 的对外契约账**
+   （端点面一旦对外，同一枚 `rule_id` 该以哪个键名出去要一次定死）。**这一格不是本节改的**，别记成本片的功劳。
+5. **`read_timeout` 仍不设**：踩坑 ④ 已按实测闭账（只有一个在挡），设它 = 新增能力，用户 2026-10-20 在
+   工单 040 格子 ① 拍板本轮不设。差额账在 safety §9.2 最后一行，那张"开工单的门口"留着。
+6. **`second_layer_off` 两处重复不收拢**：`tests/integration/test_execute_live.py:41` 与
+   `tests/integration/test_layer_independence_live.py:49` 各定义一次且逐字相同（本轮 grep 亲验）。
+   041 的立场 = **继续不拢**——收拢要动 011 那张底的夹具，属改功能不属收口。账原样留给 P6。
+7. **端点面是 P8 的接单面，不许被 P5 收口写成"已交付"**：本轮亲验 `app/api/endpoints/chat.py` 只有
+   **一支**路由（`:21 @router.post("/chat/validate")`），`app/api/router.py` 共 6 支 include
+   （health / auth / datasources / sync / kb / chat）。architecture §7 那些"文档有、实物无"的行已在
+   §7 表里逐行点名归属（`POST /chat/ask` 与 `rerun`、结果下载、`GET /sync/jobs` 列表与详情、
+   `cancel`/`retry`、`/datasources/{id}/grants`、`/metadata/*`、`/kb/status`、`/kb/terms`、`/chat/history`、
+   `/stats/overview`、`/settings/index-profiles`）。
+8. **`cancelled` 仍然一个写入点都没有**：本轮 grep 全 `app/` 只有一处字面 `'cancelled'`——
+   `app/models/meta.py:279` 那条 CHECK。`cancel_requested` 列不存在，P3 收口起如此。
+
+##### 键账（工单 041 涉及层·键，逐枚三格；禁用"待接"）
+
+| 键 / 格子 | 出生处（文件:行） | 读取点（文件:行） | 无主归谁 |
+|---|---|---|---|
+| `AIWEB_QUERY__DRY_RUN` | 037 新键：`app/settings.py:202`（默认 `True`）、`backend/.env.example:106` | `executor.py:332`（链路唯一生效点）；`scripts/check_env.py:116`（prod 策略闸，不是这条链路的开关） | **已闭**（037） |
+| `AIWEB_QUERY__MAX_EXPLAIN_ROWS` | 出生在 **P1 的配置层**（`ffdfa6b` 把这一格写进 `settings.py` 与 `.env.example`；§4 那张清单里**没有**这一枚，见下面 §4.1 那条"清单里没有而实物在场"）：`settings.py:195`、`.env.example:105` | 037 第一次被真读：`executor.py:337` → `dry_run.py:82` | **已闭**（037；尺子取逐行最大值，见 ADR-0002 补记二） |
+| 回喂封顶"最多 1 次" | **故意没有键**：`pipeline.py:180-183`（注释三行 + `_MAX_RETRIES: Final = 1`；"做成 `AIWEB_*__MAX_RETRY` 就是往配置面塞 roadmap 没要的旋钮"） | 同处 | **已闭**（038）；要开键 = 另开工单 |
+| `AIWEB_GUARD__STRICT` / `__MAX_STATEMENTS` / `__FORCE_LIMIT` / `__DANGLING_EXTRA_RULES`、`AIWEB_QUERY__HARD_LIMIT` | §4 env 清单的**分组 8**（"SQL 守卫与查询执行"那一段，清单原貌）。**本表不写本文档的行号**：本节插进去的那一百行正把它们往下推，写进去的每一枚当场就漂 | 无——逐枚判定住 safety §9.2 那几行（`FORCE_LIMIT`/`HARD_LIMIT` 的行为由代码固定；`DANGLING_EXTRA_RULES` 未实现） | **不是无主键**：§4 那三行 as-built 已判"不建"，清单留作设计期原貌 |
+| §4 清单里那 **4 枚从未出生的键** | 只在 §4 env 清单的**分组 8**（同上，不写行号）；`backend/app` 与 `.env.example` grep **零命中** | 零 | `MAX_TIMEOUT_MS`（全局天花板——`resolve_timeout`（`executor.py:208-213`）没有任何上限裁剪）归 **P6/P10**；`CELL_MAX_CHARS` 的实物住在另一组（`AIWEB_RESULT__MAX_CELL_CHARS`，`.env.example:113`）——**改名即闭**；`READONLY_SESSION` 与 `USE_SESSION_MAX_EXEC_TIME` 的行为由代码固定、**已被决定不做开关**（`executor.py:267` 注释），归 **§4.1 的文档账**（下面那节） |
+| 三枚**有键、有字段、零读取点** | `settings.py:193` `concurrency_per_ds`、`:194` `rate_limit_per_user_per_min`、`:196` `allow_sql_edit`；`.env.example:103`、`:104`、`:107` 三行都写 | 零（本轮再核仍零） | 前两枚归 **P8**（SSE 并发闸与每用户速率），第三枚归 **P8 的 `rerun`**——它绑的语义是"用户手改 SQL 后重跑"，接在 039 的 validate 上等于把一个键的含义改写成"能不能校验" |
+| `AIWEB_QUERY__ROW_LIMIT` / `__TIMEOUT_MS` | `settings.py:191`、`:192`；`.env.example:101`、`:102` | `resolve_row_limit`（`executor.py:216`）、`resolve_timeout`（`:208`） | **已闭**（011）；P5 只改了钳位语义（safety §9.2 ⑧），没动这两枚键 |
+
+##### 无主账刷新（P5 收口这一刻仍无主的，逐条给归口）
+
+1. **P4 账 11**（"直连库发只读 SELECT 的记法"待追认）：040 的那一发源库探针已按同一记法落盘
+   （`grants_raw040.txt` 只留 grant 原文、凭证运行时读），追认与否仍**待用户认**。
+2. **P4 账 12**（源库 `ANALYZE` 没有脚本入口）：仍无主，而且本轮又付了一次税——
+   `tests/integration/test_extract_pg_live.py:641` 那道 `last_analyze_at` 守卫在 10-19、10-21、10-26
+   三次重启后各红一次（P5-040 补账②那一跑回到零失败靠的是本人再补一发 `ANALYZE;`）。
+   **闸门对源库维护状态的依赖今天仍然只能靠人**，这一格归 P10。
+3. **覆盖面那半条**（上面账 1）归 **P6**。
+4. **message 文案那三处**（上面账 2、账 3）归 **P6/P7 契约账**，用户 2026-10-26 拍板。
+5. **对外键名那三个**（上面账 4）归 **P6/P7 契约账**，041 落成账、不改 039 的文本。
+6. **`read_timeout`**（上面账 5）归那张"另开的工单"，本轮不设。
+7. **`second_layer_off`**（上面账 6）归 **P6**。
+8. **PG 的第二层**：037 交付的是 SQL 形状，执行路对 PG 直接 501，所以"PG 的 dry-run 行为正确"这句话
+   今天**没人能签**，本节也不签。归 **P6/P10**（PG 真链路本身是 P6 之后的事）。
+9. **`cancel` / `retry` / `GET /sync/jobs`** 与端点面其余：P3 起就挂着，仍归 **P8**（见上面账 7）。
+10. **`AIWEB_RETRIEVAL__CATALOG_DIGEST_MAX_TABLES`**（`settings.py:166` 有字段、`.env.example:88` 有值、
+    读取点零）：它绑的是**检索阶梯 L2**（LLM 目录摘要选表），那一层到今天没有任何一张工单认领过
+    （009 起交付的是 L1，P4 补的是向量路与融合）。归 **L2 本身**，出处与核对口径住 §4.1 那一条 as-built(P5-041)。
+11. **`too_large` 的 `detail.field` 那一格没有用例签**：039 的七发真 HTTP 里 `field: null` 逐字可查的只有
+    `multi_statement` / `table_not_allowed` / `empty_statement` 三枚，`too_large` 不在七发里，它的 `null`
+    今天只由源码事实签（构造那条 `SqlGuardError` 时没传 `node`，默认值 `None`）。收拢它 = 给
+    `test_超过长度上限拒在too_large` 补一格 `field` 断言——那是新增断言，不属 041 的收口半边
+    （本片明确不做"新增功能/键"，也不在收口那一刻动测试面的尺子）。归 **P6/P7 契约账**，
+    细节与边界口径住 safety §8.4 那条 as-built(P5-041) 的 ④。
+
+##### "三层"措辞全仓判定（工单 041 涉及层·文档，`grep` 逐处判定）
+
+尺子与分布落盘 `evidence/threelayer041.txt`（含命令原文、跑前跑后的字节锚与三处原文的 before/after）。
+**命中数不进正文**：这一族句子本身住在 docs 里，所以任何抄进本节的数字都会在下一跑被本节自己改掉——
+040 那条"往文档里写轮数，本身就多要一轮"是同一件事。artifact 里的分布只对它自己那次测量有效
+（`threelayer041.txt` 明写了它是"041-C 已落之后"量的，并留了 041-A 盘点那一刻作对照）。
+判定看的是下面那三处原文，不随计数变，收口这一笔（含 `backend/app` 那一处 docstring）落完会再跑一发尺子：
+
+1. **矛盾一处，本轮已订正**：§4 env 清单**分组 8** 里 `AIWEB_QUERY__DRY_RUN=true` 那一行的行尾注释原写
+   "关掉即失去**第三层**防御"（按内容认字、不写行号：本节就在同一枚文件里，行号当场漂），而这一格管的是
+   **第二层**（`settings.py:202` → `executor.py:332` → `dry_run.py`），第三层那四条 SET 与它一字无关。
+   现在按实物改成"关掉即失去**第二层**代价闸门（第三层那四条 SET 一字不动）"。
+2. **待判→拍板就地订正一处，归施工半边**：`app/services/datasource_service.py:197-198` 的 docstring 把三层
+   并列、六行内无方言限定，而 PG 的第二层今天只交文本、零真库证据（见上面无主账 8）。
+   用户 2026-10-26 选定"就地订正、加一句限定"；它动的是 `app/` 字节，按"文档与代码分开提交"落**收口半边**那一笔。
+3. **顺带一处，本轮已订正**：根 `README.md:69`（不含"三层"字面、同一判据）那句"SQL 先过白名单守卫再
+   `EXPLAIN` 试算"同样无 PG 限定，本轮加一句限定。
+4. **其余命中判 OK**：三层各自独立有效是本片标题的立论，文档里绝大多数命中就是这个论断的叙述；
+   ADR-0002 的补记一/二/三与 safety §8.4、§9 那些行都带着"哪一层在哪一档没证据"的限定语，
+   没有留下"文档说三层、实物两层"未标注的一格——**唯一的例外就是上面第 1 条，它已改**。
+
 ### P6｜多用户与数据源级权限贯通（3 人日）
 
 要点：`require_role("admin")` 依赖工厂；grants 生成 `EXISTS` 过滤片段注入向量与关键词两路；
@@ -1135,7 +1256,7 @@ AIWEB_QUERY__HARD_LIMIT=5000           # LIMIT(+1) 注入的值上限
 AIWEB_QUERY__TIMEOUT_MS=8000           # 默认；数据源级可覆盖
 AIWEB_QUERY__MAX_TIMEOUT_MS=30000      # 全局天花板，UI 不许超过
 AIWEB_QUERY__CELL_MAX_CHARS=2000       # 超长文本列截断，防结论 prompt 爆
-AIWEB_QUERY__DRY_RUN=true              # 关掉即失去第三层防御，prod 禁止关
+AIWEB_QUERY__DRY_RUN=true              # 关掉即失去**第二层**代价闸门（第三层那四条 SET 一字不动），prod 禁止关
 AIWEB_QUERY__READONLY_SESSION=true     # SET SESSION TRANSACTION READ ONLY / default_transaction_read_only
 AIWEB_QUERY__USE_SESSION_MAX_EXEC_TIME=true    # MySQL 走 SET SESSION max_execution_time，不走 hint
 AIWEB_QUERY__RESULT_FLOAT_DIGITS=6
@@ -1195,6 +1316,32 @@ AIWEB_METRICS__ENABLED=false           # 首版不引 prometheus，留位
 - `AIWEB_APP__REQUEST_ID_HEADER=X-Request-Id`（大小写与设计稿的 `X-Request-ID` 以落地文件为准）。
 - LLM 探活/重试等 `PROBE_ON_STARTUP`、`MAX_RETRIES` 类键在落地版里由 `scripts/check_env.py` 承担，
   不再是独立开关。
+
+- **as-built(P5-041)：§4 那两张清单要读成"设计期全量"，不是"今天的开关面"**（逐枚三格的键账在
+  §P5 收口那节，这里只补本节读得通所需的四条口径）：
+  - 分组 8 里 **4 枚键从未出生**：`AIWEB_QUERY__MAX_TIMEOUT_MS`（"全局天花板"没有任何实现点——
+    `resolve_timeout`（`executor.py:208-213`）只做"行上没值才落全局缺省"，不裁上限）、
+    `__CELL_MAX_CHARS`（实物在另一组：`AIWEB_RESULT__MAX_CELL_CHARS`，`.env.example:113`，**改名即闭**）、
+    `__READONLY_SESSION` 与 `__USE_SESSION_MAX_EXEC_TIME`（行为由代码固定、**已决定不做开关**，
+    决定就写在 `executor.py:267` 那行注释里）。`backend/app` 与 `backend/.env.example` grep 零命中。
+  - **两处键名/默认值与实物不同**：清单写 `AIWEB_QUERY__MAX_ROWS=1000`，实物那格叫
+    `AIWEB_QUERY__ROW_LIMIT`（`settings.py:191`、`.env.example:101`）；清单写 `TIMEOUT_MS=8000`，
+    实物默认 **15000**（`settings.py:192`、`.env.example:102`）。按实物读。
+  - **清单里没有而实物在场的键只有一枚**：`AIWEB_QUERY__MAX_EXPLAIN_ROWS`（`settings.py:195`、
+    `.env.example:105`）——设计期清单没有、037 随实现补的键，它是第二层那把阈值尺的唯一开关，
+    037 起才有读取点（`executor.py:337` → `dry_run.py:82`）。**别把它与下面那枚反着读**：
+    `AIWEB_RETRIEVAL__CATALOG_DIGEST_MAX_TABLES` 在清单里活着（本节上面那条"新增，L2 检索阶梯用"的清单行，
+    按内容认字、不写行号），
+    `settings.py:166` 有字段、`.env.example:88` 有值，**读取点今天仍是零**（本轮 grep `backend/app`、
+    `backend/scripts`、`backend/tests` 只命中 `settings.py` 那一格）——它属"有键、有字段、零读取点"那一族，
+    归**阶梯 L2 本身**：P4 交付的是 L1＋向量融合，L2（把候选表目录压成 digest 交 LLM 挑表）到今天
+    **没有任何一张工单认领过**，是一条跨片的无主账，不是 P5 的残留。
+  - **3 枚有键、有字段、零读取点**（`AIWEB_QUERY__` 那一组，第四枚是上面那条 RETRIEVAL 键）：
+    `__CONCURRENCY_PER_DS`（`.env.example:103`）、
+    `__RATE_LIMIT_PER_USER_PER_MIN`（`:104`）、`__ALLOW_SQL_EDIT`（`:107`）——前两枚归 **P8** 的并发闸，
+    第三枚归 **P8 的 `rerun`**（039 为什么不在 validate 上接它，理由住 architecture §7 那一行的 as-built）。
+  - 上面 `DRY_RUN` 那行的注释本轮订正过：它管的是**第二层**代价闸门，第三层那四条 SET 与它一字无关
+    （原句"关掉即失去第三层防御"是错的，见 §P5 收口那节的"三层措辞全仓判定"第 1 条）。
 
 新增键、删减键都只影响 L2/L3 归属，不改变 §3 的分层规则。
 

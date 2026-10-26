@@ -1348,9 +1348,22 @@ def test_allow(sql):
 > ④ **`detail.field` 是一枚"有主人的可空槽"，不是"定位到具体字段"**：`Violation.node` 的默认值是
 > `None`（`sql_guard.py:133`），全仓写入点实测只有三族——`variable_access`（`:397`，`"、".join(sorted(hits))`）、
 > `cartesian_product`（`:460`，那枚表名）、`regeneration_drift`（`:511-557`，036 那四格自校验）。
-> 而 validate 最常拒的那四枚（`multi_statement` / `table_not_allowed` / `empty_statement` / `too_large`）
-> 回的正是 `null`，真 HTTP 回显逐字可查（`.scratch/p5-sql-guard-hardening/evidence/out_real_http039.txt`
-> 的 R1/R3/R4/R6）。所以这一格既不许写成"永远为空"（三族非空），也不许写成"能定位到具体字段"
+> 而 validate 拒得最常露面的那几枚回的正是 `null`——**041 把这句话的证据边界按实物切开**：真 HTTP
+> 回显逐字可查的只有三枚，`multi_statement`（R1）、`table_not_allowed`（R3、R4）、`empty_statement`
+> （R6），那三发的响应体里 `"field": null` 就写在明面上。第四枚 `too_large` **不在那七发里**，它的
+> `null` 今天只由源码事实签：`_preprocess` 抛它时压根没传第三个参数（`sql_guard.py:182-185`），
+> 而 `SqlGuardError.__init__` 的 `node` 默认值是 `None`（`:139`，喂给 `Violation` 再喂给
+> `field`）；闸内用例 `tests/integration/test_chat_validate_pg.py::test_超过长度上限拒在too_large`
+> 的断言只到 `rule_id` 那一格（`:317`），**没断言 `field`**。所以 `too_large` 的 `field` 那一格
+> 不许写成"真 HTTP 回显可查"，也不许由那三枚推——它属"源码签了、用例没签"那一档，收拢它 = 给那条
+> 用例补一格断言，那是动测试面的活，不属 041 的收口半边，账记在 roadmap §P5 的"P5 验收收口"。
+> （**这一处原来指的是
+> `.scratch/p5-sql-guard-hardening/evidence/out_real_http039.txt`，那份 round-1 抄件已于 2026-10-26 11:47
+> 被 `real_http039.py:204` 那个硬编码输出路径覆盖销毁、不可恢复**；本节引的 R1/R3/R4/R6 住在
+> `out_real_http039_take2.txt`（039 shipped 字节那一版），041 收口又在同一套字节上重跑了一遍存进
+> `out_real_http041.txt`——两份的**脚本自写那一段**（041 那份的前半，其后是收口半边的叙述，不参与比对）
+> 滤掉 `pid=` 那一行后 `diff` 为空（命令与 rc 逐字记在 `out_real_http041.txt` 末段，
+> 行数与读数只住这两份文件，本节一个数字都不抄）。）所以这一格既不许写成"永远为空"（三族非空），也不许写成"能定位到具体字段"
 > （今天只有三族有内容）。
 > ⑤ **`default_schema=""` ⇒ 谁在 `check()` 外面调用守卫，谁就必须自带全名**：补全出来的是
 > `QualifiedTable("", "", "order_main")`，白名单里是 `("", "ai_web_demo", "order_main")`，两枚三元组
@@ -1394,6 +1407,9 @@ def test_allow(sql):
 | 第二层的**形参名与传进来的值不是同一族** | `explain_statements(dialect, …)` 收的是守卫那侧的 `dialect` 词表（`mysql` / `postgres`），`executor.py:335` 传的是 `data_sources.kind` 列上的值（实物是 MySQL 那一支，`row.kind` 今天与 `dialect` 同词表）。两枚名字相同的一格在 PG 执行通路落地那天会不会分家（`kind='postgres'` vs 某个内部方言名）今天**没有证据**，`explain_statements` 对没登记过的值当场 `ValueError`（钉子：`test_dry_run_shape.py::test_没登记过的方言当场报错而不是默默当_mysql`），所以真分家时红的是用例而不是线上。**这一格不许写成"已对齐"** |
 | PG 那一支的两个**只在 PG 上才现形**的后果（as-built(P5-037 施工半边)，双轴审查抓出来的） | ① `run_dry_run` 的 `except DBAPIError` 在**逐条发语句的循环内**且不判语句是不是 `EXPLAIN`，所以 PG 那支的 `BEGIN READ ONLY` / `SET LOCAL` 若失败，会被冠成"源库在执行 EXPLAIN 时就拒了这条 SQL"——把我们会话准备阶段的失败报成了用户的 SQL 违规，与 §1.1.1 那条"我们的 bug 不许报成用户的 SQL 违规"相反。② 同一条路径上抛异常即退出，`ROLLBACK` 发不出去，而 `dry_run.py` 自己的注释写的正是"不收回这一个事务，同一条连接下次用会带残留语义"。两支今天**都打不到**（`executor.py:302` 对 PG 直接 501，第二层在只读会话建好之后才跑），所以没有按"补一支分支"处理——为一个取不到的形状写分支，正是本节反对的那类代码。PG 执行通路落地那天这两支必须一起补，且要各配一条用例 |
 | `explain_verdict` 里 `int(line["rows"])` 那一格**没有用例走 str** | 输入实测是 `int`（`probe_explain037.txt` 逐行读数），`int()` 是对驱动边界的归一：不归一时 `str > int` 抛 `TypeError`，那是 500 而不是一个裁决。str 那一支**真库取不到、也没有桩件用例**，所以"归一挡住了什么"这句话今天只有代码为证。它不进 §8 语料（语料驱动不到第二层，§3.2 第 4 条），要钉只能由假连接加发，那一格留给 038（回喂那一路的用例本来就要造第二层的失败） |
+| **白名单那把尺今天有三份实物、只两两对上**（as-built(口径 P5-041)，工单 041 验收 1 的覆盖面格） | 三份实物：`services/nl2sql/validate.py` 的 `allowed_from_source`（读 `meta_table.is_stale=false`）、`kb_service.required_card_count_stmt()`（同一条 `is_stale` 口径，但主语是"该源应建卡片的表数"）、`join_graph` 边查询里那两刀。**有用例钉的只有一对**：validate ↔ 检索那一路（`tests/integration/test_chat_validate_pg.py:396 test_validate构造的白名单与检索那一路逐枚相等`）。**validate ↔ `required_card_count_stmt` 的集合相等没有用例**——本轮 grep：`required_card_count_stmt` 在 `backend/tests/` 下只出现在 `test_chat_validate_pg.py:191` 的 **docstring** 里，零调用点。所以 safety §8.4 与 roadmap §P5 验收 5 那句"两条路给同一个判定"覆盖到**"检索 ↔ 校验"为止，不许写成"三口径已对齐"**。归 **P6**：`datasource_grants` 落地时这把尺要按表粒度重定，届时三条一起收 |
+| **守卫 `table_not_allowed` 的 message 有两处文本缺陷，本片按拍板不动实物**（as-built(口径 P5-041)） | 都在 `sql_guard.py` 出那枚拒绝的地方、都只影响 message、不影响判定：① 那句后缀只看 `default_schema` 真值，不看那枚引用短不短 → 引用一张**不存在的全名表**时也带"短表名无法补全"（`out_real_http039_take2.txt` 的 R4 逐字为证）；② 渲染时**空的那几格照样占位**（`f"{ref.catalog}.{ref.db}.{ref.name}"`），于是回显里有 `..category`（两个前导点，take2 的 R3）与 `.ai_web_demo.zz_no_such_table_039`（一个前导点，R4）；这与 `core/table_names.table_full_name` 那条"空的格不占位"是**相反的第二套渲染**——全仓这样的无条件拼点只剩 `sql_guard.py` 一枚文件里的四处（`:418`、`:425`、`:545`、`:546`），`table_full_name` 是唯一那把正尺，它的 docstring 连后果都写了（"模型会把它原样抄进 SQL——那条表名在源库里根本不存在"）。**为什么不动**：改它 = 动 `sql_guard.py` 的字节，现下每一轮读数都锚着这枚文件的 md5（041 本轮实测：锚与靶逐份点名住在 `evidence/guard041.txt` 的"041-D 段"，那里数得清、本节不抄数，因为下一发证据就会让那个数变）；电池这一侧三枚以它为**变异靶**（`mut_ruleid035.py:21`、`mut_drift036.py:37`、`mut_layer037.py:38`——后者的 `CELLS` 里 I/J/L 三枚靶就打在 `SG` 上），一枚只把它列进**字节凭据**（`mutation040.py:108-113`），另两枚不碰它（`mut_retry038.py` 的命中是注释、`mut_validate039.py:102-105` 命中的是 `sql_guard_rejected` 那枚码字面，靶在 `app/core/errors.py`）。用户 2026-10-26 拍板：**记成 P6/P7 的契约账**，这两句文本在 P6 把白名单收到 grant 粒度时本来就要重写 |
+| **执行器那行降级 warning 的文案仍写着不存在的兜底**（as-built(口径 P5-041)） | `executor.py:320-322` 命中 1193（源库不支持 `MAX_EXECUTION_TIME`）后打的 warning 字面是"降级靠**驱动侧连接超时**"。按本节 §4.1 的 as-built(P5-040) 与 §9.2 那行：`read_timeout` 全仓从没设过，`connect_timeout` 管的是握手、语句跑起来以后不在场——所以那一支上**没有任何东西在挡执行时长**，而这行日志把不存在的东西说成在。改它 = 动 `app/services/nl2sql/executor.py` 字节，`mut_layer037.py` 与 `mutation040.py` 两份电池都锚这枚文件 ⇒ 与上一行同一档代价，本片不动、归同一条 P6/P7 契约账 |
 | sqlglot 宽容 parser | 需要正则级兜底（`PROCEDURE ANALYSE` 等）；升级 sqlglot 必须先跑全语料 |
 | MySQL 5.7 `ONLY_FULL_GROUP_BY` 默认开启 | 进 prompt 约束，不在守卫里强行改写 SQL |
 | 中间件/代理重置会话变量 | 曾考虑用 hint 双保险，与 `comments=False` 冲突，改为拒绝 hint |
@@ -1432,6 +1448,8 @@ def test_allow(sql):
 | ⑥ `CROSS_CATALOG` 独立规则 | 归 `table_not_allowed`（catalog 非空的白名单条目本来就不存在） |
 | ③ `Union/Except/Intersect` 递归校验臂 | 未写：sqlglot 对 `SELECT 1 UNION DROP TABLE x` 直接 ParseError，规则跑不到那一层 |
 | ⑤ `AIWEB_GUARD__DANGLING_EXTRA_RULES` 追加黑名单 | 未实现。"拒绝一切 Anonymous" 已经是超集，追加黑名单只在"想放开某个函数"时才有意义，而那不在 v1 计划里 |
+| roadmap §4 env 清单里那 **4 枚从未出生的键**（as-built(口径 P5-041)，工单 041 键账） | `AIWEB_QUERY__MAX_TIMEOUT_MS`、`__CELL_MAX_CHARS`、`__READONLY_SESSION`、`__USE_SESSION_MAX_EXEC_TIME`：本轮 grep `backend/app` 与 `backend/.env.example` **零命中**（只在 roadmap/safety 的文档里活着）。三处按实物交代：① "全局天花板，UI 不许超过"没有实现点——`resolve_timeout`（`executor.py:208-213`）只做"行上没值才落全局缺省"，没有任何上限裁剪；② `CELL_MAX_CHARS` 的实物住在**另一组**（`AIWEB_RESULT__MAX_CELL_CHARS`，`.env.example:113`）；③ `READONLY_SESSION` 与 `USE_SESSION_MAX_EXEC_TIME` 的行为**由代码固定、不可开关**，后者的决定就写在这枚文件里（`executor.py:267` 注释："§4.3 的 USE_SESSION_MAX_EXEC_TIME 拍板：无条件试 SET，失败降级靠驱动超时"——那句"靠驱动超时"的实物见**本节末**那条 `read_timeout` 行）。所以 roadmap §4 这一段要读成"设计期全量"而不是"今天的开关面"，逐枚读数与归口在 roadmap §4.1 的 as-built(P5-041) |
+| 三枚**键有、字段有、读取点没有**（`concurrency_per_ds` / `rate_limit_per_user_per_min` / `allow_sql_edit`） | `settings.py:193`、`:194`、`:196` 三格都在，`.env.example:103`、`:104`、`:107` 三行都写；读取点本轮再核仍是**零**（第三枚 `allow_sql_edit` 绑的语义是"用户手改 SQL 后重跑"，入口在 P8 的 `rerun`，接在 039 的 validate 上等于把一个键的含义改写成"能不能校验"）。逐枚出生处/读取点/归谁住在 roadmap §P5 的键账表，不在此处重述 |
 | ⑦ `HARD_LIMIT` 收敛模型自写的 `LIMIT 999999` | **已收敛（2026-09-29 拍板并落地）**：`guard()` 的 LIMIT 分支从"缺了才补"改成"钳位 + 探针"，见 §1.2 ⑦。`HARD_LIMIT` 那个键**仍不建**——注入值就是 `resolve_row_limit(ds) + 1`，不需要第二个数 |
 | ⑧ `truncated` 与内存上限在真链路上双双落空（**已闭环**） | 两个后果同源：守卫当时只补不钳。① prompt 模板要求模型写 `LIMIT {{ row_limit }}`（`nl2sql_user.j2:29`），模型一写守卫就不补 `+1` 探针，`split_truncated` 因此**恒报未截断**——"这 1000 行只是前 1000 行"这句话说不出来；② 模型写 `LIMIT 5000` 时那句**原样放行**，011 的"缓冲取回的内存上限由守卫注入的 `row_limit+1` 钉住"这个前提对它不成立。**拍板口径**：`n` 是确定的非负整数且小于 `max_rows` 时尊重模型自己按问题意图选的量，其余（缺 LIMIT、`n >= max_rows`、不可证如 `LIMIT ALL`/`LIMIT 1 + 1`/`LIMIT 1e3`/`LIMIT -1`）一律钳成 `max_rows+1`——"证不了它小"与"没有 LIMIT"同一档，不给它多一条出路。**闭环范围要说清**：`n < max_rows` 那一支仍然没有探针、`truncated` 恒假，这是有意的（上限没碰到就谈不上截断），别当残留的洞去修。钉子随之从"钉住现状"翻成"钉住钳位"：`tests/guard/test_guard_api.py` 五条（超限钳、上限之下保留、只动 count 不动 offset、不可证四形状、`<= max_rows+1` 不变式）+ `tests/integration/test_pipeline_orchestration.py`（编排侧那支现在断 `sql_raw != sql_final` 且结尾是探针） |
 | §4.1 那句"1193 降级时**靠驱动侧 `read_timeout`** 兜住"（as-built(P2-011) 写的）＋ roadmap §P5 踩坑 ④"asyncmy 的 `read_timeout` 与 `MAX_EXECUTION_TIME` **谁先触发**要实测" | **as-built(P5-040 文档半边)：这个问题今天不是一个二选一，它是一个"只有一个在挡"**。实测 `grep -rn "read_timeout" backend/app backend/scripts backend/tests` → **零命中**（全仓两处命中都在文档里：本节 §4.1 与 roadmap 踩坑 ④）。驱动侧唯一被设过的一格是 `connect_timeout`：`source_connect_args`（`services/source_manager.py:53-59`）把 `timeout_ms` 折成秒落给它，`create_source_engine`（`:62-74`）的 docstring 明写这是为了"握手卡住别挂着请求"——**它管连接建立，不管语句执行**。所以：① 踩坑 ④ 的实测答案是"没有第二个竞争者，`MAX_EXECUTION_TIME` 是唯一在挡执行时长的那一格"；② 更要紧的是 1193（源库不支持该变量，MySQL < 5.7.4）那条降级支上**当前一个都不挡**——文档原句把不存在的兜底写成了存在的。设 `read_timeout` = 新增能力（要定档位、要定它与 `connect_timeout` 的关系），用户 2026-10-20 在工单 040 格子 ① 拍板**本轮不设**，要设另开工单。这一行留着就是那张开工单的门口 |

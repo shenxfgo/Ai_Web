@@ -901,6 +901,21 @@ Base：`/api/v1`（当前落地前缀为 `/api`）。鉴权：`Authorization: Be
 | GET | `/settings/index-profiles` | admin | — | `[{id,name,model,dim,status,card_count,built_at}]` **订正(P4-031)**：本行原写 `is_active`，那一列已由收缩迁移 0009 从库里删除，字段名跟着尺子走（`draft\|active\|retired` 三值，列表页要的"哪套在服务"就是 `status='active'` 那一行）。端点本身**仍未实现**（spec §6：档案列表 UI 与 `GET /kb/profiles` 都不建，诊断要的"哪套在服务"由 032 的顶层 `used_profile` 给）。 |
 | GET | `/stats/overview` | user | — | `{datasource_count,table_count,card_count,question_count_30d,success_rate}` 首页用 |
 
+**as-built(P5-041)：这张表"文档有、实物无"的行，P5 收口时刻逐行点名归属**（本轮亲验
+`app/api/endpoints/chat.py` 只有 `:21 @router.post("/chat/validate")` 一支路由，`app/api/router.py` 共 6 支
+include：health / auth / datasources / sync / kb / chat）。P5 交付的**只有** `/chat/validate` 一行，
+下面被点名的这些行今天仍无实现点（本表其余行以各自行内的 as-built 为准，不在这一格概括）——
+`POST /chat/ask` 与 `/chat/messages/{id}/rerun`（SSE，**P8**）、
+`/chat/messages/{id}/feedback` 与 `/chat/sessions` 全族（**P8/P9**）、`/chat/history`、`/stats/overview`
+（这两行按 roadmap 本节无主账第 9 条的同一口径归 **P8**——P9 验收 4 那条"看同步历史"说的是 `sync_job`，不是这张审计表）、
+`/settings/index-profiles`（**P9**；031 已明写档案列表 UI 不建）、结果文件下载（**它不在本表**，账住在
+§4.1 步骤 ⑦ 那条 as-built(P2-011) 的注 ④：013 只交付 `resolve_result_file` 纯函数，端点本体 **P8**）、`GET /sync/jobs` 列表与 `/sync/jobs/{id}` 详情（P3 明确不做，**无主→P8**）、
+`cancel`/`retry`（缺 `cancel_requested`/`retry_of` 两列，**P8/P6**）、`/datasources/{id}/grants` 两行
+（`datasource_grants` 至今零读取点，**P6**）、`/metadata/*` 全族与 `/kb/status`、`/kb/terms`（**P9**）。
+读法警告同 039 那句：**tag 出现 ≠ 端点存在**——`chat` 这个 tag 自 039 起就在 `router.py` 里，
+按 tag 反推端点清单的读者今天仍只会找到 validate 一支。本片的收口对账（五条验收 × 状态 × 证据 × 用例名、
+键账、无主账）住 [roadmap.md](roadmap.md) §P5 的"P5 验收收口"那一节。
+
 ---
 
 ## 8. 页面清单
